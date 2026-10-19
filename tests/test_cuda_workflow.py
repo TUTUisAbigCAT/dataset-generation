@@ -55,6 +55,49 @@ class CudaWorkflowTests(unittest.TestCase):
             self.assertFalse((Path(temp)/"training").exists())
             self.assertFalse((Path(temp)/"smoke").exists())
 
+    def test_configured_output_root_from_foreign_cwd_and_cli_override(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            config_dir, caller = base / "config", base / "caller"
+            config_dir.mkdir()
+            caller.mkdir()
+            config_path = config_dir / "dataset_config.json"
+            config = json.loads((ROOT / "dataset_config.json").read_text(encoding="utf-8-sig"))
+            config["data_dir"] = str(ROOT / "example_data")
+            command = [sys.executable, "-B", str(ROOT / "scripts/run_dreamt.py"),
+                       "--config", str(config_path), "--check-only"]
+            cases = [
+                ("relative", "relative runs", [], config_dir / "relative runs"),
+                ("absolute", str(base / "absolute runs"), [], base / "absolute runs"),
+                ("cli", "unused runs", ["--output-dir", "exact_run"], caller),
+            ]
+            for name, output_root, extra, expected_parent in cases:
+                with self.subTest(case=name):
+                    config["output_root"] = output_root
+                    config_path.write_text(json.dumps(config), encoding="utf-8-sig")
+                    result = subprocess.run(command + extra, cwd=caller, capture_output=True,
+                                            text=True, timeout=45)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    summary = json.loads(result.stdout.strip().splitlines()[-1])
+                    output = Path(summary["output_directory"])
+                    self.assertEqual(output.parent, expected_parent.resolve())
+                    if name == "cli":
+                        self.assertEqual(output.name, "exact_run")
+                    else:
+                        self.assertRegex(output.name, r"^dreamt_[0-9]{8}T[0-9]{6}_[0-9]{6}Z$")
+                    status = json.loads((output / "status.json").read_text(encoding="utf-8"))
+                    self.assertEqual(status["status"], "checked")
+                    self.assertEqual(status["output_directory"], str(output))
+                    preflight = json.loads((output / "preflight.json").read_text(encoding="utf-8"))
+                    self.assertEqual(preflight["training_input_shape"], [3000, 10])
+            self.assertFalse((config_dir / "unused runs").exists())
+            saved_status = (caller / "exact_run/status.json").read_bytes()
+            repeated = subprocess.run(command + ["--output-dir", "exact_run"], cwd=caller,
+                                      capture_output=True, text=True, timeout=45)
+            self.assertNotEqual(repeated.returncode, 0)
+            self.assertIn("FileExistsError", repeated.stderr)
+            self.assertEqual((caller / "exact_run/status.json").read_bytes(), saved_status)
+
     def test_dependency_profile_uses_cuda_torch(self):
         dependencies = (ROOT / "requirements_cuda.txt").read_text(encoding="utf-8")
         self.assertIn("torch==2.2.2+cu121", dependencies)

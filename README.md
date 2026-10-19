@@ -82,7 +82,22 @@ python scripts/run_dreamt.py --epochs 10 --batch-size 8 --threads 4
 
 也可通过 `--data-dir /path/to/DREAMT_PIBI_SE_new` 覆盖 NPZ 目录，或把私人路径写进已忽略的 `dataset_config.local.json` 并传入 `--config dataset_config.local.json`。Windows 使用 `run.ps1` 时传入相同参数即可。
 
-每次训练创建独立的 `runs/dreamt_<UTC时间戳>`，保存源码、配置、按人划分、训练集统计、checkpoint 和日志，随后执行去噪评估及原始 200 步采样。`--skip-generation` 可只跑训练与去噪评估。旧模型评估绑定原训练 manifest，不跟随后来修改的数据目录。
+默认每次训练创建独立的 `runs/dreamt_<UTC时间戳>`，保存源码、配置、按人划分、训练集统计、checkpoint 和日志，随后执行去噪评估及原始 200 步采样。`--skip-generation` 可只跑训练与去噪评估。旧模型评估绑定原训练 manifest，不跟随后来修改的数据目录。
+
+## 实验输出目录
+
+在同一个 `dataset_config.json` 中设置 `output_root`，指定实验输出的父目录；项目默认值为 `"runs"`。例如（仅展示相关字段，保留其余数据配置）：
+
+```json
+{
+  "data_dir": "/path/to/DREAMT_PIBI_SE_new",
+  "output_root": "/scratch/your_username/dataset-generation-runs"
+}
+```
+
+每次运行在该目录下创建 `dreamt_<UTC时间戳>/`，保存 `status.json`、数据预检以及训练、评估和生成结果。`--check-only` 也使用此位置。`output_root` 的相对路径以所选 JSON 文件所在目录为基准，支持 `~`；应填写非空字符串。旧配置未填写该字段时，仍使用项目内的 `runs/`。
+
+直接执行 `sbatch submit.sh` 即会读取该配置。命令行 `--output-dir /path/to/new_run` 优先级更高，它指定最终的单次运行目录，不再追加时间戳；相对路径仍以启动命令的工作目录为基准，已有目录会报错以避免覆盖。Slurm 自身的 `slurm-<jobid>.out` 日志及单独运行的 smoke 脚本仍遵循各自的输出设置。
 
 ## CUDA 执行范围
 
@@ -119,7 +134,7 @@ python -B scripts/verify_upstream_boundary.py --output runs/source_boundary.json
 python -B scripts/audit_watchsleep_chain.py --output-dir runs/chain_audit
 ```
 
-发布前回归检查为 **70 项通过、3 项真实 GPU 测试因本机无可用 CUDA 而跳过，共 73 项**。原 53 项数据链路测试继续通过：25 Hz 与 100 Hz 输入的原始 epoch 信号和标签逐值一致，四段拼接后的九个条件通道一致，反归一化最大误差为 `5.96e-8` 秒。
+发布前回归检查为 **71 项通过、3 项真实 GPU 测试因本机无可用 CUDA 而跳过，共 74 项**。原 53 项数据链路测试继续通过：25 Hz 与 100 Hz 输入的原始 epoch 信号和标签逐值一致，四段拼接后的九个条件通道一致，反归一化最大误差为 `5.96e-8` 秒。
 
 12 份 WaveStitch 上游快照和 5 个导入核心文件逐字未改；训练循环的 10 项设备适配在严格白名单内，移除允许的数据和设备差异后与上游相同。原始采样执行片段逐字未改。检查器可重新生成详细报告；本机历史运行日志和机器路径未纳入公共仓库。
 

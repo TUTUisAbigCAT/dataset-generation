@@ -1,5 +1,6 @@
 {
   "data_dir": "example_data",
+  "output_root": "runs",
   "metadata_path": null,
   "split_path": null,
   "multiplier": 1.0,

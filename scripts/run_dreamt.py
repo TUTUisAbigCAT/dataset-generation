@@ -25,6 +25,27 @@ def save_json(path, value):
     Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
 
 
+def resolve_output_directory(config_path, explicit_output=None):
+    """Resolve the experiment root from JSON, or use an exact CLI destination."""
+    if explicit_output is not None:
+        return Path(explicit_output).expanduser().resolve()
+    config_path = Path(config_path).expanduser().resolve()
+    config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(config, dict):
+        raise ValueError("DREAMT configuration must be a JSON object")
+    # Old configurations keep the original project-level runs directory.
+    output_root = ROOT / "runs"
+    if "output_root" in config:
+        value = config["output_root"]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("output_root must be a non-empty path string")
+        output_root = Path(value).expanduser()
+        if not output_root.is_absolute():
+            output_root = config_path.parent / output_root
+    run_name = "dreamt_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    return (output_root / run_name).resolve()
+
+
 def snapshot_source(destination):
     destination.mkdir()
     for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "cuda_runtime.py"):
@@ -46,12 +67,13 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--threads", type=int, default=2)
-    parser.add_argument("--output-dir", type=Path, help="A new run directory; by default use runs/dreamt_<UTC timestamp>")
+    parser.add_argument("--output-dir", type=Path, help="An exact new run directory; overrides JSON output_root (which receives a timestamped subdirectory)")
     parser.add_argument("--skip-generation", action="store_true", help="Run training and denoising evaluation only")
     cli = parser.parse_args()
     if min(cli.epochs, cli.batch_size, cli.threads) < 1:
         parser.error("epochs, batch size and threads must be positive")
-    output = (cli.output_dir or ROOT / "runs" / ("dreamt_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ"))).resolve()
+    cli.config = cli.config.expanduser().resolve()
+    output = resolve_output_directory(cli.config, cli.output_dir)
     output.mkdir(parents=True, exist_ok=False)
     status = dict(status="checking", output_directory=str(output), stages=[])
     save_json(output / "status.json", status)
