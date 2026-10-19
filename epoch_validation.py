@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import csv
+import hashlib
 import json
 import math
 import os
@@ -17,6 +18,74 @@ from validation_metrics import preserve_random_state, summarize_distribution
 from validation_sampling import sample_validation_windows
 
 DEFAULT_VALIDATION = {"max_windows": 64, "batch_size": 8, "seed": 20261020}
+DEFAULT_EARLY_STOPPING = {
+    "enabled": True, "patience": 5,
+    "min_delta_mean_ms": 0.0, "min_delta_variance_ms2": 0.0,
+}
+EARLY_STOP_METRICS = {
+    "mean": ("mean_window_absolute_error_ms", "min_delta_mean_ms"),
+    "variance": ("variance_window_absolute_error_ms2", "min_delta_variance_ms2"),
+}
+
+
+def early_stopping_options(config):
+    values = config.get("early_stopping", {})
+    if not isinstance(values, dict) or set(values) - set(DEFAULT_EARLY_STOPPING):
+        raise ValueError("early_stopping must be an object with only supported options")
+    options = {**DEFAULT_EARLY_STOPPING, **values}
+    if not isinstance(options["enabled"], bool):
+        raise ValueError("early_stopping.enabled must be boolean")
+    patience = options["patience"]
+    if isinstance(patience, bool) or not isinstance(patience, int) or patience < 1:
+        raise ValueError("early_stopping.patience must be a positive integer")
+    for key in ("min_delta_mean_ms", "min_delta_variance_ms2"):
+        value = options[key]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0):
+            raise ValueError(f"early_stopping.{key} must be finite and nonnegative")
+        options[key] = float(value)
+    return options
+
+
+class EarlyStopping:
+    """Stop after patience epochs where neither window error improves.
+
+    Actual minima select checkpoints. Separate threshold anchors allow several
+    small improvements to accumulate past min_delta, without resetting patience
+    on numerical jitter. No mean/variance sum mixes their different units.
+    """
+    def __init__(self, config):
+        self.options = early_stopping_options(config)
+        self.best, self.anchors = {}, {}
+        self.completed_epochs = self.bad_epochs = 0
+        self.stopped_epoch = None
+
+    def update(self, epoch, aggregate):
+        if self.stopped_epoch is not None or epoch != self.completed_epochs + 1:
+            raise ValueError("Early stopping requires consecutive, non-stopped epochs")
+        values = {name: float(aggregate[key]) for name, (key, _) in EARLY_STOP_METRICS.items()}
+        if any(not math.isfinite(value) or value < 0 for value in values.values()):
+            raise ValueError("Early-stopping metrics must be finite nonnegative absolute errors")
+        improved, new_best = [], []
+        for name, value in values.items():
+            metric, delta_key = EARLY_STOP_METRICS[name]
+            if name not in self.best or value < self.best[name]["value"]:
+                self.best[name] = dict(epoch=epoch, metric=metric, value=value)
+                new_best.append(name)
+            if name not in self.anchors or value < self.anchors[name] - self.options[delta_key]:
+                self.anchors[name] = value
+                improved.append(name)
+        self.bad_epochs = 0 if improved else self.bad_epochs + 1
+        self.completed_epochs = epoch
+        if self.options["enabled"] and self.bad_epochs >= self.options["patience"]:
+            self.stopped_epoch = epoch
+        return dict(**self.summary(), improved_metrics=improved, new_best_metrics=new_best)
+
+    def summary(self):
+        return dict(options=self.options.copy(), bad_epochs=self.bad_epochs,
+                    stopped_early=self.stopped_epoch is not None, stopped_epoch=self.stopped_epoch,
+                    completed_epochs=self.completed_epochs, threshold_anchors=self.anchors.copy(),
+                    best_metrics={name: value.copy() for name, value in self.best.items()})
 
 
 def validation_options(config):
@@ -104,6 +173,9 @@ class EpochValidator:
                  device, output_dir, config):
         self.device = _require_device(device, training_model)
         self.options = validation_options(config)
+        self.early_stopping = EarlyStopping(config)
+        self.best_checkpoints = {}
+        self.should_stop = False
         self.args = training_args
         if training_args.window_size != 3000 or training_args.s4_lmax < training_args.window_size:
             raise ValueError("Validation requires a complete 3000-point window within the original S4 kernel length")
@@ -133,6 +205,7 @@ class EpochValidator:
         self.protocol = dict(
             schema="ibi_epoch_mean_variance_v1", metric="IBI distribution mean and population variance",
             options=self.options, selection=selection, windows=self.windows_metadata,
+            early_stopping=self.early_stopping.options,
             scaler=preprocessor.scaler, split_fingerprint=preprocessor.split_fingerprint,
             data_synthetic=preprocessor.provenance()["data_synthetic"],
             condition_columns=preprocessor.columns.tolist()[1:],
@@ -166,7 +239,7 @@ class EpochValidator:
         return torch.cat(generated), copied, sampler_reports
 
     def run(self, epoch, training_model, train_mean_loss):
-        if epoch != len(self.reports) + 1:
+        if self.should_stop or epoch != len(self.reports) + 1:
             raise ValueError("Validation must run exactly once at the end of every consecutive epoch")
         if not math.isfinite(train_mean_loss):
             raise ValueError("Nonfinite epoch mean loss")
@@ -182,30 +255,48 @@ class EpochValidator:
             for row, metadata in zip(metrics["per_window"], self.windows_metadata):
                 row.update(metadata)
         aggregate = metrics["aggregate"]
+        stopping = self.early_stopping.update(epoch, aggregate)
+        self.should_stop = stopping["stopped_early"]
+        for name in stopping["new_best_metrics"]:
+            checkpoint = self.training_output / f"best_{name}_model.pth"
+            # Save only state_dict, matching the baseline checkpoint format.
+            # Temporary-file replacement preserves the previous best on I/O failure.
+            temporary = checkpoint.with_suffix(".pth.tmp")
+            torch.save(training_model.state_dict(), temporary)
+            temporary.replace(checkpoint)
+            self.best_checkpoints[name] = dict(
+                **stopping["best_metrics"][name], checkpoint=str(checkpoint),
+                checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest())
         report = dict(status="completed", epoch=epoch, train_mean_loss=float(train_mean_loss),
                       aggregate=aggregate, per_window=metrics["per_window"],
                       validation_seconds=time.perf_counter()-started, device=str(self.device),
                       protocol=str(self.output / "protocol.json"), model_copy=copied,
-                      sampling=sampler_reports)
+                      sampling=sampler_reports, early_stopping=stopping)
         _save_json(epoch_dir / "metrics.json", report)
         self.reports.append(report)
         # Rewriting a short history avoids partial CSV rows after a failed append.
         csv_path = self.training_output / "epoch_metrics.csv"
         with csv_path.open("w", encoding="utf-8", newline="") as stream:
-            fields = ["epoch", "train_mean_loss", *aggregate, "validation_seconds"]
+            fields = ["epoch", "train_mean_loss", *aggregate, "validation_seconds",
+                      "early_stopping_bad_epochs", "stopped_early"]
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
             for row in self.reports:
                 writer.writerow(dict(epoch=row["epoch"], train_mean_loss=row["train_mean_loss"],
-                                     **row["aggregate"], validation_seconds=row["validation_seconds"]))
+                                     **row["aggregate"], validation_seconds=row["validation_seconds"],
+                                     early_stopping_bad_epochs=row["early_stopping"]["bad_epochs"],
+                                     stopped_early=row["early_stopping"]["stopped_early"]))
         _save_json(self.output / "summary.json", self.summary())
         print(json.dumps(dict(status="epoch_validation_completed", epoch=epoch,
-                              train_mean_loss=float(train_mean_loss), **aggregate)), flush=True)
+                              train_mean_loss=float(train_mean_loss), **aggregate,
+                              early_stopping=stopping)), flush=True)
         return report
 
     def summary(self):
         return dict(metric="IBI distribution mean and population variance",
                     completed_epochs=len(self.reports), options=self.options,
+                    early_stopping=self.early_stopping.summary(),
+                    best_checkpoints={name: value.copy() for name, value in self.best_checkpoints.items()},
                     protocol=str(self.output / "protocol.json"),
                     epoch_metrics_csv=str(self.training_output / "epoch_metrics.csv"),
                     latest_metrics=str(self.output / f"epoch_{len(self.reports):04d}" / "metrics.json")

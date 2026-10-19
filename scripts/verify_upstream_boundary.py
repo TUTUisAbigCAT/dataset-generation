@@ -85,6 +85,14 @@ EPOCH_REPORTING_EDITS = [('from cuda_runtime import require_cuda, assert_cuda_mo
   '        print(f"epoch: {epoch + 1}, mean_loss: {mean_loss}", flush=True)\n'
   '        validator.run(epoch + 1, model, mean_loss)')]
 
+# Only the explicitly requested epoch-end stop is allowed; updates stay unchanged.
+EARLY_STOPPING_EDITS = [(
+    "        validator.run(epoch + 1, model, mean_loss)",
+    "        validator.run(epoch + 1, model, mean_loss)\n"
+    "        if validator.should_stop:\n            break",
+)]
+
+
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -94,7 +102,7 @@ def expected_training_source(original):
     start = original.index(b"    df = preprocessor.df_cleaned")
     end = original.index(b"    model = fetchModel", start)
     result = original[:start] + REPLACEMENT.encode().replace(b"\n", newline) + original[end:]
-    for before, after in CUDA_DEVICE_EDITS + EPOCH_REPORTING_EDITS:
+    for before, after in CUDA_DEVICE_EDITS + EPOCH_REPORTING_EDITS + EARLY_STOPPING_EDITS:
         before_bytes = before.encode().replace(b"\n", newline)
         after_bytes = after.encode().replace(b"\n", newline)
         assert result.count(before_bytes) == 1, f"Training edit allowlist is ambiguous: {before}"
@@ -129,7 +137,7 @@ def main():
     # Reverse exactly the reviewed device/reporting edits to verify the unchanged training
     # algorithm. The removed mask conversion needs its original insertion point.
     normalized = actual.decode().replace("\r\n", "\n")
-    for before, after in reversed(CUDA_DEVICE_EDITS + EPOCH_REPORTING_EDITS):
+    for before, after in reversed(CUDA_DEVICE_EDITS + EPOCH_REPORTING_EDITS + EARLY_STOPPING_EDITS):
         if not after:
             anchor = "            conditional_mask[:, :, non_hier_cols] = 0\n"
             assert normalized.count(anchor) == 1
@@ -156,7 +164,8 @@ def main():
         training_entry_sha256=sha(ROOT / "training_wavestitch.py"),
         data_adapter_sha256=sha(ROOT / "data_utils.py"),
         cuda_runtime_sha256=sha(ROOT / "cuda_runtime.py"),
-        exact_training_edit="Data/window preparation, enumerated CUDA-only device edits and epoch validation/reporting",
+        exact_training_edit="Data/window preparation, enumerated CUDA-only device edits and epoch validation/reporting/early stopping",
+        early_stopping_edits=[dict(before=before, after=after) for before, after in EARLY_STOPPING_EDITS],
         epoch_reporting_edits=[dict(before=before, after=after) for before, after in EPOCH_REPORTING_EDITS],
         cuda_device_edits=[dict(before=before, after=after) for before, after in CUDA_DEVICE_EDITS],
         training_algorithm_and_save_byte_identical=False,

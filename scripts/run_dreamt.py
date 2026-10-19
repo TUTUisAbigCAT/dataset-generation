@@ -98,15 +98,17 @@ def main():
         training = preprocessor.make_training_dataset(window_size=3000, stride=1500)
         if len(training) == 0:
             raise ValueError("No valid 120-second training windows in the selected folder")
-        from epoch_validation import select_fixed_windows, validation_options
+        from epoch_validation import select_fixed_windows, validation_options, early_stopping_options
         selected_config = json.loads(cli.config.read_text(encoding="utf-8-sig"))
         validation_config = validation_options(selected_config)
+        stopping_config = early_stopping_options(selected_config)
         validation, selection = select_fixed_windows(preprocessor, validation_config)
         identity = preprocessor.data_identity()
         preflight = dict(status="passed", data_identity=identity,
             training_windows=len(training), training_input_shape=list(training[0].shape),
             validation_windows=[dict(filename=name, start_sample=start) for name, start in validation],
             validation_selection=selection, validation_options=validation_config,
+            early_stopping=stopping_config,
             provenance=preprocessor.provenance(), test_npz_opened=False,
             scope="Original WatchSleepNet preprocessed IBI NPZ interface; no real-data or convergence claim")
         save_json(output / "preflight.json", preflight)
@@ -123,6 +125,7 @@ def main():
         frozen_config = {key: identity.get(key) for key in
             ("metadata_path", "split_path", "split_seed", "multiplier", "downsample_rate", "max_epochs")}
         frozen_config["validation"] = validation_config
+        frozen_config["early_stopping"] = stopping_config
         frozen_config["data_dir"] = identity["data_directory"]
         frozen_config["generate_splits"] = identity["split_source"] == "generated_subject_split"
         save_json(workspace / "dataset_config.json", frozen_config)

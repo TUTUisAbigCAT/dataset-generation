@@ -2,7 +2,7 @@
 
 基于固定版本 WaveStitch，适配 WatchSleepNet 的 DREAMT IBI 数据接口。每个输入窗口为 `[B, 3000, 10]`，对应 25 Hz、120 秒、四个连续的 30 秒睡眠阶段；生成目标为 IBI。九个条件通道依次为 W / Light / REM / Deep、AHI、BMI、AGE、gender_F、gender_M。
 
-原模型主体、优化器、损失和 DDPM 采样公式保持固定上游版本。在 `de30ac2` 的数据与 CUDA 设备适配基础上，增加每轮生成验证和 loss 数值平均；这些改动纳入源码检查器的逐项白名单。上游来源和许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+原模型主体、优化器、损失和 DDPM 采样公式保持固定上游版本。在 `de30ac2` 的数据与 CUDA 设备适配基础上，增加每轮生成验证、loss 数值平均及基于验证指标的早停；这些改动纳入源码检查器的逐项白名单。上游来源和许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 安装
 
@@ -116,6 +116,38 @@ python scripts/run_dreamt.py --epochs 10 --batch-size 8 --threads 4
 
 每轮结果见 `training/epoch_metrics.csv`，详细逐窗口结果见 `training/validation/epoch_0001/metrics.json` 等文件，最新摘要见 `training/validation/summary.json`。默认每轮最多增加 `ceil(64/8) × 200 = 1600` 次采样模型前向调用，并需要一个额外的模型副本；显存不足时可调小 validation.batch_size。均值、方差指标不能单独证明整夜连续性或条件生成质量。
 
+## 基于均值和方差误差的早停
+
+`dataset_config.json` 默认启用以下配置；旧配置未填写时也使用这些默认值：
+
+```json
+"early_stopping": {
+  "enabled": true,
+  "patience": 5,
+  "min_delta_mean_ms": 0.0,
+  "min_delta_variance_ms2": 0.0
+}
+```
+
+监控 `mean_window_absolute_error_ms` 和 `variance_window_absolute_error_ms2`，越低越好。分别保存两项指标的最佳值，任意一项改善就重置等待计数；连续 5 个 epoch 两项均未改善，在该轮 validation 完成后停止。第一轮建立参考值，因此完全无改善时最早在第 6 轮结束。`--epochs 10` 是最大轮数，触发早停后不会继续训练剩余轮数；设置 `enabled: false` 可关闭早停。
+
+改善要求误差下降幅度严格大于对应的 `min_delta`；默认 0 表示任何严格下降都算改善。需要忽略微小波动时，可分别设置毫秒和平方毫秒单位的正阈值。比较基准为上一次达到阈值的改善值，小幅改善可以累计超过阈值；最佳权重始终按实际最小误差保存。均值与方差单位不同，不直接相加形成总分。
+
+结果和权重：
+
+- `training/epoch_metrics.csv` 增加 `early_stopping_bad_epochs` 和 `stopped_early`；每轮 JSON 同时记录最佳值、改善项和阈值参考值。
+- `training/training_report.json` 的 `epochs` 是实际完成轮数，`requested_epochs` 是指定上限；`mean_loss` 只平均实际执行的训练样本。`stop_reason` 区分 `early_stopping` 与 `max_epochs`。
+- `training/best_mean_model.pth` 和 `training/best_variance_model.pth` 分别保存两项指标最佳的权重，可能来自不同 epoch。相应的 `best_mean_manifest.json`、`best_variance_manifest.json` 记录权重哈希和所选 epoch，供原评估入口使用。
+- 原 `saved_models/DREAMT/model.pth`（主工作流中位于运行目录的 `workspace/` 下）仍保存实际停止时的最终权重。主流程后续评估默认使用它，不自动将两项最佳模型之一认定为共同最优。
+
+例如，训练结束后使用均值最佳权重执行原始采样（把路径替换成实际运行目录，输出目录须尚不存在）：
+
+```bash
+python scripts/evaluate_original_sampler.py \
+  --training-args-json /path/to/run/training/best_mean_manifest.json \
+  --output-dir /path/to/run/generation_best_mean
+```
+
 ## 实验输出目录
 
 在同一个 `dataset_config.json` 中设置 `output_root`，指定实验输出的父目录；项目默认值为 `"runs"`。例如（仅展示相关字段，保留其余数据配置）：
@@ -168,6 +200,6 @@ python -B scripts/audit_watchsleep_chain.py --output-dir runs/chain_audit
 
 原数据链路回归检查覆盖 25 Hz 与 100 Hz 输入的 epoch 信号和标签、四段拼接的九个条件通道及反归一化。新增测试覆盖均值/总体方差、短 batch 加权平均、最后一轮验证、固定窗口、随机状态恢复、模型副本和原始 200 步采样一致性。缺少 CUDA 时，真实 GPU 测试会显式跳过，不能视为通过。
 
-12 份 WaveStitch 上游快照和 5 个导入核心文件逐字未改；移除允许的数据、10 项设备适配及 6 项 epoch 验证/日志改动后，训练循环与上游相同。原始采样执行片段逐字未改。检查器可重新生成详细报告；本机历史运行日志和机器路径未纳入公共仓库。
+12 份 WaveStitch 上游快照和 5 个导入核心文件逐字未改；移除允许的数据、10 项设备适配、6 项 epoch 验证/日志改动及 1 项早停分支后，训练循环与上游相同。原始采样执行片段逐字未改。检查器可重新生成详细报告；本机历史运行日志和机器路径未纳入公共仓库。
 
 目前尚未完成 Fir GPU 实测，也未用真实 DREAMT 数据验证生成质量。人工短记录和接口测试不能证明收敛，跳过的 GPU 测试不能视为通过。请在已分配的 GPU 计算节点上执行上述 `check_cuda.py` 和 `smoke_cuda.py` 后再进行正式训练。

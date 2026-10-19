@@ -100,6 +100,8 @@ if __name__ == "__main__":
         mean_loss = total_loss / total_samples
         print(f"epoch: {epoch + 1}, mean_loss: {mean_loss}", flush=True)
         validator.run(epoch + 1, model, mean_loss)
+        if validator.should_stop:
+            break
     path = f'saved_models/{args.dataset}/'
     if args.propCycEnc:
         filename = "model_prop.pth"

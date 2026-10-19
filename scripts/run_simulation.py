@@ -33,6 +33,32 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def validate_completion(validation, steps, batches_per_epoch, requested_epochs):
+    """Accept only full epochs and an explicit metric-triggered early stop."""
+    completed = validation['completed_epochs']
+    stopping = validation['early_stopping']
+    if not 1 <= completed <= requested_epochs or steps != completed * batches_per_epoch:
+        raise RuntimeError('Completed updates do not match validated full epochs')
+    stopped = stopping['stopped_early']
+    if stopped and stopping['stopped_epoch'] != completed:
+        raise RuntimeError('Early-stop epoch differs from the final validated epoch')
+    if completed < requested_epochs and not stopped:
+        raise RuntimeError('Training ended early without an early-stopping decision')
+    return dict(completed_epochs=completed, requested_epochs=requested_epochs,
+                stopped_early=stopped, stop_reason='early_stopping' if stopped else 'max_epochs')
+
+
+def save_best_manifests(output, manifest, best_checkpoints):
+    # A distinct manifest keeps strict checkpoint hash validation intact when
+    # evaluating either best model; the main manifest still selects final weights.
+    for name, best in best_checkpoints.items():
+        selected = dict(manifest, checkpoint=best['checkpoint'],
+                        checkpoint_sha256=best['checkpoint_sha256'], checkpoint_epoch=best['epoch'],
+                        checkpoint_selection=dict(metric=best['metric'], value=best['value']),
+                        parent_run_manifest=str(output / 'run_manifest.json'))
+        save_json(output / f'best_{name}_manifest.json', selected)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--batch-size', type=int, default=8)
@@ -144,17 +170,19 @@ def main():
             sys.argv = old_argv
             sys.path[:] = old_path
             os.chdir(old_cwd)
-    assert pending is None and steps == manifest['expected_updates']
+    assert pending is None
     validation = training_state['validator'].summary()
     del training_state  # Release the training model/optimizer before loading the checkpoint audit.
-    assert validation['completed_epochs'] == args.epochs
+    completion = validate_completion(validation, steps, manifest['batches_per_epoch'], args.epochs)
     assert hashes == {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
     torch.cuda.synchronize(device)
     state = torch.load(checkpoint_path, map_location=device)
     assert all(torch.isfinite(value).all() for value in state.values() if torch.is_tensor(value))
     losses = [r['epsilon_mse'] for r in rows]
     report = dict(status='completed', device=str(device), cuda_environment=cuda_environment(device),
-                  updates=steps, epochs=args.epochs, batch_size=args.batch_size,
+                  updates=steps, epochs=completion['completed_epochs'], requested_epochs=args.epochs,
+                  stopped_early=completion['stopped_early'], stop_reason=completion['stop_reason'],
+                  batch_size=args.batch_size,
                   train_windows=manifest['train_windows'], parameter_count=manifest['parameter_count'],
                   wall_seconds=time.perf_counter()-started, first_loss=losses[0], last_loss=losses[-1],
                   first_25_mean=weighted_loss(rows[:25]), last_25_mean=weighted_loss(rows[-25:]),
@@ -164,11 +192,13 @@ def main():
                   source_unchanged=True, mkldnn_enabled=torch.backends.mkldnn.enabled,
                   synthetic_data=manifest['data_synthetic'], no_quality_or_convergence_claim=True)
     save_json(output / 'training_report.json', report)
-    save_json(output / 'progress.json', dict(status='completed', updates=steps))
+    save_json(output / 'progress.json', dict(status='completed', updates=steps, **completion))
+    manifest.update(completion, updates=steps, checkpoint_epoch=completion['completed_epochs'])
     manifest['validation'] = validation
     manifest['status'] = 'completed'
     manifest['checkpoint_sha256'] = report['checkpoint_sha256']
     save_json(output / 'run_manifest.json', manifest)
+    save_best_manifests(output, manifest, validation['best_checkpoints'])
     print(json.dumps(report), flush=True)
 
 
