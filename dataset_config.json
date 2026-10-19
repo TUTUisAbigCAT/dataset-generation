@@ -1,15 +1,10 @@
 {
-  "data_dir": "example_data",
-  "output_root": "runs",
+  "data_dir": "/home/yxtao/links/scratch/WatchSleepProcessedDataset/DREAMT_PIBI_SE",
   "metadata_path": null,
   "split_path": null,
   "multiplier": 1.0,
   "downsample_rate": 1,
   "max_epochs": null,
   "split_seed": 42,
-  "validation": {
-    "max_windows": 64,
-    "batch_size": 8,
-    "seed": 20261020
-  }
+  "output_root": "/home/yxtao/links/scratch/dataset-generation/runs"
 }
