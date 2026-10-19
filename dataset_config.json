@@ -1,0 +1,9 @@
+{
+  "data_dir": "example_data",
+  "metadata_path": null,
+  "split_path": null,
+  "multiplier": 1.0,
+  "downsample_rate": 1,
+  "max_epochs": null,
+  "split_seed": 42
+}

@@ -1,0 +1,126 @@
+# DREAMT 条件 IBI 生成（CUDA 工作流）
+
+基于固定版本 WaveStitch，适配 WatchSleepNet 的 DREAMT IBI 数据接口。每个输入窗口为 `[B, 3000, 10]`，对应 25 Hz、120 秒、四个连续的 30 秒睡眠阶段；生成目标为 IBI。九个条件通道依次为 W / Light / REM / Deep、AHI、BMI、AGE、gender_F、gender_M。
+
+原模型主体、优化器、损失和 DDPM 采样公式保持固定上游版本。训练循环只保留源码检查器严格白名单内的数据与 CUDA 设备适配。上游来源和许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## 安装
+
+```bash
+git clone https://github.com/TUTUisAbigCAT/dataset-generation.git
+cd dataset-generation
+```
+
+使用 Python 3.12。`requirement.txt` 与 `requirements_cuda.txt` 固定 PyTorch 2.2.2 + CUDA 12.1 构建及其余依赖；来源参照 [PyTorch 官方历史版本说明](https://docs.pytorch.org/get-started/previous-versions/#v2-2-2)。需要可用的 NVIDIA GPU 与兼容驱动。若采用集群提供的 CUDA wheel，应记录实际版本并重新运行检查。
+
+Linux / Fir（在克隆后的项目根目录）：
+
+```bash
+python3.12 -m venv venv
+source venv/bin/activate
+python -m pip install -r requirement.txt
+python scripts/run_dreamt.py --check-only
+```
+
+Windows PowerShell：
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirement.txt
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 --check-only
+```
+
+`run.ps1` 优先使用 `DATASET_GENERATION_PYTHON` 指定的解释器，然后使用项目内 `.venv`，最后读取可选的私人 `runtime_config.json`。公共仓库不包含任何本机解释器路径；没有可用环境时会说明如何安装。Linux 直接使用已激活环境中的 `python scripts/run_dreamt.py`。
+
+## Fir 提交
+
+先按上面的 Linux 命令准备 `./venv`，并在 `dataset_config.json` 中设置集群上的真实 IBI NPZ 路径。在项目根目录执行：
+
+```bash
+sbatch submit.sh
+```
+
+脚本除 Python 命令外，与提供的 WatchSleepNet `train_transfer_sleepconvnet.sh` 逐字一致：`def-plago`、4 CPU、60G、1 个 H100、24 小时，保留原 venv 激活和 pip 命令。使用该模板需具有对应账户权限。原 pip 行只列出 scikit-learn / numpy / pandas / torch，其余依赖需提前通过 `requirement.txt` 安装。
+
+提交命令运行完整的 **训练 → 去噪评估 → 原始 200 步生成**，默认 10 个 epoch、batch size 8、4 个主机线程。各次运行单独保存源码、配置、checkpoint 和日志。
+
+在**已经分配 GPU 的计算节点**上验证环境和完整流程：
+
+```bash
+python scripts/check_cuda.py
+python scripts/smoke_cuda.py --threads 4
+```
+
+第二条命令自动创建四个人的人工短记录，运行 1 个 epoch、去噪评估和完整采样，并保存 `cuda_smoke_report.json`。它不修改真实数据，也不代表收敛或生成质量已合格。
+
+## 数据目录与训练
+
+默认 `dataset_config.json` 的 `data_dir` 为 `example_data`。其中四个人的短记录是**人工格式样例**，仅用于检查安装和入口，不是 DREAMT 观测数据。真实数据需用户自行准备，仓库不包含真实受试者数据或训练 checkpoint。
+
+训练真实数据时，只需将 `data_dir` 改成兼容的 IBI NPZ 文件夹；`metadata_path` 和 `split_path` 可以保持 null。配置中的相对路径以配置文件所在目录为基准。
+
+```text
+DREAMT/
+  participant_info.csv
+  DREAMT_PIBI_SE_new/
+    S001.npz
+    S002.npz
+    ...
+```
+
+- `data_dir` 读取原项目已提取的 IBI，默认 25 Hz、秒单位，不直接读取原始 BVP/ECG CSV。
+- NPZ 使用原字段 `data, stages, fs, ahi`。不要求模拟器字段、时间索引或额外 subject_id。IBI 可以是向量或单列数组。
+- CSV 位于 NPZ 文件夹或其直接上一层，必须有 `SID, AHI, BMI, AGE, GENDER`；SID 对应 NPZ 文件名，GENDER 为 F/M。原四字段 NPZ 不足以提供全部个人条件。
+- 原始 stage 编码为 W=0、N1=1、N2=2、N3=3、REM=4；读取后合并为 W=0、Light=1、REM=2、Deep=3。不要传入已经合并的标签再映射一次。
+- `splits.json` 可选；未提供时按固定种子 42 按受试者划分，目标比例 75% / 12.5% / 其余，至少需要三个人，且训练集和验证集各有合法两分钟窗口。已有 split 文件会严格校验。
+- 100 Hz 输入可设置 `downsample_rate=4`；其他单位通过 `multiplier` 明确换算。
+
+```bash
+python scripts/run_dreamt.py --check-only
+python scripts/run_dreamt.py --epochs 10 --batch-size 8 --threads 4
+```
+
+也可通过 `--data-dir /path/to/DREAMT_PIBI_SE_new` 覆盖 NPZ 目录，或把私人路径写进已忽略的 `dataset_config.local.json` 并传入 `--config dataset_config.local.json`。Windows 使用 `run.ps1` 时传入相同参数即可。
+
+每次训练创建独立的 `runs/dreamt_<UTC时间戳>`，保存源码、配置、按人划分、训练集统计、checkpoint 和日志，随后执行去噪评估及原始 200 步采样。`--skip-generation` 可只跑训练与去噪评估。旧模型评估绑定原训练 manifest，不跟随后来修改的数据目录。
+
+## CUDA 执行范围
+
+生产计算入口强制检查 CUDA；没有可用 GPU、安装了 CPU 版 Torch 或设备初始化失败，会直接报错，不会回退 CPU。模型参数、buffer、训练随机数、条件 mask、时间步、前向/反向、损失、去噪重建、采样及评估张量运算在同一 CUDA 设备上。运行报告记录实际设备、GPU 名称和 Torch / CUDA / cuDNN 版本。
+
+主机负责文件读写、WatchSleepNet 数据预处理、标签和索引元数据、原 seed42 模型初始化、NumPy 扩散表初始化及最终序列化；模型和扩散表在计算前整体转入 GPU。原 Adam 控制计数器允许留在主机，以保留原优化器配置。
+
+`--check-only` 和旧短跑脚本的 `--prepare-only` 只验证数据，不运行模型，因此无需 GPU。CUDA 随机流不承诺与历史 CPU 随机流逐位一致。
+
+## 与 WatchSleepNet 的一致范围
+
+原始读取的 flatten → 倍率 → 整数 stride → 完整 30 秒切段 → 四类标签映射，以及信号零标记、tuple / collate 约定，都与提供的 `SSDataset` 对齐。原文件与冻结快照 SHA256 一致。原训练 engine 在调用模型前没有额外输入归一化或增强；网络内部 BN 属于原分类模型。
+
+生成任务保留以下明确适配，因此整条分类和生成训练链路并不相同：
+
+| 项目 | 原 WatchSleepNet | 本生成任务 |
+|---|---|---|
+| 模型输入 | 整夜 epoch 序列，可 padding | 同一人的四个 epoch，3000 点，不跨人或 padding |
+| 长度上限 | 1100 个 epoch | 默认保留整夜；max_epochs=1100 可复现上限 |
+| 标签条件 | 四类分类目标 | 四类 one-hot 条件，另加 AHI/BMI/AGE/GENDER |
+| 数值标准化 | loader/engine 不做输入 z-score | 仅训练集拟合 IBI 与连续个人条件的 z-score |
+| 分组与窗口 | 原任务的受试者 split/k-fold | 固定按人划分，120 秒窗口、60 秒步长 |
+| 无效片段 | 原 loader 保留并取段首标签 | 过滤非有限/负值、无效或段内不一致标签及已知时间缺口 |
+
+原提取脚本的片段首尾、异常位置及峰提取失败产生的零值原样保留，不插值或裁剪；统计和原 MSE 包含这些存储零标记。没有时间索引的四字段 NPZ 只能依据存储顺序，无法恢复预处理已删除的原始时间间隔。
+
+## 验证与限制
+
+可复现检查命令：
+
+```bash
+python -B -m unittest discover -s tests -v
+python -B scripts/verify_upstream_boundary.py --output runs/source_boundary.json
+python -B scripts/audit_watchsleep_chain.py --output-dir runs/chain_audit
+```
+
+发布前回归检查为 **70 项通过、3 项真实 GPU 测试因本机无可用 CUDA 而跳过，共 73 项**。原 53 项数据链路测试继续通过：25 Hz 与 100 Hz 输入的原始 epoch 信号和标签逐值一致，四段拼接后的九个条件通道一致，反归一化最大误差为 `5.96e-8` 秒。
+
+12 份 WaveStitch 上游快照和 5 个导入核心文件逐字未改；训练循环的 10 项设备适配在严格白名单内，移除允许的数据和设备差异后与上游相同。原始采样执行片段逐字未改。检查器可重新生成详细报告；本机历史运行日志和机器路径未纳入公共仓库。
+
+目前尚未完成 Fir GPU 实测，也未用真实 DREAMT 数据验证生成质量。人工短记录和接口测试不能证明收敛，跳过的 GPU 测试不能视为通过。请在已分配的 GPU 计算节点上执行上述 `check_cuda.py` 和 `smoke_cuda.py` 后再进行正式训练。

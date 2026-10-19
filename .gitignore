@@ -1,0 +1,35 @@
+# Local machine configuration and export/validation artifacts
+/runtime_config.json
+/*.local.json
+/EXPORT_MANIFEST.json
+/validation/
+/validation_history/
+
+# Environments, caches, generated runs and checkpoints
+/.venv/
+/venv/
+/work/
+/runs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.out
+*.log
+
+# Secrets and local datasets (only the reviewed artificial examples are tracked)
+.env
+.env.*
+*.pem
+*.key
+*.npz
+*.npy
+*.csv
+!/example_data/EXAMPLE001.npz
+!/example_data/EXAMPLE002.npz
+!/example_data/EXAMPLE003.npz
+!/example_data/EXAMPLE004.npz
+!/example_data/participant_info.csv

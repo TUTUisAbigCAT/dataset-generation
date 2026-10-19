@@ -1,0 +1,15 @@
+{
+  "source_path": "WatchSleepNet_public/modeling/data_setup.py",
+  "snapshot_sha256": "47936ea03412afcacb98121c3239cf19a240ee0b700b14381a19c93cbd87504e",
+  "adaptation": "watchsleep_loader.py SSDataset and data_utils.py",
+  "stage_mapping": {
+    "0": 0,
+    "1": 1,
+    "2": 1,
+    "3": 3,
+    "4": 2,
+    "unknown": -1
+  },
+  "default_max_epochs": null,
+  "original_max_epochs": 1100
+}

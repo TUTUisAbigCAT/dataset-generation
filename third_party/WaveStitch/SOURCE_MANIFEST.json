@@ -1,0 +1,68 @@
+{
+  "repository": "https://github.com/adis98/WaveStitch",
+  "commit": "2b6628026c0689815ce79becf11536a571d86b1a",
+  "commit_date": "2026-10-15T08:13:03Z",
+  "retrieved_date": "2026-10-16",
+  "unmodified_upstream_files": [
+    {
+      "path": "LICENSE",
+      "sha256": "39aae52b336b30d9c61dcfb147777bec32f26c5a759e8d987707c189d0a01bd1",
+      "bytes": 1063
+    },
+    {
+      "path": "README.md",
+      "sha256": "e943647aba542e608bd753e2dcb4036da4147f78ddf46da85b712a40d8503e11",
+      "bytes": 7939
+    },
+    {
+      "path": "TSImputers/S4Model.py",
+      "sha256": "a12bcafd41f9e3b247fccebfae0839a5d851e05044980f3b57b6566dcc2b7b0c",
+      "bytes": 43204
+    },
+    {
+      "path": "TSImputers/SSSDS4Imputer.py",
+      "sha256": "7788f2687f7bee14e51fa404468b0e9a2ccdd9a2b5fbb838c3f0119f4a06d130",
+      "bytes": 17801
+    },
+    {
+      "path": "TSImputers/TimeGAN.py",
+      "sha256": "25cf53ad9f16e0949b969ae3999b3c79499b65d0af82e5ccddbb851b00a4f9e2",
+      "bytes": 6419
+    },
+    {
+      "path": "requirements.txt",
+      "sha256": "d976b988f759674c6e33d54a4a8ab96093839fa80ae7dff991f2555f96f8e07d",
+      "bytes": 279
+    },
+    {
+      "path": "synthesis_wavestitch_autoregressive_strided_preconditioning.py",
+      "sha256": "5c979cc6314f304b0b39eef102e4e21369c2477d78f76679905d451e99b0360d",
+      "bytes": 11616
+    },
+    {
+      "path": "synthesis_wavestitch_pipeline_strided_preconditioning.py",
+      "sha256": "9243cf6c6635513b8f27edfc59dcaca86474514db7b42a1e5f8c4a2246d825c7",
+      "bytes": 16409
+    },
+    {
+      "path": "training_utils.py",
+      "sha256": "abf61add81ec11fd8de3707a4ea86094e1b8ba02060f79b1c9dfe57a65b90fa5",
+      "bytes": 7435
+    },
+    {
+      "path": "training_wavestitch.py",
+      "sha256": "6608c8442a92caf3d82a3fcbae63efe5d8dc0e1751092beb7050bd58b2df6173",
+      "bytes": 5923
+    },
+    {
+      "path": "training_wavestitch_onehot.py",
+      "sha256": "5adb15bc9b2953b67886414e772bc819d0fabb5dc9fdfe03306272fc42f1b2fa",
+      "bytes": 8325
+    },
+    {
+      "path": "utils/util.py",
+      "sha256": "c8c723212d71b3617c20346c9332f740d5e37208fa76d7ad99b875d89f289f80",
+      "bytes": 8645
+    }
+  ]
+}

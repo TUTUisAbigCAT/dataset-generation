@@ -1,0 +1,11 @@
+# CUDA 12.1 build; never install a CPU-only torch for this workflow.
+# Official source: https://docs.pytorch.org/get-started/previous-versions/#v2-2-2
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.2.2+cu121
+numpy==1.26.4
+scipy==1.16.2
+einops==0.8.0
+opt_einsum==3.4.0
+pandas==2.2.1
+matplotlib==3.8.3
+tqdm==4.67.1

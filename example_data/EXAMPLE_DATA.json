@@ -1,0 +1,55 @@
+{
+  "artificial_example": true,
+  "real_DREAMT_data": false,
+  "intended_use": "Data-interface and execution checks only; no physiological or model-quality claim",
+  "seed": 20261019,
+  "subjects": 4,
+  "epochs_per_subject": 8,
+  "sample_rate_hz": 25,
+  "ibi_units": "seconds",
+  "raw_stage_codes": {
+    "W": 0,
+    "N1": 1,
+    "N2": 2,
+    "N3": 3,
+    "REM": 4
+  },
+  "npz_fields": [
+    "data",
+    "stages",
+    "fs",
+    "ahi"
+  ],
+  "zero_value_policy": "Deliberate missing-value markers retained in the stored target signal",
+  "fixed_splits": false,
+  "records": [
+    {
+      "filename": "EXAMPLE001.npz",
+      "samples": 6000,
+      "epochs": 8,
+      "zero_samples": 95,
+      "sha256": "9f3fb204ef5a98cfa380f82b77b21409491873d5620cfb8db845215992d0253b"
+    },
+    {
+      "filename": "EXAMPLE002.npz",
+      "samples": 6000,
+      "epochs": 8,
+      "zero_samples": 95,
+      "sha256": "cc182c909ddc887704892192c011491d90e3b540b4411f07b0effdbaa591b811"
+    },
+    {
+      "filename": "EXAMPLE003.npz",
+      "samples": 6000,
+      "epochs": 8,
+      "zero_samples": 95,
+      "sha256": "00b2429426f4be3876e5c34ec51080d58fe58aadbf5da49c03be06ed21ac32f5"
+    },
+    {
+      "filename": "EXAMPLE004.npz",
+      "samples": 6000,
+      "epochs": 8,
+      "zero_samples": 95,
+      "sha256": "5d297de54f24ba36d98c458d187c1573e1a7e254681ca3801a28d74b4a9bd9de"
+    }
+  ]
+}
