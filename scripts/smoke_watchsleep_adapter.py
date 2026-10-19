@@ -33,13 +33,14 @@ def main():
         raise FileExistsError("Smoke test refuses to overwrite an existing work or output directory")
     work.mkdir(parents=True)
     output.mkdir(parents=True)
-    names = ("data_utils.py", "watchsleep_loader.py", "training_wavestitch.py", "training_utils.py", "cuda_runtime.py")
+    names = ("data_utils.py", "watchsleep_loader.py", "training_wavestitch.py", "training_utils.py", "cuda_runtime.py",
+             "epoch_validation.py", "validation_metrics.py", "validation_sampling.py")
     for name in names:
         shutil.copyfile(ROOT / name, work / name)
     for name in ("TSImputers", "utils", "third_party"):
         shutil.copytree(ROOT / name, work / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     (work / "scripts").mkdir()
-    for name in ("run_simulation.py", "verify_upstream_boundary.py"):
+    for name in ("run_simulation.py", "verify_upstream_boundary.py", "evaluate_original_sampler.py"):
         shutil.copyfile(ROOT / "scripts" / name, work / "scripts" / name)
     fixture = work / "fixture"
     fixture_info = create_example_data(fixture, fixed_splits=True)

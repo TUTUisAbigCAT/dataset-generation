@@ -6,5 +6,10 @@
   "multiplier": 1.0,
   "downsample_rate": 1,
   "max_epochs": null,
-  "split_seed": 42
+  "split_seed": 42,
+  "validation": {
+    "max_windows": 64,
+    "batch_size": 8,
+    "seed": 20261020
+  }
 }

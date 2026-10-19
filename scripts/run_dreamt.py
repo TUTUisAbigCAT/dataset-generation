@@ -48,7 +48,8 @@ def resolve_output_directory(config_path, explicit_output=None):
 
 def snapshot_source(destination):
     destination.mkdir()
-    for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "cuda_runtime.py"):
+    for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "cuda_runtime.py",
+                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py"):
         shutil.copy2(ROOT / name, destination / name)
     for name in ("TSImputers", "utils", "third_party"):
         shutil.copytree(ROOT / name, destination / name,
@@ -68,7 +69,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--output-dir", type=Path, help="An exact new run directory; overrides JSON output_root (which receives a timestamped subdirectory)")
-    parser.add_argument("--skip-generation", action="store_true", help="Run training and denoising evaluation only")
+    parser.add_argument("--skip-generation", action="store_true", help="Skip final generation; per-epoch generation validation still runs")
     cli = parser.parse_args()
     if min(cli.epochs, cli.batch_size, cli.threads) < 1:
         parser.error("epochs, batch size and threads must be positive")
@@ -97,11 +98,15 @@ def main():
         training = preprocessor.make_training_dataset(window_size=3000, stride=1500)
         if len(training) == 0:
             raise ValueError("No valid 120-second training windows in the selected folder")
-        validation = preprocessor.select_validation_windows(windows_per_subject=2)
+        from epoch_validation import select_fixed_windows, validation_options
+        selected_config = json.loads(cli.config.read_text(encoding="utf-8-sig"))
+        validation_config = validation_options(selected_config)
+        validation, selection = select_fixed_windows(preprocessor, validation_config)
         identity = preprocessor.data_identity()
         preflight = dict(status="passed", data_identity=identity,
             training_windows=len(training), training_input_shape=list(training[0].shape),
             validation_windows=[dict(filename=name, start_sample=start) for name, start in validation],
+            validation_selection=selection, validation_options=validation_config,
             provenance=preprocessor.provenance(), test_npz_opened=False,
             scope="Original WatchSleepNet preprocessed IBI NPZ interface; no real-data or convergence claim")
         save_json(output / "preflight.json", preflight)
@@ -117,6 +122,7 @@ def main():
         snapshot_source(workspace)
         frozen_config = {key: identity.get(key) for key in
             ("metadata_path", "split_path", "split_seed", "multiplier", "downsample_rate", "max_epochs")}
+        frozen_config["validation"] = validation_config
         frozen_config["data_dir"] = identity["data_directory"]
         frozen_config["generate_splits"] = identity["split_source"] == "generated_subject_split"
         save_json(workspace / "dataset_config.json", frozen_config)

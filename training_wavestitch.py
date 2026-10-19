@@ -10,6 +10,7 @@ from torch import from_numpy, optim, nn, randint, normal, sqrt, device, save
 import os
 from torch.utils.data import DataLoader
 from cuda_runtime import require_cuda, assert_cuda_model
+from epoch_validation import create_epoch_validator
 
 if __name__ == "__main__":
     np.random.seed(42)
@@ -40,6 +41,7 @@ if __name__ == "__main__":
     parser.add_argument('-s4_bidirectional', type=bool, default=True)
     parser.add_argument('-s4_layernorm', type=bool, default=True)
     parser.add_argument('-propCycEnc', type=bool, default=False)
+    parser.add_argument("-validation_output", type=str, default=None)
     args = parser.parse_args()
     dataset = args.dataset
     device = require_cuda()
@@ -66,9 +68,11 @@ if __name__ == "__main__":
     # Convert to an ndarray
     non_hier_cols = np.array(remaining_indices)
     non_hier_cols = torch.as_tensor(non_hier_cols, dtype=torch.long, device=device)
+    validator = create_epoch_validator(preprocessor, args, model, diffusion_config, device)
     """TRAINING"""
     for epoch in range(args.epochs):
         total_loss = 0.0
+        total_samples = 0
         for batch in dataloader:
             batch = batch.to(device)
             timesteps = randint(diffusion_config['T'], size=(batch.shape[0],), device=device)
@@ -90,9 +94,12 @@ if __name__ == "__main__":
             sigmas_permuted = sigmas_permuted.to(device)
             loss = criterion(sigmas_predicted, sigmas_permuted)
             loss.backward()
-            total_loss += loss
+            total_loss += float(loss.detach()) * batch.shape[0]
+            total_samples += batch.shape[0]
             optimizer.step()
-        print(f'epoch: {epoch}, loss: {total_loss}')
+        mean_loss = total_loss / total_samples
+        print(f"epoch: {epoch + 1}, mean_loss: {mean_loss}", flush=True)
+        validator.run(epoch + 1, model, mean_loss)
     path = f'saved_models/{args.dataset}/'
     if args.propCycEnc:
         filename = "model_prop.pth"

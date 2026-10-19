@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -35,9 +36,13 @@ def main():
         raise RuntimeError(f"CUDA workflow failed: see {output / 'workflow.log'} and stage logs")
     status = read_json(workflow / "status.json")
     training = read_json(workflow / "training/training_report.json")
+    validation = read_json(workflow / "training/validation/epoch_0001/metrics.json")
+    assert training["validation"]["completed_epochs"] == 1
+    assert validation["status"] == "completed"
+    assert math.isclose(training["mean_loss"], validation["train_mean_loss"], rel_tol=1e-12)
     denoising = read_json(workflow / "denoising/evaluation_report.json")
     generation = read_json(workflow / "generation/evaluation_report.json")
-    devices = {"training": training["device"], "denoising": denoising["runtime"]["device"],
+    devices = {"validation": validation["device"], "training": training["device"], "denoising": denoising["runtime"]["device"],
                "generation": generation["runtime"]["device"]}
     assert status["status"] == "completed", status
     assert all(value == str(device) for value in devices.values()), devices
@@ -48,7 +53,7 @@ def main():
     assert generation["cuda_execution"]["sampler_source_byte_identical"]
     report = dict(status="cuda_workflow_passed", runtime=cuda_environment(device), devices=devices,
         training_updates=training["updates"], epochs=1, artificial_data=True,
-        stages=["training", "denoising", "original_200_step_generation"],
+        stages=["training", "epoch_validation", "denoising", "original_200_step_generation"],
         no_real_data_or_convergence_claim=True, workflow=str(workflow))
     (output / "cuda_smoke_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report), flush=True)

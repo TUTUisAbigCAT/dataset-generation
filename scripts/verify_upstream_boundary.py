@@ -1,4 +1,4 @@
-"""Verify frozen upstream files and the exact data/device adaptation allowlist."""
+"""Verify frozen upstream files and the exact data/device/epoch-reporting adaptation allowlist."""
 from __future__ import annotations
 
 import argparse
@@ -66,6 +66,25 @@ CUDA_DEVICE_EDITS = [
 ]
 
 
+# Exact user-authorized epoch validation and scalar loss reporting additions.
+EPOCH_REPORTING_EDITS = [('from cuda_runtime import require_cuda, assert_cuda_model',
+  'from cuda_runtime import require_cuda, assert_cuda_model\n'
+  'from epoch_validation import create_epoch_validator'),
+ ('    args = parser.parse_args()',
+  '    parser.add_argument("-validation_output", type=str, default=None)\n'
+  '    args = parser.parse_args()'),
+ ('    """TRAINING"""',
+  '    validator = create_epoch_validator(preprocessor, args, model, diffusion_config, device)\n'
+  '    """TRAINING"""'),
+ ('        total_loss = 0.0', '        total_loss = 0.0\n        total_samples = 0'),
+ ('            total_loss += loss',
+  '            total_loss += float(loss.detach()) * batch.shape[0]\n'
+  '            total_samples += batch.shape[0]'),
+ ("        print(f'epoch: {epoch}, loss: {total_loss}')",
+  '        mean_loss = total_loss / total_samples\n'
+  '        print(f"epoch: {epoch + 1}, mean_loss: {mean_loss}", flush=True)\n'
+  '        validator.run(epoch + 1, model, mean_loss)')]
+
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -75,10 +94,10 @@ def expected_training_source(original):
     start = original.index(b"    df = preprocessor.df_cleaned")
     end = original.index(b"    model = fetchModel", start)
     result = original[:start] + REPLACEMENT.encode().replace(b"\n", newline) + original[end:]
-    for before, after in CUDA_DEVICE_EDITS:
+    for before, after in CUDA_DEVICE_EDITS + EPOCH_REPORTING_EDITS:
         before_bytes = before.encode().replace(b"\n", newline)
         after_bytes = after.encode().replace(b"\n", newline)
-        assert result.count(before_bytes) == 1, f"Device allowlist is ambiguous: {before}"
+        assert result.count(before_bytes) == 1, f"Training edit allowlist is ambiguous: {before}"
         result = result.replace(before_bytes, after_bytes, 1)
     return result
 
@@ -105,12 +124,12 @@ def main():
         assert (ROOT / name).read_bytes() == (UPSTREAM / name).read_bytes(), f"Changed imported core: {name}"
     original = (UPSTREAM / "training_wavestitch.py").read_bytes()
     actual = (ROOT / "training_wavestitch.py").read_bytes()
-    assert actual == expected_training_source(original), "Training modifications exceeded the exact data/device allowlist"
+    assert actual == expected_training_source(original), "Training modifications exceeded the exact data/device/epoch-reporting allowlist"
 
-    # Reverse exactly the reviewed device edits to verify the unchanged training
+    # Reverse exactly the reviewed device/reporting edits to verify the unchanged training
     # algorithm. The removed mask conversion needs its original insertion point.
     normalized = actual.decode().replace("\r\n", "\n")
-    for before, after in reversed(CUDA_DEVICE_EDITS):
+    for before, after in reversed(CUDA_DEVICE_EDITS + EPOCH_REPORTING_EDITS):
         if not after:
             anchor = "            conditional_mask[:, :, non_hier_cols] = 0\n"
             assert normalized.count(anchor) == 1
@@ -122,7 +141,7 @@ def main():
     old_loop = normalized_training_loop(ast.parse(original_text))
     new_loop = normalized_training_loop(ast.parse(actual.decode()))
     normalized_loop = normalized_training_loop(ast.parse(normalized))
-    assert old_loop == normalized_loop, "Training formulas/structure changed beyond device allocation"
+    assert old_loop == normalized_loop, "Training formulas/structure changed beyond allowed device allocation and epoch reporting"
     marker = "    model = fetchModel"
     assert normalized[normalized.index(marker):] == original_text[original_text.index(marker):]
     imported_core = {name: sha(ROOT / name) for name in CORE_FILES}
@@ -137,12 +156,13 @@ def main():
         training_entry_sha256=sha(ROOT / "training_wavestitch.py"),
         data_adapter_sha256=sha(ROOT / "data_utils.py"),
         cuda_runtime_sha256=sha(ROOT / "cuda_runtime.py"),
-        exact_training_edit="Data/window preparation plus the enumerated CUDA-only device edits",
+        exact_training_edit="Data/window preparation, enumerated CUDA-only device edits and epoch validation/reporting",
+        epoch_reporting_edits=[dict(before=before, after=after) for before, after in EPOCH_REPORTING_EDITS],
         cuda_device_edits=[dict(before=before, after=after) for before, after in CUDA_DEVICE_EDITS],
         training_algorithm_and_save_byte_identical=False,
         training_loop_ast_identical=(old_loop == new_loop),
-        training_loop_ast_identical_after_device_normalization=True,
-        training_suffix_byte_identical_after_device_normalization=True,
+        training_loop_ast_identical_after_allowed_normalization=True,
+        training_suffix_byte_identical_after_allowed_normalization=True,
         optimizer_loss_diffusion_formulas_and_update_order_unchanged=True,
         gpu_rng_note="Random draws now use the CUDA generator; distributions are unchanged but CPU seeded trajectories are not expected to match",
         official_sampler_snapshot_unchanged=True, sampler_execution_performed=False,
@@ -155,7 +175,7 @@ def main():
     args.output.with_suffix(".patch").write_text(diff, encoding="utf-8")
     print(json.dumps({key: report[key] for key in ("status", "upstream_snapshot_files_checked",
         "imported_core_byte_identical", "training_loop_ast_identical",
-        "training_loop_ast_identical_after_device_normalization",
+        "training_loop_ast_identical_after_allowed_normalization",
         "optimizer_loss_diffusion_formulas_and_update_order_unchanged")}, indent=2))
 
 

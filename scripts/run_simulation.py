@@ -1,9 +1,7 @@
-"""Observe an unmodified official training loop via read-only Python tracing.
+"""Observe baseline optimizer updates and record sample-weighted mean loss.
 
-Only the data preparation block in training_wavestitch.py is adapted. This
-launcher reads loss/iteration metadata; it never replaces a function, modifies
-frame locals, changes a tensor or RNG, or adds optimizer/loss/checkpoint steps.
-The official script performs every training update and saves its own model.
+The training entry point explicitly runs epoch validation with isolated RNG and
+an independent evaluation model. This trace only reads completed update metadata.
 """
 from __future__ import annotations
 
@@ -24,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from cuda_runtime import require_cuda, cuda_environment
+from epoch_validation import weighted_loss
 
 
 def save_json(path, value):
@@ -62,10 +61,13 @@ def main():
     source_paths = [training, ROOT / 'data_utils.py', ROOT / 'training_utils.py',
                     ROOT / 'TSImputers/SSSDS4Imputer.py', ROOT / 'TSImputers/S4Model.py', ROOT / 'utils/util.py',
                     ROOT / 'watchsleep_loader.py', ROOT / 'dataset_config.json', ROOT / 'cuda_runtime.py',
-                    ROOT / 'third_party/WatchSleepNet/data_setup.py']
+                    ROOT / 'third_party/WatchSleepNet/data_setup.py', ROOT / 'epoch_validation.py',
+                    ROOT / 'validation_metrics.py', ROOT / 'validation_sampling.py',
+                    ROOT / 'scripts/evaluate_original_sampler.py']
     hashes = {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
     command = [filename, '-d', args.dataset, '-window_size', '3000', '-s4_lmax', '3000',
-               '-stride', '1500', '-batch_size', str(args.batch_size), '-epochs', str(args.epochs)]
+               '-stride', '1500', '-batch_size', str(args.batch_size), '-epochs', str(args.epochs),
+               '-validation_output', str(output / 'validation')]
     manifest = dict(status='starting', python=sys.executable, python_version=sys.version,
                     torch=torch.__version__, numpy=np.__version__, cuda=torch.cuda.is_available(),
                     mkldnn_enabled=torch.backends.mkldnn.enabled, threads=torch.get_num_threads(),
@@ -132,7 +134,7 @@ def main():
             sys.path.insert(0, str(ROOT))
             sys.argv = command
             sys.settrace(trace)
-            runpy.run_path(filename, run_name='__main__')
+            training_state = runpy.run_path(filename, run_name='__main__')
         except BaseException:
             save_json(output / 'failure.json', dict(status='failed', completed_updates=steps,
                                                    traceback=traceback.format_exc()))
@@ -143,6 +145,9 @@ def main():
             sys.path[:] = old_path
             os.chdir(old_cwd)
     assert pending is None and steps == manifest['expected_updates']
+    validation = training_state['validator'].summary()
+    del training_state  # Release the training model/optimizer before loading the checkpoint audit.
+    assert validation['completed_epochs'] == args.epochs
     assert hashes == {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
     torch.cuda.synchronize(device)
     state = torch.load(checkpoint_path, map_location=device)
@@ -152,13 +157,15 @@ def main():
                   updates=steps, epochs=args.epochs, batch_size=args.batch_size,
                   train_windows=manifest['train_windows'], parameter_count=manifest['parameter_count'],
                   wall_seconds=time.perf_counter()-started, first_loss=losses[0], last_loss=losses[-1],
-                  first_25_mean=float(np.mean(losses[:25])), last_25_mean=float(np.mean(losses[-25:])),
-                  mean_loss=float(np.mean(losses)), all_losses_finite=True, checkpoint_all_finite=True,
+                  first_25_mean=weighted_loss(rows[:25]), last_25_mean=weighted_loss(rows[-25:]),
+                  mean_loss=weighted_loss(rows), loss_aggregation='sample_weighted_mean',
+                  validation=validation, all_losses_finite=True, checkpoint_all_finite=True,
                   checkpoint=str(checkpoint_path), checkpoint_sha256=sha(checkpoint_path),
                   source_unchanged=True, mkldnn_enabled=torch.backends.mkldnn.enabled,
                   synthetic_data=manifest['data_synthetic'], no_quality_or_convergence_claim=True)
     save_json(output / 'training_report.json', report)
     save_json(output / 'progress.json', dict(status='completed', updates=steps))
+    manifest['validation'] = validation
     manifest['status'] = 'completed'
     manifest['checkpoint_sha256'] = report['checkpoint_sha256']
     save_json(output / 'run_manifest.json', manifest)

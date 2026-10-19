@@ -2,7 +2,7 @@
 
 基于固定版本 WaveStitch，适配 WatchSleepNet 的 DREAMT IBI 数据接口。每个输入窗口为 `[B, 3000, 10]`，对应 25 Hz、120 秒、四个连续的 30 秒睡眠阶段；生成目标为 IBI。九个条件通道依次为 W / Light / REM / Deep、AHI、BMI、AGE、gender_F、gender_M。
 
-原模型主体、优化器、损失和 DDPM 采样公式保持固定上游版本。训练循环只保留源码检查器严格白名单内的数据与 CUDA 设备适配。上游来源和许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+原模型主体、优化器、损失和 DDPM 采样公式保持固定上游版本。在 `de30ac2` 的数据与 CUDA 设备适配基础上，增加每轮生成验证和 loss 数值平均；这些改动纳入源码检查器的逐项白名单。上游来源和许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 安装
 
@@ -82,7 +82,39 @@ python scripts/run_dreamt.py --epochs 10 --batch-size 8 --threads 4
 
 也可通过 `--data-dir /path/to/DREAMT_PIBI_SE_new` 覆盖 NPZ 目录，或把私人路径写进已忽略的 `dataset_config.local.json` 并传入 `--config dataset_config.local.json`。Windows 使用 `run.ps1` 时传入相同参数即可。
 
-默认每次训练创建独立的 `runs/dreamt_<UTC时间戳>`，保存源码、配置、按人划分、训练集统计、checkpoint 和日志，随后执行去噪评估及原始 200 步采样。`--skip-generation` 可只跑训练与去噪评估。旧模型评估绑定原训练 manifest，不跟随后来修改的数据目录。
+默认每次训练创建独立的 `runs/dreamt_<UTC时间戳>`，保存源码、配置、按人划分、训练集统计、checkpoint 和日志。每个 epoch 结束执行生成验证，训练结束后再执行去噪评估及原始 200 步采样。`--skip-generation` 只跳过最后的独立采样任务，每轮 validation 仍执行。旧模型评估绑定原训练 manifest，不跟随后来修改的数据目录。
+
+## 每轮 validation 和平均 loss
+
+每个 epoch 完成全部 optimizer 更新后（包括最后一轮），用当前权重在验证集条件下从噪声生成两分钟 IBI。执行与训练相同的完整扩散日程，默认 200 步；直接复用经过哈希检查的原始采样片段。验证窗口独立生成，因此推理 stride 为完整的 3000 点，不将不同片段或受试者互相拼接；训练 stride 仍为 1500 点。
+
+在 `dataset_config.json` 中设置：
+
+```json
+"validation": {
+  "max_windows": 64,
+  "batch_size": 8,
+  "seed": 20261020
+}
+```
+
+默认从按受试者隔离的 val split 中固定选择最多 64 个互不重叠的合法窗口；不足时使用全部可用窗口，`max_windows: null` 使用全部不重叠窗口。候选搜索对齐 30 秒边界，按固定种子在受试者间轮流选取。训练期间窗口、顺序、采样种子不变；修改 batch_size 也可能改变采样随机流，跨实验比较应保持整个 validation 配置一致。所选窗口和实际数量记录在 `training/validation/protocol.json`，不读取 test split，不重新拟合标准化参数。
+
+指标只统计 IBI，反归一化到毫秒后用 float64 计算，总体方差采用 `correction=0`：
+
+| 字段 | 定义 |
+|---|---|
+| `mean_error_ms` | 所有验证样本合并后的生成均值 − 参考均值 |
+| `variance_error_ms2` | 所有验证样本合并后的生成方差 − 参考方差 |
+| `mean_absolute_error_ms` / `variance_absolute_error_ms2` | 上述整体差值的绝对值 |
+| `mean_window_absolute_error_ms` | 每个两分钟窗口均值差的绝对值，再对窗口取平均 |
+| `variance_window_absolute_error_ms2` | 每个两分钟窗口方差差的绝对值，再对窗口取平均 |
+
+整体指标和逐窗口指标同时记录，避免不同窗口的正负偏差被相互抵消。原存储零值仍计入统计，不裁剪生成值。每轮使用独立的 eval 模型副本；退出验证时恢复随机数状态，不改变训练模型的模式、梯度、buffer 或后续训练随机流。
+
+训练 `train_mean_loss = Σ(batch_MSE × batch样本数) / Σ(batch样本数)`，输出普通数值，不累积带计算图的 loss tensor。最后一个短 batch 按实际样本数加权；`training_report.json` 中的 `mean_loss` 为整个训练过程的同口径平均。反向传播仍使用原始 MSE，没有增加均值或方差损失项。
+
+每轮结果见 `training/epoch_metrics.csv`，详细逐窗口结果见 `training/validation/epoch_0001/metrics.json` 等文件，最新摘要见 `training/validation/summary.json`。默认每轮最多增加 `ceil(64/8) × 200 = 1600` 次采样模型前向调用，并需要一个额外的模型副本；显存不足时可调小 validation.batch_size。均值、方差指标不能单独证明整夜连续性或条件生成质量。
 
 ## 实验输出目录
 
@@ -134,8 +166,8 @@ python -B scripts/verify_upstream_boundary.py --output runs/source_boundary.json
 python -B scripts/audit_watchsleep_chain.py --output-dir runs/chain_audit
 ```
 
-发布前回归检查为 **71 项通过、3 项真实 GPU 测试因本机无可用 CUDA 而跳过，共 74 项**。原 53 项数据链路测试继续通过：25 Hz 与 100 Hz 输入的原始 epoch 信号和标签逐值一致，四段拼接后的九个条件通道一致，反归一化最大误差为 `5.96e-8` 秒。
+原数据链路回归检查覆盖 25 Hz 与 100 Hz 输入的 epoch 信号和标签、四段拼接的九个条件通道及反归一化。新增测试覆盖均值/总体方差、短 batch 加权平均、最后一轮验证、固定窗口、随机状态恢复、模型副本和原始 200 步采样一致性。缺少 CUDA 时，真实 GPU 测试会显式跳过，不能视为通过。
 
-12 份 WaveStitch 上游快照和 5 个导入核心文件逐字未改；训练循环的 10 项设备适配在严格白名单内，移除允许的数据和设备差异后与上游相同。原始采样执行片段逐字未改。检查器可重新生成详细报告；本机历史运行日志和机器路径未纳入公共仓库。
+12 份 WaveStitch 上游快照和 5 个导入核心文件逐字未改；移除允许的数据、10 项设备适配及 6 项 epoch 验证/日志改动后，训练循环与上游相同。原始采样执行片段逐字未改。检查器可重新生成详细报告；本机历史运行日志和机器路径未纳入公共仓库。
 
 目前尚未完成 Fir GPU 实测，也未用真实 DREAMT 数据验证生成质量。人工短记录和接口测试不能证明收敛，跳过的 GPU 测试不能视为通过。请在已分配的 GPU 计算节点上执行上述 `check_cuda.py` 和 `smoke_cuda.py` 后再进行正式训练。

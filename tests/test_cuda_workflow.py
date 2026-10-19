@@ -19,7 +19,7 @@ class CudaWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             destination = Path(temp) / "workspace"
             runner.snapshot_source(destination)
-            for relative in ("cuda_runtime.py", "training_wavestitch.py", "scripts/run_simulation.py",
+            for relative in ("cuda_runtime.py", "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "training_wavestitch.py", "scripts/run_simulation.py",
                              "scripts/evaluate_denoising.py", "scripts/evaluate_original_sampler.py"):
                 self.assertEqual((ROOT / relative).read_bytes(), (destination / relative).read_bytes())
 
