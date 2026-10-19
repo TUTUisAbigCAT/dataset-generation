@@ -159,10 +159,10 @@ def audit_numeric_case(directory, *, fs=25, downsample_rate=1, multiplier=1., mi
             discarded_25hz_tail_samples=expected_tail, legacy_tuple_ahi=float(legacy_ahi),
             condition_ahi=float(record["continuous"][0]), ahi_source=record["ahi_source"]))
     for split in ("train", "val"):
-        dataset = (processor.make_training_dataset(3000, 1500) if split == "train"
+        dataset = (processor.make_training_dataset(3000, 750) if split == "train"
                    else processor.make_validation_dataset(3000, 1500))
         expected_index = [(name, first*750) for name in fixture["splits"][split]
-                          for first in range(0, oracle[name][2] - 4 + 1, 2)]
+                          for first in range(0, oracle[name][2] - 4 + 1, 1 if split == "train" else 2)]
         require(dataset.window_index == expected_index, "Windows cross subjects, use padding, or shift the epoch grid")
         for index, (name, start) in enumerate(expected_index):
             first = start//750
@@ -232,8 +232,8 @@ def audit_boundary_case(directory):
             and limited[2:] == old_long[2:], "Explicit max_epochs=1100 does not reproduce original tuple")
     require(torch.equal(adapter_long[0][:1100], old_long[0]), "Original retained prefix differs")
     processor = preprocessor(directory, 1, 1.)
-    dataset = processor.make_training_dataset(3000, 1500)
-    expected_index = [("S101.npz", first*750) for first in range(0, 1105-4+1, 2)]
+    dataset = processor.make_training_dataset(3000, 750)
+    expected_index = [("S101.npz", first*750) for first in range(0, 1105-4+1)]
     require(dataset.window_index == expected_index, "Padding, subject boundary, or truncated epochs entered windows")
     try:
         processor.window_array("S102.npz", 0, 3000)
@@ -253,7 +253,7 @@ def audit_boundary_case(directory):
         original_padded_batch_shape=list(padded_ibi.shape), original_actual_lengths=lengths.tolist(),
         original_short_padding_epochs=1097, original_padding_ibi=0, original_padding_label=-1,
         short_record_epochs=3, generation_windows_from_short_record=0,
-        generated_training_windows=len(dataset), windows_if_original_1100_cap_were_used=len(range(0, 1100-4+1, 2)),
+        generated_training_windows=len(dataset), windows_if_original_1100_cap_were_used=len(range(0, 1100-4+1)),
         final_window_start_epoch=last_start//750, final_window_inverse_max_error_seconds=inverse_error,
         signal_scaler_points=(1105+3)*750, padding_in_signal_scaler=False, padding_in_generation_windows=False,
         data_files_unchanged=True, test_npz_opened=False)

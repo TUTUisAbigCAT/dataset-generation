@@ -28,7 +28,7 @@ class NumericalLoaderChainTests(unittest.TestCase):
     def test_25hz_original_epochs_to_every_conditioned_window_and_back(self):
         result = audit.audit_numeric_case(self.directory / "fs25", fs=25, downsample_rate=1, multiplier=1.)
         self.assertEqual(result["status"], "passed")
-        self.assertEqual(result["train_window_count"], 3)
+        self.assertEqual(result["train_window_count"], 6)
         self.assertEqual(result["val_window_count"], 2)
         self.assertTrue(result["original_epoch_signal_bitwise_equal"])
         self.assertTrue(result["condition_channels_exact"])
@@ -40,7 +40,7 @@ class NumericalLoaderChainTests(unittest.TestCase):
     def test_100hz_stride_unit_conversion_and_csv_ahi_to_windows(self):
         result = audit.audit_numeric_case(self.directory / "fs100", fs=100, downsample_rate=4,
                                           multiplier=.001, missing_ahi="S102.npz")
-        self.assertEqual(result["train_window_count"], 3)
+        self.assertEqual(result["train_window_count"], 6)
         self.assertEqual(result["val_window_count"], 2)
         self.assertEqual([row["discarded_25hz_tail_samples"] for row in result["records"]], [44, 44, 44])
         fallback = next(row for row in result["records"] if row["filename"] == "S102.npz")
@@ -54,9 +54,9 @@ class NumericalLoaderChainTests(unittest.TestCase):
         self.assertTrue(result["explicit_cap_1100_tuple_exact"])
         self.assertEqual(result["original_actual_lengths"], [1100, 3])
         self.assertEqual(result["generation_windows_from_short_record"], 0)
-        self.assertEqual(result["generated_training_windows"], 551)
-        self.assertEqual(result["windows_if_original_1100_cap_were_used"], 549)
-        self.assertEqual(result["final_window_start_epoch"], 1100)
+        self.assertEqual(result["generated_training_windows"], 1102)
+        self.assertEqual(result["windows_if_original_1100_cap_were_used"], 1097)
+        self.assertEqual(result["final_window_start_epoch"], 1101)
         self.assertFalse(result["padding_in_signal_scaler"])
         self.assertFalse(result["padding_in_generation_windows"])
 

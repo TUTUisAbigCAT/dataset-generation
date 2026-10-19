@@ -92,7 +92,7 @@ def main():
                     ROOT / 'scripts/evaluate_original_sampler.py']
     hashes = {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
     command = [filename, '-d', args.dataset, '-window_size', '3000', '-s4_lmax', '3000',
-               '-stride', '1500', '-batch_size', str(args.batch_size), '-epochs', str(args.epochs),
+               '-stride', '750', '-batch_size', str(args.batch_size), '-epochs', str(args.epochs),
                '-validation_output', str(output / 'validation')]
     manifest = dict(status='starting', python=sys.executable, python_version=sys.version,
                     torch=torch.__version__, numpy=np.__version__, cuda=torch.cuda.is_available(),

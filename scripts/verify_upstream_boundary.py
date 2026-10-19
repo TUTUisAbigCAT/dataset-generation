@@ -175,7 +175,7 @@ def main():
         optimizer_loss_diffusion_formulas_and_update_order_unchanged=True,
         gpu_rng_note="Random draws now use the CUDA generator; distributions are unchanged but CPU seeded trajectories are not expected to match",
         official_sampler_snapshot_unchanged=True, sampler_execution_performed=False,
-        training_window_stride_change="Original ignores CLI stride and unfolds by 1 point; adapted data windows honor explicit -stride 1500 (60 seconds)",
+        training_window_stride_change="Original ignores CLI stride and unfolds by 1 point; adapted data windows honor explicit -stride 750 (30 seconds)",
         runtime_configuration="CUDA required; 64 channels, 4 residual layers, state 64, T200 linear 0.0001 to 0.02, Adam 1e-4; CLI window_size/s4_lmax 3000; batch/epochs are runtime budget arguments")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")

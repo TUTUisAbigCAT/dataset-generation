@@ -1,4 +1,4 @@
-"""Run three unchanged official optimizer updates on four-key DREAMT fixtures.
+"""Run five unchanged official optimizer updates on four-key DREAMT fixtures.
 
 Copies source into work/, never writes a checkpoint into the deliverable or an
 ongoing experiment. The fixture is artificial and tests integration only.
@@ -51,13 +51,13 @@ def main():
     if args.prepare_only:
         from data_utils import Preprocessor
         processor = Preprocessor("DREAMT_SIM", config_override=config)
-        dataset = processor.make_training_dataset(3000, 1500)
-        assert len(dataset) == 6 and tuple(dataset[0].shape) == (3000, 10)
+        dataset = processor.make_training_dataset(3000, 750)
+        assert len(dataset) == 10 and tuple(dataset[0].shape) == (3000, 10)
         validation = processor.select_validation_windows()
         assert len(validation) == 2
         result = dict(status="prepared_no_model_execution", synthetic_fixture=True,
             fixture=fixture_info, training_windows=len(dataset), validation_windows=len(validation),
-            planned_optimizer_updates=3, planned_batch_size=2, input_shape=[2, 3000, 10],
+            planned_optimizer_updates=5, planned_batch_size=2, input_shape=[2, 3000, 10],
             data_identity=processor.data_identity(), test_npz_opened=False,
             work_directory=str(work))
         (output / "summary.json").write_text(json.dumps(result, indent=2, allow_nan=False), encoding="utf-8")
@@ -76,9 +76,9 @@ def main():
     read = lambda p: json.loads(p.read_text(encoding="utf-8"))
     training = read(output / "training/training_report.json")
     manifest = read(output / "training/run_manifest.json")
-    assert training["status"] == "completed" and training["updates"] == 3
+    assert training["status"] == "completed" and training["updates"] == 5
     assert training["all_losses_finite"] and training["checkpoint_all_finite"] and training["source_unchanged"]
-    assert manifest["train_windows"] == 6 and len(manifest["model_input_columns"]) == 10
+    assert manifest["train_windows"] == 10 and len(manifest["model_input_columns"]) == 10
     assert manifest["data"]["test_npz_opened"] is False
     assert all(r["continuity_source"] == "stored_order_only" for r in manifest["data"]["record_alignment"].values())
     copied_hashes = {name: hashlib.sha256((work / name).read_bytes()).hexdigest() for name in names}
@@ -86,7 +86,7 @@ def main():
     result = dict(status="passed", synthetic_fixture=True, fixture_npz_keys=["data", "stages", "fs", "ahi"],
         fixture=fixture_info,
         original_epoch_indices_supplied=False, continuity_claim="stored order only; this fixture has known artificial origin",
-        original_training_loop=True, optimizer_updates=3, batch_size=2, epochs=1, input_shape=[2, 3000, 10],
+        original_training_loop=True, optimizer_updates=5, batch_size=2, epochs=1, input_shape=[2, 3000, 10],
         output_channels=1, training=training, source_copy_sha256=copied_hashes,
         default_deliverable_checkpoint_created=(ROOT / "saved_models/DREAMT_SIM/model.pth").exists(),
         ongoing_experiment_modified=False, quality_or_convergence_claim=False,

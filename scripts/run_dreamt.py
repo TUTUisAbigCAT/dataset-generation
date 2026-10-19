@@ -95,7 +95,7 @@ def main():
         from data_utils import Preprocessor
 
         preprocessor = Preprocessor("DREAMT", data_dir=cli.data_dir)
-        training = preprocessor.make_training_dataset(window_size=3000, stride=1500)
+        training = preprocessor.make_training_dataset(window_size=3000, stride=750)
         if len(training) == 0:
             raise ValueError("No valid 120-second training windows in the selected folder")
         from epoch_validation import select_fixed_windows, validation_options, early_stopping_options
