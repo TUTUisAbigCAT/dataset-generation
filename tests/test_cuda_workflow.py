@@ -23,12 +23,11 @@ class CudaWorkflowTests(unittest.TestCase):
                              "scripts/evaluate_denoising.py", "scripts/evaluate_original_sampler.py"):
                 self.assertEqual((ROOT / relative).read_bytes(), (destination / relative).read_bytes())
 
-    def test_submit_changes_only_python_line(self):
-        old = (ROOT / "third_party/WatchSleepNet/train_transfer_sleepconvnet.sh").read_bytes()
+    def test_submit_keeps_workflow_entry_and_unix_line_endings(self):
+        # Cluster directives now follow the user's supplied submission script.
         new = (ROOT / "submit.sh").read_bytes()
-        expected = old.replace(b"python modeling/train_transfer_1.py --model=sleepconvnet",
-            b"python scripts/run_dreamt.py --epochs 10 --batch-size 8 --threads 4")
-        self.assertEqual(new, expected)
+        commands = [line for line in new.splitlines() if line.startswith(b"python ")]
+        self.assertEqual(commands, [b"python scripts/run_dreamt.py --epochs 10 --batch-size 8 --threads 4"])
         self.assertNotIn(b"\r", new)
 
     def test_production_entry_points_reject_missing_cuda(self):
