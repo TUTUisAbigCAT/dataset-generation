@@ -281,6 +281,27 @@ class EpochCoordinatorTests(unittest.TestCase):
         self.assertModelEqual(model_before)
         self.assertEqual(validator.summary()["completed_epochs"], 0)
 
+    def test_joint_checkpoint_updates_exactly_when_patience_resets(self):
+        validator = self.make_validator()
+        means, variances = [10., 9., 9., 8.], [100., 100., 90., 80.]
+        for epoch, (mean, variance) in enumerate(zip(means, variances), 1):
+            with torch.no_grad():
+                self.model[0].weight.fill_(epoch)
+            measured = dict(aggregate=dict(mean_window_absolute_error_ms=mean,
+                                          variance_window_absolute_error_ms2=variance),
+                            per_window=[{}, {}])
+            with mock.patch.object(validator, "_generate", return_value=(validator.reference.clone(), {}, [])), \
+                 mock.patch.object(coordinator, "summarize_distribution", return_value=measured), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                report = validator.run(epoch, self.model, .1)
+            joint_epoch = 4 if epoch == 4 else 1
+            selected = validator.summary()["best_checkpoints"]["joint"]
+            self.assertEqual(selected["epoch"], joint_epoch)
+            saved = torch.load(selected["checkpoint"], map_location="cpu", weights_only=True)
+            self.assertEqual(saved["0.weight"].item(), joint_epoch)
+            self.assertEqual(report["early_stopping"]["joint_improvement"], epoch in (1, 4))
+            self.assertEqual(report["early_stopping"]["bad_epochs"], [0, 1, 2, 0][epoch-1])
+
     def test_epoch_order_and_nonfinite_loss_rejected(self):
         validator = self.make_validator()
         for epoch, loss in ((0, .1), (2, .1), (1, float("nan")), (1, float("inf"))):

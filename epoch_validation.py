@@ -48,7 +48,7 @@ def early_stopping_options(config):
 
 
 class EarlyStopping:
-    """Stop after patience epochs where neither window error improves.
+    """Reset patience only when both window errors improve in the same epoch.
 
     Actual minima select checkpoints. Separate threshold anchors allow several
     small improvements to accumulate past min_delta, without resetting patience
@@ -75,14 +75,17 @@ class EarlyStopping:
             if name not in self.anchors or value < self.anchors[name] - self.options[delta_key]:
                 self.anchors[name] = value
                 improved.append(name)
-        self.bad_epochs = 0 if improved else self.bad_epochs + 1
+        joint_improvement = len(improved) == len(EARLY_STOP_METRICS)
+        self.bad_epochs = 0 if joint_improvement else self.bad_epochs + 1
         self.completed_epochs = epoch
         if self.options["enabled"] and self.bad_epochs >= self.options["patience"]:
             self.stopped_epoch = epoch
-        return dict(**self.summary(), improved_metrics=improved, new_best_metrics=new_best)
+        return dict(**self.summary(), improved_metrics=improved, new_best_metrics=new_best,
+                    joint_improvement=joint_improvement)
 
     def summary(self):
-        return dict(options=self.options.copy(), bad_epochs=self.bad_epochs,
+        return dict(options=self.options.copy(), improvement_rule="both_metrics_same_epoch",
+                    bad_epochs=self.bad_epochs,
                     stopped_early=self.stopped_epoch is not None, stopped_epoch=self.stopped_epoch,
                     completed_epochs=self.completed_epochs, threshold_anchors=self.anchors.copy(),
                     best_metrics={name: value.copy() for name, value in self.best.items()})
@@ -206,6 +209,7 @@ class EpochValidator:
             schema="ibi_epoch_mean_variance_v1", metric="IBI distribution mean and population variance",
             options=self.options, selection=selection, windows=self.windows_metadata,
             early_stopping=self.early_stopping.options,
+            early_stopping_improvement_rule="both_metrics_same_epoch",
             scaler=preprocessor.scaler, split_fingerprint=preprocessor.split_fingerprint,
             data_synthetic=preprocessor.provenance()["data_synthetic"],
             condition_columns=preprocessor.columns.tolist()[1:],
@@ -257,7 +261,13 @@ class EpochValidator:
         aggregate = metrics["aggregate"]
         stopping = self.early_stopping.update(epoch, aggregate)
         self.should_stop = stopping["stopped_early"]
-        for name in stopping["new_best_metrics"]:
+        checkpoint_updates = {
+            name: stopping["best_metrics"][name] for name in stopping["new_best_metrics"]}
+        if stopping["joint_improvement"]:
+            checkpoint_updates["joint"] = dict(
+                epoch=epoch, metric="both_metrics_same_epoch",
+                value={key: aggregate[key] for key, _ in EARLY_STOP_METRICS.values()})
+        for name, checkpoint_metrics in checkpoint_updates.items():
             checkpoint = self.training_output / f"best_{name}_model.pth"
             # Save only state_dict, matching the baseline checkpoint format.
             # Temporary-file replacement preserves the previous best on I/O failure.
@@ -265,7 +275,7 @@ class EpochValidator:
             torch.save(training_model.state_dict(), temporary)
             temporary.replace(checkpoint)
             self.best_checkpoints[name] = dict(
-                **stopping["best_metrics"][name], checkpoint=str(checkpoint),
+                **checkpoint_metrics, checkpoint=str(checkpoint),
                 checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest())
         report = dict(status="completed", epoch=epoch, train_mean_loss=float(train_mean_loss),
                       aggregate=aggregate, per_window=metrics["per_window"],
@@ -278,12 +288,13 @@ class EpochValidator:
         csv_path = self.training_output / "epoch_metrics.csv"
         with csv_path.open("w", encoding="utf-8", newline="") as stream:
             fields = ["epoch", "train_mean_loss", *aggregate, "validation_seconds",
-                      "early_stopping_bad_epochs", "stopped_early"]
+                      "joint_improvement", "early_stopping_bad_epochs", "stopped_early"]
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
             for row in self.reports:
                 writer.writerow(dict(epoch=row["epoch"], train_mean_loss=row["train_mean_loss"],
                                      **row["aggregate"], validation_seconds=row["validation_seconds"],
+                                     joint_improvement=row["early_stopping"]["joint_improvement"],
                                      early_stopping_bad_epochs=row["early_stopping"]["bad_epochs"],
                                      stopped_early=row["early_stopping"]["stopped_early"]))
         _save_json(self.output / "summary.json", self.summary())

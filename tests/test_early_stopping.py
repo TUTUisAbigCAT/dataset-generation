@@ -35,16 +35,17 @@ class EarlyStoppingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             stopping.update(7, metrics(9., 0.))
 
-    def test_either_metric_resets_patience_even_when_other_worsens(self):
-        stopping = EarlyStopping({'early_stopping': {'patience': 2}})
-        values = [(10, 100), (10, 100), (20, 90), (20, 90), (9, 200), (9, 200), (11, 300)]
+    def test_only_simultaneous_improvement_resets_patience(self):
+        stopping = EarlyStopping({'early_stopping': {'patience': 3}})
+        values = [(10, 100), (9, 100), (9, 90), (8, 80), (7, 90), (8, 70), (7, 70)]
         results = [stopping.update(i, metrics(*pair)) for i, pair in enumerate(values, 1)]
-        self.assertEqual([r['bad_epochs'] for r in results], [0, 1, 0, 1, 0, 1, 2])
+        self.assertEqual([r['bad_epochs'] for r in results], [0, 1, 2, 0, 1, 2, 3])
+        self.assertEqual([r['joint_improvement'] for r in results], [True, False, False, True, False, False, False])
         self.assertEqual(results[2]['improved_metrics'], ['variance'])
         self.assertEqual(results[4]['improved_metrics'], ['mean'])
         self.assertEqual(results[-1]['stopped_epoch'], 7)
         self.assertEqual(results[-1]['best_metrics']['mean']['epoch'], 5)
-        self.assertEqual(results[-1]['best_metrics']['variance']['epoch'], 3)
+        self.assertEqual(results[-1]['best_metrics']['variance']['epoch'], 6)
         # Earlier rows must remain immutable when later best values change.
         self.assertEqual(results[0]['best_metrics']['mean']['epoch'], 1)
 
@@ -58,8 +59,25 @@ class EarlyStoppingTests(unittest.TestCase):
         self.assertEqual(result['threshold_anchors'], {'mean': 10., 'variance': 100.})
         result = stopping.update(3, metrics(8.9, 95))
         self.assertEqual(result['improved_metrics'], ['mean'])
+        self.assertEqual(result['bad_epochs'], 2)
+        self.assertFalse(result['joint_improvement'])
+        result = stopping.update(4, metrics(8.9, 94.9))
+        self.assertEqual(result['improved_metrics'], ['variance'])
+        self.assertEqual(result['bad_epochs'], 3)
+        result = stopping.update(5, metrics(7.8, 89.8))
+        self.assertTrue(result['joint_improvement'])
         self.assertEqual(result['bad_epochs'], 0)
-        self.assertEqual(stopping.update(4, metrics(8.9, 94.9))['improved_metrics'], ['variance'])
+
+    def test_repeated_single_metric_improvement_cannot_prevent_stopping(self):
+        for improving in ('mean', 'variance'):
+            with self.subTest(improving=improving):
+                stopping = EarlyStopping({})
+                for epoch in range(1, 7):
+                    value = 100 - epoch
+                    row = metrics(value, 100) if improving == 'mean' else metrics(100, value)
+                    result = stopping.update(epoch, row)
+                    self.assertEqual(result['bad_epochs'], epoch - 1)
+                    self.assertEqual(result['stopped_early'], epoch == 6)
 
     def test_disabled_stopping_and_zero_errors(self):
         stopping = EarlyStopping({'early_stopping': {'enabled': False, 'patience': 1}})
@@ -151,7 +169,7 @@ class LauncherEarlyStoppingTests(unittest.TestCase):
                 self.assertFalse((output / 'failure.json').exists())
                 self.assertEqual(len(list((output / 'validation').glob('epoch_*'))), completed)
                 final = torch.load(manifest['checkpoint'], map_location='cpu', weights_only=True)
-                for metric in ('mean', 'variance'):
+                for metric in ('mean', 'variance', 'joint'):
                     best_path = output / f'best_{metric}_manifest.json'
                     _, selected, _ = load_training_run(best_path)
                     checkpoint, identity = resolve_checkpoint(best_path, selected)
