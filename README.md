@@ -92,29 +92,41 @@ python scripts/run_dreamt.py --epochs 50 --batch-size 8 --threads 4
 
 ```json
 "validation": {
-  "max_windows": 64,
+  "max_windows": null,
   "batch_size": 8,
   "seed": 20261020
 }
 ```
 
-默认从按受试者隔离的 val split 中固定选择最多 64 个互不重叠的合法窗口；不足时使用全部可用窗口，`max_windows: null` 使用全部不重叠窗口。候选搜索对齐 30 秒边界，按固定种子在受试者间轮流选取。训练期间窗口、顺序、采样种子不变；修改 batch_size 也可能改变采样随机流，跨实验比较应保持整个 validation 配置一致。所选窗口和实际数量记录在 `training/validation/protocol.json`，不读取 test split，不重新拟合标准化参数。
+默认使用按受试者隔离的 val split 中全部互不重叠的合法两分钟窗口（`max_windows: null`）。不足两分钟的尾段和含无效睡眠标签的窗口不参与；完整选择清单记录在 protocol 中。候选搜索对齐 30 秒边界；若显式设置整数 `max_windows`，才按固定种子在受试者间轮流限量抽取，该模式属于子集验证。训练期间窗口、顺序、采样种子不变；修改 batch_size 也可能改变采样随机流，跨实验比较应保持整个 validation 配置一致。所选窗口和实际数量记录在 `training/validation/protocol.json`，不读取 test split，不重新拟合标准化参数。
 
-指标只统计 IBI，反归一化到毫秒后用 float64 计算，总体方差采用 `correction=0`：
+指标只统计 IBI，反归一化到毫秒后用 float64 计算，总体方差采用 `correction=0`。每个连续 4 个睡眠 epoch（750 × 4 点）的窗口是一个 3000 维样本，全部窗口组织为 `X_real, X_gen: [N, 3000]`。在全部 N 个窗口上沿 `dim=0` 计算每个时间坐标的均值和方差，得到两个 3000 维向量：
+
+```text
+mu_real[j] = mean_n(X_real[n, j])
+v_real[j]  = mean_n((X_real[n, j] - mu_real[j])²)
+mu_gen、v_gen 同理
+mean_vector_l2_ms     = sqrt(sum_j((mu_gen[j] - mu_real[j])²))
+variance_vector_l2_ms2 = sqrt(sum_j((v_gen[j] - v_real[j])²))
+```
+
+两个欧式距离都不除以 √3000；例如所有坐标均值都偏移 1 ms，均值距离就是 √3000 ≈ 54.77 ms。方差向量是每个时间坐标的方差，不是 3000 × 3000 协方差矩阵；只比较一阶矩和对角二阶矩。一个窗口时跨窗口总体方差按定义为 0，不能据此判断方差是否学好。原有 pooled / per-window 统计仍保留作诊断：
 
 | 字段 | 定义 |
 |---|---|
+| `mean_vector_l2_ms` | 真实与生成的 3000 维均值向量欧式距离；早停主指标 |
+| `variance_vector_l2_ms2` | 真实与生成的 3000 维方差向量欧式距离；早停主指标 |
 | `mean_error_ms` | 所有验证样本合并后的生成均值 − 参考均值 |
 | `variance_error_ms2` | 所有验证样本合并后的生成方差 − 参考方差 |
 | `mean_absolute_error_ms` / `variance_absolute_error_ms2` | 上述整体差值的绝对值 |
 | `mean_window_absolute_error_ms` | 每个两分钟窗口均值差的绝对值，再对窗口取平均 |
 | `variance_window_absolute_error_ms2` | 每个两分钟窗口方差差的绝对值，再对窗口取平均 |
 
-整体指标和逐窗口指标同时记录，避免不同窗口的正负偏差被相互抵消。原存储零值仍计入统计，不裁剪生成值。每轮使用独立的 eval 模型副本；退出验证时恢复随机数状态，不改变训练模型的模式、梯度、buffer 或后续训练随机流。
+新增向量指标与原整体、逐窗口指标使用独立字段，旧字段定义不变。新指标对所有窗口一起估计矩，再计算距离；不对每个 batch 或每个窗口的距离取平均。原存储零值（包括缺失标记）仍计入统计，不裁剪生成值。每轮使用独立的 eval 模型副本；退出验证时恢复随机数状态，不改变训练模型的模式、梯度、buffer 或后续训练随机流。
 
 训练 `train_mean_loss = Σ(batch_MSE × batch样本数) / Σ(batch样本数)`，输出普通数值，不累积带计算图的 loss tensor。最后一个短 batch 按实际样本数加权；`training_report.json` 中的 `mean_loss` 为整个训练过程的同口径平均。反向传播仍使用原始 MSE，没有增加均值或方差损失项。
 
-每轮结果见 `training/epoch_metrics.csv`，详细逐窗口结果见 `training/validation/epoch_0001/metrics.json` 等文件，最新摘要见 `training/validation/summary.json`。默认每轮最多增加 `ceil(64/8) × 200 = 1600` 次采样模型前向调用，并需要一个额外的模型副本；显存不足时可调小 validation.batch_size。均值、方差指标不能单独证明整夜连续性或条件生成质量。
+每轮结果见 `training/epoch_metrics.csv`，详细逐窗口结果见 `training/validation/epoch_0001/metrics.json` 等文件，最新摘要见 `training/validation/summary.json`。每轮增加 `ceil(N/validation.batch_size) × 200` 次采样模型前向调用，并需要一个额外的模型副本；全量验证耗时随实际窗口数增长。生成和统计按 batch 在 CUDA 上执行，用按窗口数加权的中心矩合并得到全量结果，生成波形不跨 batch 保留在显存；所选条件、参考数据和输出元数据存放在主机。显存不足时可调小 validation.batch_size。向量均值、方差不包含时间位置之间的协方差，不能单独证明整夜连续性或条件生成质量。
 
 ## 基于均值和方差误差的早停
 
@@ -130,18 +142,18 @@ python scripts/run_dreamt.py --epochs 50 --batch-size 8 --threads 4
 }
 ```
 
-监控 `mean_window_absolute_error_ms` 和 `variance_window_absolute_error_ms2`，越低越好。分别对最近 5 个 epoch 的误差计算简单滑动平均（SMA）。前 4 轮只记录原始指标，不计早停等待次数；第 5 轮建立平滑参考值并保存首个整体 checkpoint。只有同一轮两项平滑指标都改善才重置等待计数（AND 规则）；仅一项改善或两项均未改善，计数加 1。连续 10 轮没有双指标同时改善，在该轮 validation 完成后停止，默认最早在第 15 轮结束。
+监控 `mean_vector_l2_ms` 和 `variance_vector_l2_ms2`，越低越好。分别对最近 5 个 epoch 的误差计算简单滑动平均（SMA）。前 4 轮只记录原始指标，不计早停等待次数；第 5 轮建立平滑参考值并保存首个整体 checkpoint。只有同一轮两项平滑指标都改善才重置等待计数（AND 规则）；仅一项改善或两项均未改善，计数加 1。连续 10 轮没有双指标同时改善，在该轮 validation 完成后停止，默认最早在第 15 轮结束。
 
 主入口默认上限和 `submit.sh` 均为 `--epochs 50`，可通过命令行覆盖。设置 `enabled: false` 关闭提前停止，但继续记录平滑指标、等待次数和最佳 checkpoint。若训练未满 `smoothing_window` 轮，不产生整体最佳 checkpoint；原始单项最佳和最终 checkpoint 仍正常保存。
 
-改善要求平滑误差下降幅度严格大于对应的 `min_delta`；默认 0 表示任何严格下降都算单项改善。需要忽略微小波动时，可分别设置毫秒和平方毫秒单位的正阈值。两项各自维护历史平滑参考值，单项改善也更新该项参考值，但不能单独清零等待计数；先后两轮分别改善不算同一轮整体改善。小幅改善可以累计超过各自阈值。此处判断相对历史表现的改善，没有设置绝对误差达标线。均值与方差单位不同，不直接相加形成总分。
+改善要求平滑误差下降幅度严格大于对应的 `min_delta`；默认 0 表示任何严格下降都算单项改善。需要忽略微小波动时，可分别设置毫秒和平方毫秒单位的正阈值；这两个 `min_delta` 现在作用于向量 L2 距离，不能直接沿用旧逐窗口误差的非零阈值。两项各自维护历史平滑参考值，单项改善也更新该项参考值，但不能单独清零等待计数；先后两轮分别改善不算同一轮整体改善。小幅改善可以累计超过各自阈值。此处判断相对历史表现的改善，没有设置绝对误差达标线。均值与方差单位不同，不直接相加形成总分。
 
 结果和权重：
 
-- `training/epoch_metrics.csv` 保留原始指标，新增 `smoothed_mean_window_absolute_error_ms`、`smoothed_variance_window_absolute_error_ms2` 和 `smoothing_ready`。窗口未满时平滑值为 CSV 空值 / JSON null。`joint_improvement` 表示本轮两项平滑指标是否同时改善，另记录 `early_stopping_bad_epochs`、`stopped_early`；每轮 JSON 记录原始最佳值及平滑参考值。
+- `training/epoch_metrics.csv` 保留原始指标，记录 `smoothed_mean_vector_l2_ms`、`smoothed_variance_vector_l2_ms2` 和 `smoothing_ready`。窗口未满时平滑值为 CSV 空值 / JSON null。`joint_improvement` 表示本轮两项平滑指标是否同时改善，另记录 `early_stopping_bad_epochs`、`stopped_early`；每轮 JSON 记录向量距离原始最佳值及平滑参考值。新协议为 `ibi_epoch_coordinate_moments_v2`，不与旧逐窗口误差混用。
 - `training/training_report.json` 的 `epochs` 是实际完成轮数，`requested_epochs` 是指定上限；`mean_loss` 只平均实际执行的训练样本。`stop_reason` 区分 `early_stopping` 与 `max_epochs`。
 - `training/best_joint_model.pth` 与早停计数清零同步更新，保存触发双指标平滑改善的当轮模型权重。这里平滑的是指标，不做模型权重平均或 EMA。`best_joint_manifest.json` 记录当轮原始值、平滑值、滑动窗口起始 epoch、窗口长度、所选 epoch 和权重哈希。
-- `training/best_mean_model.pth` 和 `training/best_variance_model.pth` 继续按原始单轮指标的最小误差保存，可能来自不同 epoch。相应的 `best_mean_manifest.json`、`best_variance_manifest.json` 记录权重哈希和所选 epoch，供原评估入口使用。
+- `training/best_mean_model.pth` 和 `training/best_variance_model.pth` 分别按单轮 `mean_vector_l2_ms`、`variance_vector_l2_ms2` 的最小值保存，可能来自不同 epoch。相应的 `best_mean_manifest.json`、`best_variance_manifest.json` 记录权重哈希和所选 epoch，供原评估入口使用。
 - 原 `saved_models/DREAMT/model.pth`（主工作流中位于运行目录的 `workspace/` 下）仍保存实际停止时的最终权重。主流程后续评估默认使用它，不自动切换到整体最佳 checkpoint。
 
 例如，训练结束后使用整体最佳权重执行原始采样（把路径替换成实际运行目录，输出目录须尚不存在）：

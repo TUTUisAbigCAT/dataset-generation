@@ -1,5 +1,6 @@
 """Independent numerical cases for the physical-unit validation diagnostics."""
 import json
+import math
 from pathlib import Path
 import random
 import sys
@@ -10,7 +11,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from validation_metrics import preserve_random_state, summarize_distribution
+from validation_metrics import DistributionAccumulator, preserve_random_state, summarize_distribution
 
 
 class ValidationMetricsTests(unittest.TestCase):
@@ -23,6 +24,8 @@ class ValidationMetricsTests(unittest.TestCase):
         self.assertEqual(aggregate["mean_absolute_error_ms"], 0.0)
         self.assertEqual(aggregate["variance_absolute_error_ms2"], 0.0)
         self.assertEqual(aggregate["variance_ratio"], 1.0)
+        self.assertEqual(aggregate["mean_vector_l2_ms"], 0.0)
+        self.assertEqual(aggregate["variance_vector_l2_ms2"], 0.0)
         self.assertEqual(len(result["per_window"]), 2)
         json.dumps(result, allow_nan=False)
 
@@ -121,6 +124,136 @@ class ValidationMetricsTests(unittest.TestCase):
                         actual = draws()
                     self.assertEqual(expected[:2], actual[:2])
                     self.assertTrue(torch.equal(expected[2], actual[2]))
+
+    def test_equal_pooled_moments_do_not_hide_coordinate_mean_error(self):
+        reference = torch.tensor([[0.5, 1.5], [0.5, 1.5]], dtype=torch.float64)
+        generated = torch.tensor([[1.5, 0.5], [1.5, 0.5]], dtype=torch.float64)
+        aggregate = summarize_distribution(generated, reference)["aggregate"]
+        self.assertEqual(aggregate["mean_absolute_error_ms"], 0.0)
+        self.assertEqual(aggregate["variance_absolute_error_ms2"], 0.0)
+        self.assertEqual(aggregate["mean_window_absolute_error_ms"], 0.0)
+        self.assertAlmostEqual(aggregate["mean_vector_l2_ms"], 1000.0 * math.sqrt(2.0))
+        self.assertEqual(aggregate["variance_vector_l2_ms2"], 0.0)
+
+    def test_equal_window_moments_do_not_hide_coordinate_variance_error(self):
+        # Every row has mean 1000 ms and population variance 500000 ms^2.
+        # All coordinate means also match, but the varying positions differ.
+        reference = torch.tensor([[0.0, 2.0, 1.0, 1.0],
+                                  [2.0, 0.0, 1.0, 1.0]], dtype=torch.float64)
+        generated = torch.tensor([[1.0, 1.0, 0.0, 2.0],
+                                  [1.0, 1.0, 2.0, 0.0]], dtype=torch.float64)
+        aggregate = summarize_distribution(generated, reference)["aggregate"]
+        self.assertEqual(aggregate["mean_window_absolute_error_ms"], 0.0)
+        self.assertEqual(aggregate["variance_window_absolute_error_ms2"], 0.0)
+        self.assertEqual(aggregate["mean_absolute_error_ms"], 0.0)
+        self.assertEqual(aggregate["variance_absolute_error_ms2"], 0.0)
+        self.assertEqual(aggregate["mean_vector_l2_ms"], 0.0)
+        # The variance difference vector is [-1e6, -1e6, 1e6, 1e6].
+        self.assertEqual(aggregate["variance_vector_l2_ms2"], 2000000.0)
+
+    def test_vector_metrics_are_invariant_to_independent_row_permutations(self):
+        reference = torch.tensor([[0.2, 0.8, 1.4], [0.3, 1.1, 1.2],
+                                  [1.3, 0.4, 0.9]], dtype=torch.float64)
+        generated = torch.tensor([[0.5, 0.8, 1.0], [0.4, 1.5, 1.1],
+                                  [0.9, 0.2, 0.7]], dtype=torch.float64)
+        original = summarize_distribution(generated, reference)["aggregate"]
+        shuffled = summarize_distribution(generated[[2, 0, 1]], reference[[1, 2, 0]])["aggregate"]
+        for key in ("mean_vector_l2_ms", "variance_vector_l2_ms2"):
+            with self.subTest(metric=key):
+                self.assertAlmostEqual(original[key], shuffled[key], places=7)
+
+    def test_3000_dimensional_distance_is_l2_not_coordinate_rmse(self):
+        reference = torch.ones((4, 3000), dtype=torch.float64)
+        generated = reference + 0.125
+        aggregate = summarize_distribution(generated, reference)["aggregate"]
+        self.assertAlmostEqual(aggregate["mean_vector_l2_ms"], 125.0 * math.sqrt(3000.0))
+        self.assertEqual(aggregate["variance_vector_l2_ms2"], 0.0)
+
+    def test_single_window_has_zero_coordinate_population_variance(self):
+        generated = torch.tensor([[0.0, 1.0, 2.0]], dtype=torch.float64)
+        reference = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float64)
+        aggregate = summarize_distribution(generated, reference)["aggregate"]
+        self.assertAlmostEqual(aggregate["mean_vector_l2_ms"], 1000.0 * math.sqrt(5.0))
+        self.assertEqual(aggregate["variance_vector_l2_ms2"], 0.0)
+        self.assertGreater(aggregate["generated_variance_ms2"], 0.0)
+        json.dumps(aggregate, allow_nan=False)
+
+    def test_chunked_accumulation_matches_numpy_all_rows_and_short_last_batch(self):
+        # Deliberately unequal chunk sizes and a final row far from the rest
+        # catch unweighted batch averages and missing between-batch variance.
+        generated_ms = np.array([[100, 200, 300, 400], [150, 250, 350, 450],
+                                 [800, 500, 200, 100], [200, 400, 600, 800],
+                                 [1000, 900, 800, 700], [0, -100, 300, 600],
+                                 [3000, 4000, 5000, 6000]], dtype=np.float64)
+        reference_ms = np.array([[200, 100, 500, 300], [500, 250, 0, 900],
+                                 [900, 700, 600, 500], [100, 200, 300, 400],
+                                 [600, 800, 1000, 1200], [700, 400, 100, -200],
+                                 [1000, 1500, 2000, 2500]], dtype=np.float64)
+        generated = torch.from_numpy(generated_ms / 1000.0).requires_grad_()
+        reference = torch.from_numpy(reference_ms / 1000.0)
+        saved_generated, saved_reference = generated.detach().clone(), reference.clone()
+        accumulator = DistributionAccumulator()
+        for start, stop in ((0, 3), (3, 6), (6, 7)):
+            accumulator.update(generated[start:stop], reference[start:stop])
+        result = accumulator.finalize()
+        aggregate = result["aggregate"]
+        expected = {
+            "generated_mean_ms": generated_ms.mean(),
+            "reference_mean_ms": reference_ms.mean(),
+            "generated_variance_ms2": generated_ms.var(ddof=0),
+            "reference_variance_ms2": reference_ms.var(ddof=0),
+            "mean_vector_l2_ms": np.linalg.norm(generated_ms.mean(axis=0) - reference_ms.mean(axis=0)),
+            "variance_vector_l2_ms2": np.linalg.norm(generated_ms.var(axis=0, ddof=0)
+                                                    - reference_ms.var(axis=0, ddof=0)),
+            "mean_window_absolute_error_ms": np.abs(generated_ms.mean(axis=1)
+                                                      - reference_ms.mean(axis=1)).mean(),
+            "variance_window_absolute_error_ms2": np.abs(generated_ms.var(axis=1, ddof=0)
+                                                           - reference_ms.var(axis=1, ddof=0)).mean(),
+        }
+        for key, value in expected.items():
+            with self.subTest(metric=key):
+                self.assertAlmostEqual(aggregate[key], value, places=7)
+        self.assertEqual(len(result["per_window"]), 7)
+        for index, row in enumerate(result["per_window"]):
+            with self.subTest(window=index):
+                self.assertEqual(row["window_index"], index)
+                self.assertAlmostEqual(row["generated_mean_ms"], generated_ms[index].mean())
+                self.assertAlmostEqual(row["reference_mean_ms"], reference_ms[index].mean())
+                self.assertAlmostEqual(row["generated_variance_ms2"], generated_ms[index].var(ddof=0))
+                self.assertAlmostEqual(row["reference_variance_ms2"], reference_ms[index].var(ddof=0))
+        direct = summarize_distribution(generated, reference)
+        for key, value in direct["aggregate"].items():
+            with self.subTest(direct_metric=key):
+                if value is None:
+                    self.assertIsNone(aggregate[key])
+                else:
+                    self.assertAlmostEqual(aggregate[key], value, places=7)
+        self.assertTrue(torch.equal(generated, saved_generated))
+        self.assertTrue(torch.equal(reference, saved_reference))
+        self.assertIsNone(generated.grad)
+        json.dumps(result, allow_nan=False)
+
+    def test_accumulator_rejects_empty_result_and_feature_count_changes(self):
+        with self.assertRaises(ValueError):
+            DistributionAccumulator().finalize()
+        accumulator = DistributionAccumulator()
+        accumulator.update(torch.ones((2, 4)), torch.zeros((2, 4)))
+        with self.assertRaises(ValueError):
+            accumulator.update(torch.ones((1, 3)), torch.zeros((1, 3)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for streaming metric test")
+    def test_cuda_streaming_vector_metrics_match_hand_calculated_distances(self):
+        reference = torch.tensor([[0.0, 2.0, 1.0, 1.0],
+                                  [2.0, 0.0, 1.0, 1.0]], dtype=torch.float64, device="cuda")
+        generated = torch.tensor([[1.0, 1.0, 0.0, 2.0],
+                                  [1.0, 1.0, 2.0, 0.0]], dtype=torch.float64, device="cuda")
+        accumulator = DistributionAccumulator()
+        accumulator.update(generated[:1], reference[:1])
+        accumulator.update(generated[1:], reference[1:])
+        aggregate = accumulator.finalize()["aggregate"]
+        self.assertEqual(aggregate["mean_vector_l2_ms"], 0.0)
+        self.assertEqual(aggregate["variance_vector_l2_ms2"], 2000000.0)
+        json.dumps(aggregate, allow_nan=False)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for device RNG test")
     def test_cuda_arithmetic_and_rng_restoration(self):

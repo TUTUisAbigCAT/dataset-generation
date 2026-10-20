@@ -13,5 +13,10 @@
     "min_delta_mean_ms": 0.0,
     "min_delta_variance_ms2": 0.0,
     "smoothing_window": 5
+  },
+  "validation": {
+    "max_windows": null,
+    "batch_size": 8,
+    "seed": 20261020
   }
 }

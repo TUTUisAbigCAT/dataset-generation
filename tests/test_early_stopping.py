@@ -16,10 +16,11 @@ sys.path.insert(0, str(ROOT))
 from epoch_validation import EarlyStopping, early_stopping_options, EpochValidator
 from scripts import run_dreamt, run_simulation
 from scripts.evaluate_denoising import resolve_checkpoint, load_training_run
+from validation_metrics import summarize_distribution
 
 
 def metrics(mean, variance):
-    return dict(mean_window_absolute_error_ms=mean, variance_window_absolute_error_ms2=variance)
+    return dict(mean_vector_l2_ms=mean, variance_vector_l2_ms2=variance)
 
 
 class EarlyStoppingTests(unittest.TestCase):
@@ -164,7 +165,7 @@ class LauncherEarlyStoppingTests(unittest.TestCase):
                         '--batch-size', '4', '--output-dir', str(output)]
 
                 def generate(validator, model):
-                    return validator.reference.clone(), {'unit_test_mock': True}, []
+                    return summarize_distribution(validator.reference, validator.reference), {'unit_test_mock': True}, []
 
                 with mock.patch.dict(os.environ, env, clear=True), \
                      mock.patch.object(sys, 'argv', argv), \
@@ -204,6 +205,9 @@ class LauncherEarlyStoppingTests(unittest.TestCase):
                     checkpoint, identity = resolve_checkpoint(best_path, selected)
                     self.assertTrue(identity['recorded_digest_verified'])
                     self.assertEqual(selected['checkpoint_epoch'], 5 if metric == 'joint' else 1)
+                    if metric != 'joint':
+                        expected_metric = 'mean_vector_l2_ms' if metric == 'mean' else 'variance_vector_l2_ms2'
+                        self.assertEqual(selected['checkpoint_selection']['metric'], expected_metric)
                     if metric == 'joint':
                         selection = selected['checkpoint_selection']
                         self.assertEqual(selection['smoothing_window'], 5)

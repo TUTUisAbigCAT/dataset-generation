@@ -1,9 +1,8 @@
-"""Mean and population-variance checks on generated IBI in physical units.
+"""Sequence-coordinate moments and legacy IBI distribution diagnostics.
 
-These are distribution diagnostics, not FID or paired waveform errors. Inputs
-are windows in seconds. Arithmetic remains on the input device in float64;
-only the final scalars are converted for JSON logging. Production callers must
-require CUDA before calling these helpers. CPU inputs support unit tests only.
+One row is a sequence sample; dim=0 estimates each time coordinate's mean and
+population variance across windows. All tensor arithmetic stays on the input
+device in float64. Production callers require CUDA; CPU supports unit tests.
 """
 from __future__ import annotations
 
@@ -14,14 +13,12 @@ import numpy as np
 import torch
 
 
-def summarize_distribution(generated_seconds, reference_seconds):
-    """Compare equal-shaped ``[windows, samples]`` IBI tensors without clipping.
+_ROW_FIELDS = ("generated_mean_ms", "reference_mean_ms", "mean_error_ms",
+               "mean_absolute_error_ms", "generated_variance_ms2",
+               "reference_variance_ms2", "variance_error_ms2", "variance_absolute_error_ms2")
 
-    Variances use the population definition (``unbiased=False``). Aggregate
-    statistics cover all samples, while the two window-error summaries average
-    absolute differences of each window's mean or variance. A variance ratio
-    with a zero reference variance is undefined and is serialized as ``None``.
-    """
+
+def _prepare_pair(generated_seconds, reference_seconds):
     for name, value in (("generated", generated_seconds), ("reference", reference_seconds)):
         if not torch.is_tensor(value) or not value.is_floating_point():
             raise TypeError(f"{name} must be a real floating-point tensor")
@@ -30,49 +27,111 @@ def summarize_distribution(generated_seconds, reference_seconds):
     if generated_seconds.shape != reference_seconds.shape:
         raise ValueError("Generated and reference shapes must match")
     if generated_seconds.device != reference_seconds.device:
-        raise ValueError("Generated and reference tensors must be on the same device")
+        raise ValueError("Generated and reference tensors must use the same device")
+    generated = generated_seconds.detach().to(dtype=torch.float64) * 1000.0
+    reference = reference_seconds.detach().to(dtype=torch.float64) * 1000.0
+    if not bool(torch.isfinite(generated).all() & torch.isfinite(reference).all()):
+        raise ValueError("Generated and reference IBI must be finite in milliseconds")
+    return generated, reference
 
-    with torch.no_grad():
-        generated = generated_seconds.detach().to(dtype=torch.float64) * 1000.0
-        reference = reference_seconds.detach().to(dtype=torch.float64) * 1000.0
-        if not bool(torch.isfinite(generated).all() & torch.isfinite(reference).all()):
-            raise ValueError("Generated and reference IBI must be finite in milliseconds")
-        generated_variance, generated_mean = torch.var_mean(generated, dim=1, unbiased=False)
-        reference_variance, reference_mean = torch.var_mean(reference, dim=1, unbiased=False)
-        global_generated_variance, global_generated_mean = torch.var_mean(generated, unbiased=False)
-        global_reference_variance, global_reference_mean = torch.var_mean(reference, unbiased=False)
 
-        def row(gen_mean, ref_mean, gen_var, ref_var):
-            values = torch.stack((gen_mean, ref_mean, gen_mean - ref_mean,
-                                  (gen_mean - ref_mean).abs(), gen_var, ref_var,
-                                  gen_var - ref_var, (gen_var - ref_var).abs()))
-            if not bool(torch.isfinite(values).all()):
-                raise FloatingPointError("Nonfinite IBI distribution statistic")
-            result = dict(zip(("generated_mean_ms", "reference_mean_ms", "mean_error_ms",
-                               "mean_absolute_error_ms", "generated_variance_ms2",
-                               "reference_variance_ms2", "variance_error_ms2",
-                               "variance_absolute_error_ms2"), values.tolist()))
-            if bool(ref_var == 0):
-                result["variance_ratio"] = None
-            else:
-                ratio = gen_var / ref_var
-                if not bool(torch.isfinite(ratio)):
-                    raise FloatingPointError("Nonfinite IBI variance ratio")
-                result["variance_ratio"] = float(ratio)
-            return result
+def _moment_rows(gen_mean, ref_mean, gen_var, ref_var):
+    """Transfer a batch of final diagnostics together, avoiding per-row CUDA sync."""
+    values = torch.stack((gen_mean, ref_mean, gen_mean - ref_mean,
+                          (gen_mean - ref_mean).abs(), gen_var, ref_var,
+                          gen_var - ref_var, (gen_var - ref_var).abs()), dim=-1).reshape(-1, 8)
+    valid = ref_var != 0
+    ratio = gen_var / torch.where(valid, ref_var, torch.ones_like(ref_var))
+    if not bool(torch.isfinite(values).all() & torch.isfinite(ratio[valid]).all()):
+        raise FloatingPointError("Nonfinite IBI distribution statistic")
+    packed = torch.cat((values, ratio.reshape(-1, 1), valid.to(torch.float64).reshape(-1, 1)), dim=1)
+    return [dict(zip(_ROW_FIELDS, row[:8]), variance_ratio=row[8] if row[9] else None)
+            for row in packed.tolist()]
 
-        aggregate = row(global_generated_mean, global_reference_mean,
-                        global_generated_variance, global_reference_variance)
-        window_errors = torch.stack(((generated_mean - reference_mean).abs().mean(),
-                                     (generated_variance - reference_variance).abs().mean()))
-        if not bool(torch.isfinite(window_errors).all()):
-            raise FloatingPointError("Nonfinite mean per-window distribution error")
-        aggregate["mean_window_absolute_error_ms"] = float(window_errors[0])
-        aggregate["variance_window_absolute_error_ms2"] = float(window_errors[1])
-        per_window = [dict(window_index=index, **row(generated_mean[index], reference_mean[index],
-                                                    generated_variance[index], reference_variance[index]))
-                      for index in range(generated.shape[0])]
-    return {"aggregate": aggregate, "per_window": per_window}
+
+class DistributionAccumulator:
+    """Merge batch moments into moments of ALL sequence samples, on device.
+
+    Chan's centered-moment merge weights unequal batches by their window counts.
+    No generated waveform is retained after update. Only O(sequence length)
+    running tensors and serialized per-window diagnostics remain. The L2 metrics
+    are neither per-window waveform distances nor RMS (no division by sqrt(D)).
+    """
+    def __init__(self):
+        self.count = 0
+        self.generated_mean = self.reference_mean = None
+        self.generated_m2 = self.reference_m2 = None
+        self.window_errors = None
+        self.per_window = []
+
+    @torch.no_grad()
+    def update(self, generated_seconds, reference_seconds):
+        generated, reference = _prepare_pair(generated_seconds, reference_seconds)
+        if self.count and (generated.shape[1] != self.generated_mean.numel()
+                           or generated.device != self.generated_mean.device):
+            raise ValueError("Batches must have the same feature dimension and device")
+        batch_count = len(generated)
+        gen_window_var, gen_window_mean = torch.var_mean(generated, dim=1, unbiased=False)
+        ref_window_var, ref_window_mean = torch.var_mean(reference, dim=1, unbiased=False)
+        rows = _moment_rows(gen_window_mean, ref_window_mean, gen_window_var, ref_window_var)
+        errors = torch.stack(((gen_window_mean - ref_window_mean).abs().sum(),
+                              (gen_window_var - ref_window_var).abs().sum()))
+        gen_var, gen_mean = torch.var_mean(generated, dim=0, unbiased=False)
+        ref_var, ref_mean = torch.var_mean(reference, dim=0, unbiased=False)
+        if not bool(torch.isfinite(gen_var).all() & torch.isfinite(ref_var).all()
+                    & torch.isfinite(gen_mean).all() & torch.isfinite(ref_mean).all()
+                    & torch.isfinite(errors).all()):
+            raise FloatingPointError("Nonfinite sequence-coordinate moments")
+        if self.count == 0:
+            self.generated_mean, self.reference_mean = gen_mean, ref_mean
+            self.generated_m2, self.reference_m2 = gen_var * batch_count, ref_var * batch_count
+            self.window_errors = errors
+        else:
+            total = self.count + batch_count
+            for prefix, mean, variance in (("generated", gen_mean, gen_var), ("reference", ref_mean, ref_var)):
+                old_mean = getattr(self, prefix + "_mean")
+                delta = mean - old_mean
+                m2 = (getattr(self, prefix + "_m2") + variance * batch_count
+                      + delta.square() * (self.count * batch_count / total))
+                setattr(self, prefix + "_mean", old_mean + delta * (batch_count / total))
+                setattr(self, prefix + "_m2", m2)
+            self.window_errors = self.window_errors + errors
+        self.per_window.extend(dict(window_index=self.count + index, **row) for index, row in enumerate(rows))
+        self.count += batch_count
+
+    @torch.no_grad()
+    def finalize(self):
+        if self.count == 0:
+            raise ValueError("Cannot summarize empty validation data")
+        gen_var = self.generated_m2 / self.count
+        ref_var = self.reference_m2 / self.count
+        gen_mean = self.generated_mean.mean()
+        ref_mean = self.reference_mean.mean()
+        # Law of total variance recovers the original pooled scalar diagnostic.
+        pooled_gen_var = (gen_var + (self.generated_mean - gen_mean).square()).mean()
+        pooled_ref_var = (ref_var + (self.reference_mean - ref_mean).square()).mean()
+        aggregate = _moment_rows(gen_mean, ref_mean, pooled_gen_var, pooled_ref_var)[0]
+        distances = torch.stack((torch.linalg.vector_norm(self.generated_mean - self.reference_mean),
+                                 torch.linalg.vector_norm(gen_var - ref_var)))
+        window_errors = self.window_errors / self.count
+        if not bool(torch.isfinite(distances).all() & torch.isfinite(window_errors).all()):
+            raise FloatingPointError("Nonfinite validation error")
+        aggregate.update(zip(("mean_window_absolute_error_ms", "variance_window_absolute_error_ms2"),
+                             window_errors.tolist()))
+        aggregate.update(zip(("mean_vector_l2_ms", "variance_vector_l2_ms2"), distances.tolist()))
+        return {"aggregate": aggregate, "per_window": [row.copy() for row in self.per_window]}
+
+
+def summarize_distribution(generated_seconds, reference_seconds):
+    """Compare [windows, time coordinates] using the same all-window estimator.
+
+    Inputs are seconds. Coordinate population variances use correction=0; for
+    one window they are zero. Legacy pooled/window diagnostics retain their
+    definitions. Stored zeros and negative generated values are not clipped.
+    """
+    accumulator = DistributionAccumulator()
+    accumulator.update(generated_seconds, reference_seconds)
+    return accumulator.finalize()
 
 
 @contextmanager

@@ -14,17 +14,17 @@ import numpy as np
 import torch
 
 from cuda_runtime import assert_cuda_model, require_cuda
-from validation_metrics import preserve_random_state, summarize_distribution
+from validation_metrics import DistributionAccumulator, preserve_random_state
 from validation_sampling import sample_validation_windows
 
-DEFAULT_VALIDATION = {"max_windows": 64, "batch_size": 8, "seed": 20261020}
+DEFAULT_VALIDATION = {"max_windows": None, "batch_size": 8, "seed": 20261020}
 DEFAULT_EARLY_STOPPING = {
     "enabled": True, "patience": 10, "smoothing_window": 5,
     "min_delta_mean_ms": 0.0, "min_delta_variance_ms2": 0.0,
 }
 EARLY_STOP_METRICS = {
-    "mean": ("mean_window_absolute_error_ms", "min_delta_mean_ms"),
-    "variance": ("variance_window_absolute_error_ms2", "min_delta_variance_ms2"),
+    "mean": ("mean_vector_l2_ms", "min_delta_mean_ms"),
+    "variance": ("variance_vector_l2_ms2", "min_delta_variance_ms2"),
 }
 
 
@@ -220,7 +220,7 @@ class EpochValidator:
                      file_sha256=preprocessor.record(name)["file_sha256"])
                 for name, start in selected]
         self.protocol = dict(
-            schema="ibi_epoch_mean_variance_v1", metric="IBI distribution mean and population variance",
+            schema="ibi_epoch_coordinate_moments_v2", metric="Euclidean distances between 3000-dimensional coordinate mean and variance vectors",
             options=self.options, selection=selection, windows=self.windows_metadata,
             early_stopping=self.early_stopping.options,
             early_stopping_improvement_rule="both_smoothed_metrics_same_epoch",
@@ -232,9 +232,14 @@ class EpochValidator:
             diffusion_steps=diffusion_config["T"], initialization_seed=42,
             validation_seed_reset_each_epoch=True, training_rng_restored=True,
             signal_unit="milliseconds", variance_unit="milliseconds_squared", variance_correction=0,
-            aggregation="all selected IBI samples pooled; conditions excluded; stored zeros included; no clipping",
+            aggregation="one 3000-dimensional sample per window; coordinate moments over all selected windows; stored zeros included; no clipping",
+            vector_metrics=dict(mean="mean_vector_l2_ms", variance="variance_vector_l2_ms2",
+                                dimension=3000, moment_axis="windows (dim=0)", distance="L2, no dimension normalization",
+                                covariance="diagonal only", accumulation="CUDA batched centered-moment merge",
+                                single_window_variance="zero under population definition"),
+            diagnostic_aggregation="legacy pooled and per-window scalars retained; excluded from early stopping",
             metric_dtype="float64", device=str(self.device), test_npz_opened=False,
-            limitations="Mean and variance alone do not establish waveform, temporal, or conditional fidelity.")
+            limitations="Coordinate means and variances exclude cross-coordinate covariance and do not establish temporal or conditional fidelity.")
         _save_json(self.output / "protocol.json", self.protocol)
 
     def _generate(self, training_model):
@@ -249,13 +254,15 @@ class EpochValidator:
         model.eval()
         torch.manual_seed(self.options["seed"])
         np.random.seed(self.options["seed"])
-        generated, sampler_reports = [], []
+        accumulator, sampler_reports = DistributionAccumulator(), []
         for start in range(0, len(self.windows), self.options["batch_size"]):
             clean = self.windows[start:start+self.options["batch_size"]].to(self.device)
             ibi, metadata = sample_validation_windows(model, clean, self.diffusion_config, self.args, self.device)
-            generated.append(ibi.to(dtype=torch.float64) * self.scale + self.center)
+            generated_seconds = ibi.to(dtype=torch.float64) * self.scale + self.center
+            reference_seconds = self.reference[start:start+self.options["batch_size"]].to(self.device)
+            accumulator.update(generated_seconds, reference_seconds)
             sampler_reports.append(metadata)
-        return torch.cat(generated), copied, sampler_reports
+        return accumulator.finalize(), copied, sampler_reports
 
     def run(self, epoch, training_model, train_mean_loss):
         if self.should_stop or epoch != len(self.reports) + 1:
@@ -268,9 +275,7 @@ class EpochValidator:
         epoch_dir = self.output / f"epoch_{epoch:04d}"
         epoch_dir.mkdir(exist_ok=False)
         with preserve_random_state(self.device):
-            generated, copied, sampler_reports = self._generate(training_model)
-            reference = self.reference.to(self.device)
-            metrics = summarize_distribution(generated, reference)
+            metrics, copied, sampler_reports = self._generate(training_model)
             for row, metadata in zip(metrics["per_window"], self.windows_metadata):
                 row.update(metadata)
         aggregate = metrics["aggregate"]
@@ -306,7 +311,7 @@ class EpochValidator:
         csv_path = self.training_output / "epoch_metrics.csv"
         with csv_path.open("w", encoding="utf-8", newline="") as stream:
             fields = ["epoch", "train_mean_loss", *aggregate, "validation_seconds",
-                      "smoothed_mean_window_absolute_error_ms", "smoothed_variance_window_absolute_error_ms2",
+                      *("smoothed_" + key for key, _ in EARLY_STOP_METRICS.values()),
                       "smoothing_ready",
                       "joint_improvement", "early_stopping_bad_epochs", "stopped_early"]
             writer = csv.DictWriter(stream, fieldnames=fields)
@@ -326,7 +331,7 @@ class EpochValidator:
         return report
 
     def summary(self):
-        return dict(metric="IBI distribution mean and population variance",
+        return dict(metric="Euclidean distances between 3000-dimensional coordinate mean and variance vectors",
                     completed_epochs=len(self.reports), options=self.options,
                     early_stopping=self.early_stopping.summary(),
                     best_checkpoints={name: value.copy() for name, value in self.best_checkpoints.items()},

@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from data_utils import Preprocessor
 import epoch_validation as coordinator
+from validation_metrics import summarize_distribution
 
 
 
@@ -122,6 +123,17 @@ class ValidationOptionsAndSelectionTests(unittest.TestCase):
         processor.make_validation_dataset.return_value = SimpleNamespace(window_index=[])
         with self.assertRaisesRegex(ValueError, "No complete"):
             coordinator.select_fixed_windows(processor, coordinator.DEFAULT_VALIDATION)
+
+    def test_default_selection_includes_all_windows_beyond_previous_sixty_four_cap(self):
+        index = [("val.npz", start) for start in range(0, 80 * 3000, 750)]
+        processor = mock.Mock(splits={"val": ["val.npz"]})
+        processor.make_validation_dataset.return_value = SimpleNamespace(window_index=index)
+        options = coordinator.validation_options({})
+        self.assertIsNone(options["max_windows"])
+        selected, metadata = coordinator.select_fixed_windows(processor, options)
+        self.assertEqual(selected, [("val.npz", start) for start in range(0, 80 * 3000, 3000)])
+        self.assertEqual(metadata["available_nonoverlapping_windows"], 80)
+        self.assertEqual(metadata["selected_windows"], 80)
 
 
 class EpochCoordinatorTests(unittest.TestCase):
@@ -239,7 +251,7 @@ class EpochCoordinatorTests(unittest.TestCase):
                 random.random()
                 np.random.rand(3)
                 torch.rand(3)
-                return sample.clone(), {"unit_test_mock": True}, [{"unit_test_mock": True}]
+                return summarize_distribution(sample, frozen), {"unit_test_mock": True}, [{"unit_test_mock": True}]
 
             with mock.patch.object(validator, "_generate", side_effect=fake_generate), contextlib.redirect_stdout(io.StringIO()):
                 reports.append(validator.run(epoch, self.model, .3 / epoch))
@@ -250,8 +262,12 @@ class EpochCoordinatorTests(unittest.TestCase):
         self.assertAlmostEqual(first["aggregate"]["reference_variance_ms2"], 250000.)
         self.assertTrue(all(row["reference_variance_ms2"] == 0. for row in first["per_window"]))
         self.assertAlmostEqual(first["aggregate"]["mean_absolute_error_ms"], 100.)
+        self.assertAlmostEqual(first["aggregate"]["mean_vector_l2_ms"], 100. * 3000 ** .5)
+        self.assertAlmostEqual(first["aggregate"]["variance_vector_l2_ms2"], 0.)
         self.assertAlmostEqual(second["aggregate"]["mean_absolute_error_ms"], 0.)
         self.assertAlmostEqual(second["aggregate"]["variance_absolute_error_ms2"], 750000.)
+        self.assertAlmostEqual(second["aggregate"]["mean_vector_l2_ms"], 0.)
+        self.assertAlmostEqual(second["aggregate"]["variance_vector_l2_ms2"], 750000. * 3000 ** .5)
         summary = validator.summary()
         self.assertEqual(summary["completed_epochs"], 3)
         with (self.output.parent / "epoch_metrics.csv").open(newline="", encoding="utf-8") as stream:
@@ -287,11 +303,10 @@ class EpochCoordinatorTests(unittest.TestCase):
         for epoch, (mean, variance) in enumerate(zip(means, variances), 1):
             with torch.no_grad():
                 self.model[0].weight.fill_(epoch)
-            measured = dict(aggregate=dict(mean_window_absolute_error_ms=mean,
-                                          variance_window_absolute_error_ms2=variance),
+            measured = dict(aggregate=dict(mean_vector_l2_ms=mean,
+                                          variance_vector_l2_ms2=variance),
                             per_window=[{}, {}])
-            with mock.patch.object(validator, "_generate", return_value=(validator.reference.clone(), {}, [])), \
-                 mock.patch.object(coordinator, "summarize_distribution", return_value=measured), \
+            with mock.patch.object(validator, "_generate", return_value=(measured, {}, [])), \
                  contextlib.redirect_stdout(io.StringIO()):
                 report = validator.run(epoch, self.model, .1)
             joint_epoch = 4 if epoch == 4 else 1
@@ -307,11 +322,10 @@ class EpochCoordinatorTests(unittest.TestCase):
         for epoch, mean in enumerate((10., 10., 10., 7., 20.), 1):
             with torch.no_grad():
                 self.model[0].weight.fill_(epoch)
-            measured = dict(aggregate=dict(mean_window_absolute_error_ms=mean,
-                                          variance_window_absolute_error_ms2=mean * 10),
+            measured = dict(aggregate=dict(mean_vector_l2_ms=mean,
+                                          variance_vector_l2_ms2=mean * 10),
                             per_window=[{}, {}])
-            with mock.patch.object(validator, "_generate", return_value=(validator.reference.clone(), {}, [])), \
-                 mock.patch.object(coordinator, "summarize_distribution", return_value=measured), \
+            with mock.patch.object(validator, "_generate", return_value=(measured, {}, [])), \
                  contextlib.redirect_stdout(io.StringIO()):
                 report = validator.run(epoch, self.model, .1)
             checkpoints = validator.summary()["best_checkpoints"]
@@ -325,14 +339,14 @@ class EpochCoordinatorTests(unittest.TestCase):
                 self.assertEqual(selected["epoch"], expected_epoch)
                 saved = torch.load(selected["checkpoint"], map_location="cpu", weights_only=True)
                 self.assertEqual(saved["0.weight"].item(), expected_epoch)
-        self.assertEqual(selected["value"], dict(mean_window_absolute_error_ms=9., variance_window_absolute_error_ms2=90.))
-        self.assertEqual(selected["raw_metrics"]["mean_window_absolute_error_ms"], 7.)
+        self.assertEqual(selected["value"], dict(mean_vector_l2_ms=9., variance_vector_l2_ms2=90.))
+        self.assertEqual(selected["raw_metrics"]["mean_vector_l2_ms"], 7.)
         self.assertEqual(selected["window_start_epoch"], 2)
         with (self.output.parent / "epoch_metrics.csv").open(newline="", encoding="utf-8") as stream:
             rows = list(csv.DictReader(stream))
-        self.assertEqual(rows[0]["smoothed_mean_window_absolute_error_ms"], "")
+        self.assertEqual(rows[0]["smoothed_mean_vector_l2_ms"], "")
         self.assertEqual(rows[0]["smoothing_ready"], "False")
-        self.assertEqual(float(rows[3]["smoothed_mean_window_absolute_error_ms"]), 9.)
+        self.assertEqual(float(rows[3]["smoothed_mean_vector_l2_ms"]), 9.)
         self.assertEqual(rows[4]["early_stopping_bad_epochs"], "1")
 
     def test_epoch_order_and_nonfinite_loss_rejected(self):
@@ -387,6 +401,53 @@ class EpochCoordinatorTests(unittest.TestCase):
         self.assertEqual(first["aggregate"], second["aggregate"])
         self.assertRngEqual(original_rng)
         self.assertModelEqual(original_model)
+
+    def test_actual_generation_accumulates_coordinate_moments_across_uneven_batches(self):
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(.05))
+
+        self.model = TinyModel().train()
+        processor = TwoWindowPreprocessor()
+        processor.splits["val"] = [f"val_{index}.npz" for index in range(5)]
+        coordinate = np.linspace(-1., 1., 3000, dtype=np.float64)
+        processor.records = {
+            name: dict(ibi=.6 + index * .2 + coordinate * (.01 + .03 * index),
+                       stages=np.full(3000, index % 4, dtype=np.int8),
+                       file_sha256=str(index) * 64)
+            for index, name in enumerate(processor.splits["val"])
+        }
+        validator = self.make_validator(processor)
+        self.assertEqual(validator.options["batch_size"], 2)
+        batch_sizes, generated_batches = [], []
+
+        def sample(model, clean, diffusion_config, args, device):
+            self.assertFalse(model.training)
+            batch_sizes.append(len(clean))
+            pattern = torch.linspace(-.2, .3, 3000, dtype=clean.dtype, device=clean.device)
+            generated = clean[:, :, 0] * .7 + pattern
+            generated_batches.append(generated.to(torch.float64) * validator.scale + validator.center)
+            return generated, {"unit_test_mock": True, "windows": len(clean)}
+
+        with mock.patch("training_utils.fetchModel", side_effect=lambda *args: TinyModel()), \
+             mock.patch.object(coordinator, "sample_validation_windows", side_effect=sample), \
+             contextlib.redirect_stdout(io.StringIO()):
+            report = validator.run(1, self.model, .1)
+        self.assertEqual(batch_sizes, [2, 2, 1])
+        self.assertEqual([entry["windows"] for entry in report["sampling"]], [2, 2, 1])
+        generated_ms = torch.cat(generated_batches) * 1000.
+        reference_ms = validator.reference * 1000.
+        expected_mean_distance = torch.linalg.vector_norm(generated_ms.mean(dim=0) - reference_ms.mean(dim=0))
+        expected_variance_distance = torch.linalg.vector_norm(
+            generated_ms.var(dim=0, unbiased=False) - reference_ms.var(dim=0, unbiased=False))
+        self.assertAlmostEqual(report["aggregate"]["mean_vector_l2_ms"], float(expected_mean_distance), places=7)
+        self.assertAlmostEqual(report["aggregate"]["variance_vector_l2_ms2"], float(expected_variance_distance), places=6)
+        self.assertEqual(len(report["per_window"]), 5)
+        self.assertEqual([row["window_index"] for row in report["per_window"]], list(range(5)))
+        self.assertEqual([row["filename"] for row in report["per_window"]], processor.splits["val"])
+        self.assertEqual(report["early_stopping"]["best_metrics"]["mean"]["metric"], "mean_vector_l2_ms")
+        self.assertEqual(report["early_stopping"]["best_metrics"]["variance"]["metric"], "variance_vector_l2_ms2")
 
 if __name__ == "__main__":
     unittest.main()
