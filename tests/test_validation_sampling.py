@@ -30,7 +30,7 @@ class TinyDenoiser(torch.nn.Module):
 
 def fixture(device="cpu", length=6, steps=200):
     device = torch.device(device)
-    args = SimpleNamespace(window_size=length, stride=length // 2, timesteps=steps)
+    args = SimpleNamespace(window_size=length, stride=length // 2, timesteps=steps, s4_lmax=length)
     windows = torch.arange(2 * length * 10, device=device, dtype=torch.float32).reshape(2, length, 10) / 100
     betas = torch.linspace(.0001, .02, steps, device=device).reshape(steps, 1)
     config = {"T": steps, "betas": betas, "alphas": 1 - betas,
@@ -134,6 +134,53 @@ class ValidationSamplingTests(unittest.TestCase):
         model, clean, config, args = fixture()
         with self.assertRaisesRegex(RuntimeError, "CUDA is required.*CPU fallback is disabled"):
             sample_validation_windows(model, clean, config, args, "cpu")
+
+    def test_whole_epoch_lengths_preserve_original_sampler_masks_and_arguments(self):
+        for epochs in (1, 2, 3, 8):
+            with self.subTest(window_epochs=epochs):
+                length = epochs * 750
+                model, clean, config, args = fixture(length=length, steps=3)
+                args.stride = 750
+                original_input = clean.clone()
+                original_args = vars(args).copy()
+                with torch.random.fork_rng():
+                    torch.manual_seed(1951)
+                    generated, metadata = _sample_windows_from_original(model, clean, config, args, "cpu")
+                    torch.manual_seed(1951)
+                    expected = direct_upstream(TinyDenoiser().eval(), clean, config, args)
+                self.assertTrue(torch.equal(generated, expected))
+                self.assertEqual(generated.shape, (2, length))
+                self.assertEqual(metadata["mask_shape"], [2, length])
+                self.assertEqual(metadata["inference_stride"], length)
+                self.assertEqual(metadata["training_stride"], 750)
+                self.assertEqual(metadata["denoiser_calls"], 3)
+                self.assertTrue(metadata["condition_columns_bitwise_preserved"])
+                self.assertTrue(metadata["last_step_guidance_exactly_zero"])
+                self.assertTrue(torch.equal(clean, original_input))
+                self.assertEqual(vars(args), original_args)
+
+    def test_public_api_window_guard_accepts_epoch_lengths_and_rejects_invalid_values(self):
+        # Mock only CUDA availability/model guards and the sampler call. This
+        # tests public argument validation without pretending a GPU run occurred.
+        model, clean, config, _ = fixture(steps=3)
+        device = torch.device("cuda:0")
+        with mock.patch("cuda_runtime.require_cuda", return_value=device), \
+             mock.patch("cuda_runtime.assert_cuda_model"), \
+             mock.patch("validation_sampling._sample_windows_from_original", return_value=mock.sentinel.sample) as sample:
+            for epochs in (1, 2, 3, 8):
+                args = SimpleNamespace(window_size=epochs * 750, s4_lmax=epochs * 750)
+                with self.subTest(window_epochs=epochs):
+                    self.assertIs(sample_validation_windows(model, clean, config, args, device), mock.sentinel.sample)
+                    sample.assert_called_with(model, clean, config, args, device)
+            sample.reset_mock()
+            for length in (0, -750, True, 749, 751, 1500.0, "1500"):
+                with self.subTest(window_size=length), self.assertRaisesRegex(ValueError, "750-point"):
+                    sample_validation_windows(model, clean, config,
+                                              SimpleNamespace(window_size=length, s4_lmax=6000), device)
+            with self.assertRaisesRegex(ValueError, "S4 kernel length"):
+                sample_validation_windows(model, clean, config,
+                                          SimpleNamespace(window_size=6000, s4_lmax=3000), device)
+            sample.assert_not_called()
 
     def test_incomplete_schedule_and_training_mode_are_rejected(self):
         model, clean, config, args = fixture(steps=5)

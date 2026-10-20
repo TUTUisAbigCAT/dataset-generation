@@ -49,7 +49,7 @@ def resolve_output_directory(config_path, explicit_output=None):
 def snapshot_source(destination):
     destination.mkdir()
     for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "cuda_runtime.py",
-                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py"):
+                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "window_config.py"):
         shutil.copy2(ROOT / name, destination / name)
     for name in ("TSImputers", "utils", "third_party"):
         shutil.copytree(ROOT / name, destination / name,
@@ -95,9 +95,9 @@ def main():
         from data_utils import Preprocessor
 
         preprocessor = Preprocessor("DREAMT", data_dir=cli.data_dir)
-        training = preprocessor.make_training_dataset(window_size=3000, stride=750)
+        training = preprocessor.make_training_dataset(window_size=preprocessor.window_size, stride=750)
         if len(training) == 0:
-            raise ValueError("No valid 120-second training windows in the selected folder")
+            raise ValueError("No valid configured-length training windows in the selected folder")
         from epoch_validation import select_fixed_windows, validation_options, early_stopping_options
         selected_config = json.loads(cli.config.read_text(encoding="utf-8-sig"))
         validation_config = validation_options(selected_config)
@@ -106,6 +106,7 @@ def main():
         identity = preprocessor.data_identity()
         preflight = dict(status="passed", data_identity=identity,
             training_windows=len(training), training_input_shape=list(training[0].shape),
+            window_epochs=preprocessor.window_epochs, window_size=preprocessor.window_size,
             validation_windows=[dict(filename=name, start_sample=start) for name, start in validation],
             validation_selection=selection, validation_options=validation_config,
             early_stopping=stopping_config,
@@ -123,7 +124,7 @@ def main():
         workspace = output / "workspace"
         snapshot_source(workspace)
         frozen_config = {key: identity.get(key) for key in
-            ("metadata_path", "split_path", "split_seed", "multiplier", "downsample_rate", "max_epochs")}
+            ("metadata_path", "split_path", "split_seed", "multiplier", "downsample_rate", "max_epochs", "window_epochs")}
         frozen_config["validation"] = validation_config
         frozen_config["early_stopping"] = stopping_config
         frozen_config["data_dir"] = identity["data_directory"]

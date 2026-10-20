@@ -17,6 +17,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from window_config import DEFAULT_WINDOW_EPOCHS, EPOCH_SAMPLES, FS, window_settings
+
 DEFAULT_TRAINING_ARGS = dict(dataset="DREAMT_SIM", backbone="S4", beta_0=.0001, beta_T=.02,
     timesteps=200, hdim=64, lr=.0001, batch_size=1024, epochs=1000, layers=4,
     window_size=3000, stride=1500, num_res_layers=4, res_channels=64, skip_channels=64,
@@ -41,6 +43,28 @@ def table_files(output, stem, rows):
         writer.writerows(rows)
 
 
+def _manifest_data_identity(manifest):
+    data = manifest.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
+    return manifest.get("data_identity", data.get("data_identity", data))
+
+
+def _validate_frozen_window(model_args, identity):
+    """Use recorded dimensions only; legacy identities imply four epochs."""
+    size, kernel_length = model_args.window_size, model_args.s4_lmax
+    if isinstance(size, bool) or not isinstance(size, int) or size < EPOCH_SAMPLES or size % EPOCH_SAMPLES:
+        raise ValueError("Training window_size must be a positive multiple of 750 samples")
+    if isinstance(kernel_length, bool) or not isinstance(kernel_length, int) or kernel_length < size:
+        raise ValueError("Training s4_lmax must be an integer at least as large as window_size")
+    if not isinstance(identity, dict):
+        raise ValueError("Training data identity must be a dictionary")
+    settings = window_settings({"window_epochs": identity.get("window_epochs", DEFAULT_WINDOW_EPOCHS)})
+    if size != settings["window_size"]:
+        raise ValueError("Training window_size disagrees with frozen data window_epochs (legacy default: 4)")
+    return settings
+
+
 def load_training_run(manifest_path):
     """Require explicit training arguments and data provenance; never infer a run."""
     manifest_path = Path(manifest_path)
@@ -53,15 +77,17 @@ def load_training_run(manifest_path):
         raise ValueError("Incomplete training_args; missing: " + ", ".join(missing))
     if config["dataset"] not in ("DREAMT", "DREAMT_SIM"):
         raise ValueError("Expected dataset DREAMT or DREAMT_SIM")
-    for key in ("backbone", "beta_0", "beta_T", "timesteps", "window_size", "num_res_layers",
+    for key in ("backbone", "beta_0", "beta_T", "timesteps", "num_res_layers",
                 "res_channels", "skip_channels", "diff_step_embed_in", "diff_step_embed_mid", "diff_step_embed_out",
-                "s4_lmax", "s4_dstate", "s4_dropout", "s4_bidirectional", "s4_layernorm", "propCycEnc"):
+                "s4_dstate", "s4_dropout", "s4_bidirectional", "s4_layernorm", "propCycEnc"):
         if config[key] != DEFAULT_TRAINING_ARGS[key]:
             raise ValueError(f"This audit expects the planned strict model; {key} differs: {config[key]!r}")
+    model_args = SimpleNamespace(**config)
+    settings = _validate_frozen_window(model_args, _manifest_data_identity(manifest))
     info = dict(source="explicit run_manifest.training_args and data",
         manifest=str(manifest_path.resolve()), manifest_sha256=sha256(manifest_path),
-        supplied_training_args=config, actual_training_duration_verified=False)
-    return SimpleNamespace(**config), manifest, info
+        supplied_training_args=config, frozen_window=settings, actual_training_duration_verified=False)
+    return model_args, manifest, info
 
 
 def training_arguments(manifest_path):
@@ -76,10 +102,10 @@ def _recorded_path(value, manifest_path):
 
 def bind_training_data(model_args, manifest, manifest_path, preprocessor_class):
     """Rebuild only the recorded training source and reject changed identities."""
-    data = manifest.get("data", {})
-    expected = manifest.get("data_identity", data.get("data_identity", data))
+    expected = _manifest_data_identity(manifest)
     if not isinstance(expected, dict):
         raise ValueError("Training data identity must be a dictionary")
+    settings = _validate_frozen_window(model_args, expected)
     if expected.get("dataset", model_args.dataset) != model_args.dataset:
         raise ValueError("Training arguments and data identity name different datasets")
     required = {"data_directory", "splits", "scaler", "metadata_file_sha256"}
@@ -95,19 +121,21 @@ def bind_training_data(model_args, manifest, manifest_path, preprocessor_class):
     config = dict(data_dir=str(data_dir), metadata_path=str(metadata_path), generate_splits=generated,
         split_path=None if generated else str(split_path), split_seed=expected.get("split_seed", 42),
         multiplier=expected.get("multiplier", 1.0), downsample_rate=expected.get("downsample_rate", 1),
-        max_epochs=expected.get("max_epochs"))
+        max_epochs=expected.get("max_epochs"), window_epochs=settings["window_epochs"])
     if "schema" in expected:
         if expected["schema"] != "dreamt_data_identity_v1":
             raise ValueError("Unsupported training data identity schema")
         preprocessor = preprocessor_class.from_identity(expected, dataset=model_args.dataset)
     else:
         preprocessor = preprocessor_class(model_args.dataset, model_args.propCycEnc, data_config=config)
+    if preprocessor.window_size != model_args.window_size or preprocessor.window_epochs != settings["window_epochs"]:
+        raise ValueError("Frozen preprocessor window dimensions disagree with training arguments")
     actual = preprocessor.data_identity()
     checks = {}
     for key in ("dataset", "data_directory", "metadata_path", "split_source", "split_path", "split_seed",
                 "split_file_sha256", "split_fingerprint", "metadata_file_sha256", "splits", "scaler",
                 "scaler_subjects", "multiplier", "downsample_rate", "max_epochs", "sample_rate_hz",
-                "epoch_samples", "columns", "stage_names", "raw_stage_mapping"):
+                "epoch_samples", "window_epochs", "columns", "stage_names", "raw_stage_mapping"):
         if key in expected:
             reference = expected[key]
             if key in ("data_directory", "metadata_path", "split_path") and reference is not None:
@@ -223,16 +251,17 @@ def main():
     selected_windows = preprocessor.select_validation_windows(windows_per_subject=2)
     for filename, start in selected_windows:
         record = preprocessor.record(filename)
-        windows.append(preprocessor.window_array(filename, start, 3000))
+        windows.append(preprocessor.window_array(filename, start, model_args.window_size))
         identities.append(dict(subject_id=record["subject_id"], filename=filename,
-            split="val", start_sample=start, start_epoch=start // 750, start_seconds=start / 25., samples=3000))
+            split="val", start_sample=start, start_epoch=start // EPOCH_SAMPLES,
+            start_seconds=start / FS, samples=model_args.window_size))
     window_count = len(windows)
     subject_count = len({row["subject_id"] for row in identities})
     clean = from_numpy(np.stack(windows)).to(device=device, dtype=torch.float32)
     hierarchy_gpu = torch.as_tensor(hierarchy, device=device, dtype=torch.long)
     non_hier_gpu = torch.as_tensor(non_hier_cols, device=device, dtype=torch.long)
-    if clean.shape != (window_count, 3000, input_features) or not torch.isfinite(clean).all():
-        raise ValueError("Expected fully finite 120-second validation windows")
+    if clean.shape != (window_count, model_args.window_size, input_features) or not torch.isfinite(clean).all():
+        raise ValueError("Expected fully finite validation windows matching the frozen training window_size")
     if set(preprocessor.accessed_files) & set(preprocessor.splits["test"]):
         raise AssertionError("Test NPZ files were accessed")
     generator = torch.Generator(device=device).manual_seed(20261017)
@@ -335,13 +364,15 @@ def main():
             for key, value in row.items():
                 if torch.is_tensor(value):
                     row[key] = float(value)
-    sources = {name: sha256(ROOT / name) for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py",
+    sources = {name: sha256(ROOT / name) for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "window_config.py",
         "TSImputers/SSSDS4Imputer.py", "TSImputers/S4Model.py", "utils/util.py", "scripts/evaluate_denoising.py")}
     report = dict(status="passed", evaluation_type="teacher-forced conditional epsilon denoising; not free generation",
         protocol=dict(initialization_seed=42, evaluation_noise_seed=20261017, scenarios=list(scenarios),
             same_epsilon_across_scenarios=True, initial_and_trained_share_noised_inputs=True,
             random_timesteps=random_timesteps.tolist(), evaluation_batch_size=args.batch_size,
-            input_features=input_features, output_features=1, window_length=3000, validation_subjects=subject_count, windows=window_count,
+            input_features=input_features, output_features=1, window_length=model_args.window_size,
+            window_epochs=preprocessor.window_epochs, window_seconds=model_args.window_size / FS,
+            validation_subjects=subject_count, windows=window_count,
             validation_selection=preprocessor.validation_selection,
             stage_columns=list(columns[1:5]), condition_columns=list(columns[hierarchy]),
             observations_or_inpainting=False, output_clipping=False, extra_loss_terms=False,
@@ -372,7 +403,7 @@ def main():
     lines = ["# 固定验证窗口的一步去噪检查", "",
         "这是外部只读观测：对记录中的目标 x0 正向加噪后，比较原模型初始化零输出头与训练后 epsilon 预测。"
         "不运行反向采样，不修改训练算法；这些是 teacher-forced 去噪指标，不是自由生成质量、FID 或整夜评价。", "",
-        f"本次 {subject_count} 位 val 主体、{window_count} 个合法 120 秒窗口；每人选择首个及最接近30分钟的不同合法窗口，只有一个时保留一个。"
+        f"本次 {subject_count} 位 val 主体、{window_count} 个合法 {model_args.window_size / FS:g} 秒窗口；每人选择首个及最接近30分钟的不同合法窗口，只有一个时保留一个。"
         f"使用训练manifest记录的数据和train-only scaler；test NPZ未打开。两种模型状态使用相同x_t/epsilon；B={args.batch_size}。", "",
         "| 模型状态 | 情景 | epsilon MSE | x0 窗口均值 MAE (ms) | x0 均值有符号偏差 (ms) |", "| --- | --- | --- | --- | --- |"]
     for row in totals:

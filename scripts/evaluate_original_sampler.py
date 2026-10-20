@@ -12,6 +12,7 @@ import argparse
 import ast
 import hashlib
 import json
+from numbers import Integral
 from pathlib import Path
 import sys
 import time
@@ -21,6 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM = ROOT / 'third_party/WaveStitch'
 SOURCE = UPSTREAM / 'synthesis_wavestitch_pipeline_strided_preconditioning.py'
 sys.path.insert(0, str(ROOT))
+
+from window_config import EPOCH_SAMPLES, FS
 
 
 def digest(value):
@@ -116,10 +119,14 @@ def load_original_parameters(model, saved, torch):
                 checked_buffers=comparisons)
 
 
-def select_sampling_window(preprocessor, subject=None, start_sample=None, windows=1, stride=1500):
+def select_sampling_window(preprocessor, subject=None, start_sample=None, windows=1, stride=None):
     """Choose a recorded legal span; never stitch around invalid epochs or gaps."""
-    if windows < 1 or stride <= 0 or stride % 750 or stride > 3000:
-        raise ValueError('Expected positive windows and an epoch-aligned stride no larger than 3000')
+    window_size = preprocessor.window_size
+    stride = min(1500, window_size) if stride is None else stride
+    if (isinstance(windows, bool) or not isinstance(windows, Integral) or windows < 1
+            or isinstance(stride, bool) or not isinstance(stride, Integral)
+            or stride <= 0 or stride % EPOCH_SAMPLES or stride > window_size):
+        raise ValueError('Expected positive integer windows and an epoch-aligned stride no larger than window_size')
     if subject is None:
         selected = preprocessor.select_validation_windows(windows_per_subject=1)
         filename = selected[0][0]
@@ -127,12 +134,12 @@ def select_sampling_window(preprocessor, subject=None, start_sample=None, window
         filename = subject if subject.endswith('.npz') else subject + '.npz'
     if filename not in preprocessor.splits['train'] + preprocessor.splits['val']:
         raise ValueError('Selected subject must belong to the recorded train or validation split')
-    length = 3000 + stride * (windows - 1)
+    length = window_size + stride * (windows - 1)
     if start_sample is not None:
         preprocessor.window_array(filename, start_sample, length)
         return filename, start_sample
     record = preprocessor.record(filename)
-    for start in range(0, len(record['ibi']) - length + 1, 750):
+    for start in range(0, len(record['ibi']) - length + 1, EPOCH_SAMPLES):
         try:
             preprocessor.window_array(filename, start, length)
         except ValueError:
@@ -205,9 +212,9 @@ def main():
         cli.checkpoint, checkpoint_identity = resolve_checkpoint(cli.training_args_json, manifest, cli.checkpoint)
         report.update(checkpoint=str(cli.checkpoint), checkpoint_identity=checkpoint_identity,
                       config_provenance=config_provenance)
-        if args.dataset not in ('DREAMT', 'DREAMT_SIM') or args.window_size != 3000:
-            raise ValueError('Expected DREAMT or DREAMT_SIM with 3000-point / 120-second windows')
-        if args.stride <= 0 or args.stride % 750 or args.stride > args.window_size:
+        if args.dataset not in ('DREAMT', 'DREAMT_SIM'):
+            raise ValueError('Expected DREAMT or DREAMT_SIM')
+        if args.stride <= 0 or args.stride % EPOCH_SAMPLES or args.stride > args.window_size:
             raise ValueError('Stride must align with 30-second epochs and not exceed the window')
         if args.backbone.lower() != 's4':
             raise ValueError('Only the original S4 backbone is supported')
@@ -218,7 +225,7 @@ def main():
         report['training_data_identity_checks'] = identity_checks
         report['artificial_data'] = preprocessor.provenance().get('data_synthetic')
         report['source_sha256'] = {name: digest((ROOT / name).read_bytes()) for name in
-            ('data_utils.py', 'watchsleep_loader.py', 'scripts/evaluate_denoising.py',
+            ('data_utils.py', 'watchsleep_loader.py', 'window_config.py', 'scripts/evaluate_denoising.py',
              'scripts/evaluate_original_sampler.py')}
         columns = preprocessor.columns
         input_features = len(columns)
@@ -243,7 +250,7 @@ def main():
         windows = torch.from_numpy(all_unknown_input).to(device=device, dtype=torch.float32).unfold(
             0, args.window_size, args.stride).transpose(1, 2)
         masks = torch.ones(total_length, dtype=torch.bool, device=device).unfold(0, args.window_size, args.stride)
-        if windows.shape != (cli.windows, 3000, input_features):
+        if windows.shape != (cli.windows, args.window_size, input_features):
             raise RuntimeError('Unexpected aligned model input shape')
         test_dataset = MyDataset(windows.float())
         mask_dataset = MyDataset(masks)
@@ -288,7 +295,7 @@ def main():
         finite = bool(torch.isfinite(generated).all())
         report['result'] = dict(all_finite=finite,
             condition_columns_bitwise_preserved=bool(torch.equal(generated[:, 1:], reference_tensor[:, 1:])),
-            samples=len(generated), duration_seconds=len(generated) / 25,
+            samples=len(generated), duration_seconds=len(generated) / FS,
             denoiser_calls=int(scope['num_ops']),
             generated_mean_ms=float(generated_seconds.mean() * 1000) if finite else None,
             reference_mean_ms=float(reference_seconds.mean() * 1000),
@@ -305,7 +312,7 @@ def main():
             generated_standardized=generated[:, 0].cpu().numpy(),
             generated_seconds=generated_seconds.cpu().numpy(),
             reference_seconds=reference_seconds.cpu().numpy(), clean_conditions=reference[:, 1:],
-            generated_conditions=generated[:, 1:].cpu().numpy(), sample_rate_hz=np.array(25),
+            generated_conditions=generated[:, 1:].cpu().numpy(), sample_rate_hz=np.array(FS),
             subject=np.array(Path(filename).stem), start_sample=np.array(start_sample))
         report['status'] = 'completed' if finite else 'nonfinite_output'
         save_report()

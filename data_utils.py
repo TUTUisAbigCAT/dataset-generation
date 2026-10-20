@@ -1,6 +1,6 @@
 """WatchSleepNet epoch loading adapted to conditional WaveStitch windows.
 
-Only data handling changes: four original sleep classes, four 30-second epochs,
+Only data handling changes: four original sleep classes, configurable 30-second epochs,
 participant conditions, and training-only population scaling. Optional subject
 splits use a local NumPy generator and never consume global training RNG state.
 """
@@ -14,10 +14,10 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from watchsleep_loader import SSDataset
+from window_config import FS, EPOCH_SAMPLES, window_settings
 
 ROOT = Path(__file__).resolve().parent
 datasets = {"DREAMT_SIM": None, "DREAMT": None}
-FS, EPOCH_SAMPLES = 25, 750
 STAGE_NAMES = ("W", "Light", "REM", "Deep")
 CONTINUOUS = ("AHI", "BMI", "AGE")
 COLUMNS = ("IBI",) + tuple("stage_" + name for name in STAGE_NAMES) + CONTINUOUS + ("gender_F", "gender_M")
@@ -55,12 +55,12 @@ def _window_valid(record, first, count):
 
 
 class WindowDataset(Dataset):
-    """Four stored epochs, excluding invalid epochs and known temporal gaps."""
+    """Configured consecutive epochs, excluding invalid labels and temporal gaps."""
     def __init__(self, preprocessor, split, window_size, stride):
         if split not in ("train", "val"):
             raise ValueError("Only train and validation are available; test is sealed")
-        if window_size != 4 * EPOCH_SAMPLES:
-            raise ValueError("Expected a 120-second / 3000-point window")
+        if isinstance(window_size, bool) or not isinstance(window_size, int) or window_size != preprocessor.window_size:
+            raise ValueError("Window size must match configured window_epochs * epoch_samples")
         if stride <= 0 or stride % EPOCH_SAMPLES:
             raise ValueError("Stride must be a positive whole number of 30-second epochs")
         self.preprocessor, self.split = preprocessor, split
@@ -69,12 +69,12 @@ class WindowDataset(Dataset):
         for filename in preprocessor.splits[split]:
             record = preprocessor.record(filename)
             for start in range(0, len(record["ibi"]) - window_size + 1, stride):
-                if _window_valid(record, start // EPOCH_SAMPLES, 4):
+                if _window_valid(record, start // EPOCH_SAMPLES, preprocessor.window_epochs):
                     self.window_index.append((filename, start))
                 else:
                     self.excluded_windows += 1
         if not self.window_index:
-            raise ValueError("No complete valid four-epoch windows in selected split")
+            raise ValueError("No complete valid configured-length windows in selected split")
 
     def __len__(self):
         return len(self.window_index)
@@ -87,7 +87,7 @@ class WindowDataset(Dataset):
 class Preprocessor:
     def __init__(self, dataset, propCycEnc=False, *, data_dir=None, metadata_path=None,
                  split_path=None, multiplier=None, downsample_rate=None, max_epochs=None,
-                 split_seed=None, generate_splits=None, config_override=None, data_config=None):
+                 split_seed=None, generate_splits=None, config_override=None, data_config=None, window_epochs=None):
         if dataset not in datasets:
             raise ValueError("Expected dataset DREAMT or DREAMT_SIM")
         if propCycEnc:
@@ -119,6 +119,9 @@ class Preprocessor:
             return config.get(key, default), config_base
 
         self.dataset = dataset
+        dimensions = window_settings(config if window_epochs is None else {"window_epochs": window_epochs})
+        self.window_epochs = dimensions["window_epochs"]
+        self.window_size = dimensions["window_size"]
         data_value, data_base = option(data_dir, "data_dir", "DREAMT_DATA_DIR")
         if not data_value:
             raise ValueError("Set data_dir in dataset_config.json, DREAMT_DATA_DIR, or the constructor; no dataset fallback is used")
@@ -288,8 +291,8 @@ class Preprocessor:
     def make_training_dataset(self, window_size, stride):
         return WindowDataset(self, "train", window_size, stride)
 
-    def make_validation_dataset(self, window_size=3000, stride=1500):
-        return WindowDataset(self, "val", window_size, stride)
+    def make_validation_dataset(self, window_size=None, stride=1500):
+        return WindowDataset(self, "val", self.window_size if window_size is None else window_size, stride)
 
     def select_validation_windows(self, windows_per_subject=2):
         """Select legal windows without assuming cohort size or recording length.
@@ -302,13 +305,14 @@ class Preprocessor:
             raise ValueError("windows_per_subject must be a positive integer")
         windows_per_subject = int(windows_per_subject)
         selected, excluded, subjects = [], [], []
+        stride = min(2 * EPOCH_SAMPLES, self.window_size)
         for filename in self.splits["val"]:
             record = self.record(filename)
-            candidates = [start for start in range(0, len(record["ibi"]) - 3000 + 1, 1500)
-                          if _window_valid(record, start // EPOCH_SAMPLES, 4)]
+            candidates = [start for start in range(0, len(record["ibi"]) - self.window_size + 1, stride)
+                          if _window_valid(record, start // EPOCH_SAMPLES, self.window_epochs)]
             if not candidates:
                 excluded.append(dict(filename=filename, subject_id=Path(filename).stem,
-                                     reason="no complete valid four-epoch window"))
+                                     reason="no complete valid configured-length window"))
                 continue
             starts = [candidates[0]]
             remaining = candidates[1:]
@@ -319,13 +323,13 @@ class Preprocessor:
             starts = starts[:windows_per_subject]
             selected.extend((filename, start) for start in starts)
             subjects.append(dict(filename=filename, candidates=len(candidates), selected_starts=starts))
-        self.validation_selection = dict(window_size=3000, stride=1500,
+        self.validation_selection = dict(window_size=self.window_size, stride=stride,
             windows_per_subject=int(windows_per_subject), preferred_second_start=45000,
             policy="first legal; distinct nearest 45000; additional starts in order",
             selected=[dict(filename=name, start=start) for name, start in selected],
             subjects=subjects, excluded=excluded)
         if not selected:
-            raise ValueError("No complete valid four-epoch windows across validation subjects")
+            raise ValueError("No complete valid configured-length windows across validation subjects")
         return selected
 
     def inverse_signal(self, standardized):
@@ -340,7 +344,7 @@ class Preprocessor:
             split_path=str(self.split_path) if self.split_path is not None else None,
             split_source=self.split_source, split_file_sha256=self.split_file_sha256,
             split_seed=self.split_seed, split_fingerprint=self.split_fingerprint, splits=self.splits,
-            sample_rate_hz=FS, epoch_samples=EPOCH_SAMPLES,
+            sample_rate_hz=FS, epoch_samples=EPOCH_SAMPLES, window_epochs=self.window_epochs,
             multiplier=self.multiplier, downsample_rate=self.downsample_rate, max_epochs=self.max_epochs,
             columns=list(COLUMNS), stage_names=list(STAGE_NAMES),
             zero_value_policy=ZERO_VALUE_POLICY,
@@ -376,9 +380,11 @@ class Preprocessor:
             metadata_path=identity["metadata_path"], split_path=identity["split_path"],
             multiplier=identity["multiplier"], downsample_rate=identity["downsample_rate"],
             max_epochs=identity["max_epochs"], split_seed=identity["split_seed"],
-            generate_splits=generated, config_override={})
+            generate_splits=generated, config_override={}, window_epochs=identity.get("window_epochs", 4))
         actual = processor.data_identity()
-        mismatches = [key for key in actual if key not in identity or actual[key] != identity[key]]
+        expected = dict(identity)
+        expected.setdefault("window_epochs", 4)  # Legacy manifests used four sleep epochs.
+        mismatches = [key for key in actual if key not in expected or actual[key] != expected[key]]
         if mismatches:
             raise ValueError(f"Training data identity mismatch: {', '.join(mismatches)}")
         return processor
@@ -390,7 +396,7 @@ class Preprocessor:
             data_synthetic=synthetic,
             columns=list(COLUMNS), non_hierarchical_columns=["IBI"],
             hierarchical_columns=self.hierarchical_features_cyclic,
-            sample_rate_hz=FS, epoch_samples=EPOCH_SAMPLES, stage_names=list(STAGE_NAMES),
+            sample_rate_hz=FS, epoch_samples=EPOCH_SAMPLES, window_epochs=self.window_epochs, window_size=self.window_size, stage_names=list(STAGE_NAMES),
             zero_value_policy=ZERO_VALUE_POLICY,
             raw_stage_mapping={"0": 0, "1": 1, "2": 1, "3": 3, "4": 2, "other": -1},
             multiplier=self.multiplier, downsample_rate=self.downsample_rate,

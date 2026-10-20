@@ -16,6 +16,7 @@ import torch
 from cuda_runtime import assert_cuda_model, require_cuda
 from validation_metrics import DistributionAccumulator, preserve_random_state
 from validation_sampling import sample_validation_windows
+from window_config import EPOCH_SAMPLES, window_settings
 
 DEFAULT_VALIDATION = {"max_windows": None, "batch_size": 8, "seed": 20261020}
 DEFAULT_EARLY_STOPPING = {
@@ -130,7 +131,11 @@ def select_fixed_windows(preprocessor, options):
     Search at every 30-second boundary so a missing first epoch cannot discard
     all legal windows in a short validation record. Selection never opens test.
     """
-    dataset = preprocessor.make_validation_dataset(window_size=3000, stride=750)
+    window_size = preprocessor.window_size
+    if (isinstance(window_size, bool) or not isinstance(window_size, int)
+            or window_size < EPOCH_SAMPLES or window_size % EPOCH_SAMPLES):
+        raise ValueError("Validation requires a positive whole number of 30-second epochs")
+    dataset = preprocessor.make_validation_dataset(window_size=window_size, stride=EPOCH_SAMPLES)
     groups = defaultdict(list)
     end_by_subject = {}
     for name, start in dataset.window_index:
@@ -138,10 +143,10 @@ def select_fixed_windows(preprocessor, options):
             raise RuntimeError("Validation selection escaped the validation split")
         if start >= end_by_subject.get(name, 0):
             groups[name].append((name, start))
-            end_by_subject[name] = start + 3000
+            end_by_subject[name] = start + window_size
     available = sum(map(len, groups.values()))
     if not available:
-        raise ValueError("No complete valid two-minute validation windows")
+        raise ValueError("No complete valid validation windows for the configured window_epochs")
     rng = np.random.default_rng(options["seed"])
     names = sorted(groups)
     rng.shuffle(names)
@@ -162,8 +167,8 @@ def select_fixed_windows(preprocessor, options):
         "available_subjects": len(groups),
         "selected_windows": count,
         "selected_subjects": len({name for name, _ in selected}),
-        "candidate_stride_samples": 750,
-        "window_size_samples": 3000,
+        "candidate_stride_samples": EPOCH_SAMPLES,
+        "window_size_samples": window_size,
         "policy": "greedy nonoverlap per subject; seeded round-robin subjects and shuffled starts; sorted fixed output",
     }
 
@@ -194,8 +199,17 @@ class EpochValidator:
         self.best_checkpoints = {}
         self.should_stop = False
         self.args = training_args
-        if training_args.window_size != 3000 or training_args.s4_lmax < training_args.window_size:
-            raise ValueError("Validation requires a complete 3000-point window within the original S4 kernel length")
+        self.window = window_settings(config)
+        self.window_size = self.window["window_size"]
+        self.window_epochs = self.window["window_epochs"]
+        if (training_args.window_size != self.window_size
+                or preprocessor.window_size != self.window_size
+                or preprocessor.window_epochs != self.window_epochs):
+            raise ValueError("Validation window_epochs must match the configuration, preprocessor and training window_size")
+        if training_args.s4_lmax < self.window_size:
+            raise ValueError("Validation window_size must fit within the original S4 kernel length")
+        self.metric_description = (f"Euclidean distances between {self.window_size}-dimensional "
+                                   "coordinate mean and variance vectors")
         self.diffusion_config = diffusion_config
         self.output = Path(output_dir).resolve()
         self.training_output = self.output.parent
@@ -204,10 +218,10 @@ class EpochValidator:
         with preserve_random_state(self.device):
             selected, selection = select_fixed_windows(preprocessor, self.options)
             # Data loading is on the host; generation and all statistics use CUDA.
-            self.windows = torch.stack([torch.from_numpy(preprocessor.window_array(name, start, 3000))
+            self.windows = torch.stack([torch.from_numpy(preprocessor.window_array(name, start, self.window_size))
                                         for name, start in selected])
             self.reference = torch.stack([
-                torch.from_numpy(np.asarray(preprocessor.record(name)["ibi"][start:start + 3000],
+                torch.from_numpy(np.asarray(preprocessor.record(name)["ibi"][start:start + self.window_size],
                                             dtype=np.float64).copy())
                 for name, start in selected])
             self.scale = float(preprocessor.scaler["signal_std_seconds"])
@@ -216,11 +230,13 @@ class EpochValidator:
                 raise ValueError("Invalid training-only IBI scaler")
             self.windows_metadata = [
                 dict(filename=name, subject_id=Path(name).stem, start_sample=start,
-                     start_second=start / 25, sleep_stages=preprocessor.record(name)["stages"][start:start+3000:750].tolist(),
+                     start_second=start / self.window["sample_rate_hz"],
+                     sleep_stages=preprocessor.record(name)["stages"][start:start+self.window_size:EPOCH_SAMPLES].tolist(),
                      file_sha256=preprocessor.record(name)["file_sha256"])
                 for name, start in selected]
         self.protocol = dict(
-            schema="ibi_epoch_coordinate_moments_v2", metric="Euclidean distances between 3000-dimensional coordinate mean and variance vectors",
+            schema="ibi_epoch_coordinate_moments_v2", metric=self.metric_description,
+            window=self.window,
             options=self.options, selection=selection, windows=self.windows_metadata,
             early_stopping=self.early_stopping.options,
             early_stopping_improvement_rule="both_smoothed_metrics_same_epoch",
@@ -232,9 +248,9 @@ class EpochValidator:
             diffusion_steps=diffusion_config["T"], initialization_seed=42,
             validation_seed_reset_each_epoch=True, training_rng_restored=True,
             signal_unit="milliseconds", variance_unit="milliseconds_squared", variance_correction=0,
-            aggregation="one 3000-dimensional sample per window; coordinate moments over all selected windows; stored zeros included; no clipping",
+            aggregation=f"one {self.window_size}-dimensional sample per window; coordinate moments over all selected windows; stored zeros included; no clipping",
             vector_metrics=dict(mean="mean_vector_l2_ms", variance="variance_vector_l2_ms2",
-                                dimension=3000, moment_axis="windows (dim=0)", distance="L2, no dimension normalization",
+                                dimension=self.window_size, moment_axis="windows (dim=0)", distance="L2, no dimension normalization",
                                 covariance="diagonal only", accumulation="CUDA batched centered-moment merge",
                                 single_window_variance="zero under population definition"),
             diagnostic_aggregation="legacy pooled and per-window scalars retained; excluded from early stopping",
@@ -270,7 +286,9 @@ class EpochValidator:
         if not math.isfinite(train_mean_loss):
             raise ValueError("Nonfinite epoch mean loss")
         print(json.dumps(dict(status="epoch_validation_started", epoch=epoch,
-                              windows=len(self.windows), diffusion_steps=self.diffusion_config["T"])), flush=True)
+                              windows=len(self.windows), window_size=self.window_size,
+                              window_epochs=self.window_epochs,
+                              diffusion_steps=self.diffusion_config["T"])), flush=True)
         started = time.perf_counter()
         epoch_dir = self.output / f"epoch_{epoch:04d}"
         epoch_dir.mkdir(exist_ok=False)
@@ -331,7 +349,7 @@ class EpochValidator:
         return report
 
     def summary(self):
-        return dict(metric="Euclidean distances between 3000-dimensional coordinate mean and variance vectors",
+        return dict(metric=self.metric_description, window=self.window.copy(),
                     completed_epochs=len(self.reports), options=self.options,
                     early_stopping=self.early_stopping.summary(),
                     best_checkpoints={name: value.copy() for name, value in self.best_checkpoints.items()},

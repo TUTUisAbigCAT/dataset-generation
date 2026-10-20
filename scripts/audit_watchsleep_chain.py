@@ -305,7 +305,7 @@ def main():
     json_path, md_path = output / "watchsleep_chain_audit.json", output / "WATCHSLEEP_CHAIN_AUDIT.md"
     require(args.overwrite or not (json_path.exists() or md_path.exists()), "Audit reports already exist; use --overwrite")
     source_names = ("third_party/WatchSleepNet/data_setup.py", "watchsleep_loader.py", "data_utils.py",
-                    "scripts/audit_watchsleep_chain.py", "tests/test_loader_chain.py")
+                    "scripts/audit_watchsleep_chain.py", "tests/test_loader_chain.py", "window_config.py")
     source_hashes = {name: sha256(ROOT / name) for name in source_names}
     args.fixture_parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="chain_", dir=args.fixture_parent) as temporary:

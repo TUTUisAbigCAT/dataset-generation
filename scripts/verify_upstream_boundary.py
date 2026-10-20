@@ -163,6 +163,7 @@ def main():
         imported_core_sha256=imported_core, imported_core_byte_identical=True,
         training_entry_sha256=sha(ROOT / "training_wavestitch.py"),
         data_adapter_sha256=sha(ROOT / "data_utils.py"),
+        window_configuration_sha256=sha(ROOT / "window_config.py"),
         cuda_runtime_sha256=sha(ROOT / "cuda_runtime.py"),
         exact_training_edit="Data/window preparation, enumerated CUDA-only device edits and epoch validation/reporting/early stopping",
         early_stopping_edits=[dict(before=before, after=after) for before, after in EARLY_STOPPING_EDITS],
@@ -176,7 +177,7 @@ def main():
         gpu_rng_note="Random draws now use the CUDA generator; distributions are unchanged but CPU seeded trajectories are not expected to match",
         official_sampler_snapshot_unchanged=True, sampler_execution_performed=False,
         training_window_stride_change="Original ignores CLI stride and unfolds by 1 point; adapted data windows honor explicit -stride 750 (30 seconds)",
-        runtime_configuration="CUDA required; 64 channels, 4 residual layers, state 64, T200 linear 0.0001 to 0.02, Adam 1e-4; CLI window_size/s4_lmax 3000; batch/epochs are runtime budget arguments")
+        runtime_configuration="CUDA required; 64 channels, 4 residual layers, state 64, T200 linear 0.0001 to 0.02, Adam 1e-4; CLI window_size/s4_lmax = window_epochs * 750 (default 3000); batch/epochs are runtime budget arguments")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     diff = "".join(difflib.unified_diff(original.decode().splitlines(keepends=True),

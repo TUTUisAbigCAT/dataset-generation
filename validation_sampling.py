@@ -17,6 +17,8 @@ from types import SimpleNamespace
 
 import torch
 
+from window_config import EPOCH_SAMPLES
+
 
 @lru_cache(maxsize=1)
 def _original_sampler():
@@ -110,6 +112,7 @@ def _sample_windows_from_original(model, clean_windows, diffusion_config, traini
             "denoiser_calls": int(scope["num_ops"]),
             "windows": len(windows),
             "window_size": args.window_size,
+            "mask_shape": list(masks.shape),
             "training_stride": training_stride,
             "inference_stride": args.stride,
             "independent_windows": True,
@@ -129,7 +132,7 @@ def _sample_windows_from_original(model, clean_windows, diffusion_config, traini
 
 
 def sample_validation_windows(model, clean_windows, diffusion_config, training_args, device):
-    """Return (standardized IBI [B,3000], provenance) using CUDA only.
+    """Return (standardized IBI [B, window_epochs * 750], provenance) using CUDA only.
 
     clean_windows contains the real validation IBI and nine clean condition
     columns. Its IBI values are removed before the original sampler sees the
@@ -144,6 +147,11 @@ def sample_validation_windows(model, clean_windows, diffusion_config, training_a
     if device.index is None:
         device = selected
     assert_cuda_model(model)
-    if _arguments(training_args).window_size != 3000:
-        raise ValueError("Production validation requires 3000-point / two-minute DREAMT windows")
+    args = _arguments(training_args)
+    window_size = args.window_size
+    if (isinstance(window_size, bool) or not isinstance(window_size, int)
+            or window_size < EPOCH_SAMPLES or window_size % EPOCH_SAMPLES):
+        raise ValueError("Production validation requires a positive whole number of 750-point sleep epochs")
+    if args.s4_lmax < window_size:
+        raise ValueError("Production validation window_size must fit within the S4 kernel length")
     return _sample_windows_from_original(model, clean_windows, diffusion_config, training_args, device)

@@ -34,7 +34,7 @@ def main():
     work.mkdir(parents=True)
     output.mkdir(parents=True)
     names = ("data_utils.py", "watchsleep_loader.py", "training_wavestitch.py", "training_utils.py", "cuda_runtime.py",
-             "epoch_validation.py", "validation_metrics.py", "validation_sampling.py")
+             "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "window_config.py")
     for name in names:
         shutil.copyfile(ROOT / name, work / name)
     for name in ("TSImputers", "utils", "third_party"):

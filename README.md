@@ -1,6 +1,6 @@
 # DREAMT 条件 IBI 生成（CUDA 工作流）
 
-基于固定版本 WaveStitch，适配 WatchSleepNet 的 DREAMT IBI 数据接口。每个输入窗口为 `[B, 3000, 10]`，对应 25 Hz、120 秒、四个连续的 30 秒睡眠阶段；生成目标为 IBI。九个条件通道依次为 W / Light / REM / Deep、AHI、BMI、AGE、gender_F、gender_M。
+基于固定版本 WaveStitch，适配 WatchSleepNet 的 DREAMT IBI 数据接口。每个输入窗口为 `[B, 750 × K, 10]`，其中 `K=window_epochs` 是连续 30 秒睡眠 epoch 的数量，默认 4（25 Hz、120 秒、3000 点）；生成目标为 IBI。九个条件通道依次为 W / Light / REM / Deep、AHI、BMI、AGE、gender_F、gender_M。
 
 原模型主体、优化器、损失和 DDPM 采样公式保持固定上游版本。在 `de30ac2` 的数据与 CUDA 设备适配基础上，增加每轮生成验证、loss 数值平均及基于验证指标的早停；这些改动纳入源码检查器的逐项白名单。上游来源和许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
@@ -40,9 +40,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 --check-only
 sbatch submit.sh
 ```
 
-脚本除 Python 命令外，与提供的 WatchSleepNet `train_transfer_sleepconvnet.sh` 逐字一致：`def-plago`、4 CPU、60G、1 个 H100、24 小时，保留原 venv 激活和 pip 命令。使用该模板需具有对应账户权限。原 pip 行只列出 scikit-learn / numpy / pandas / torch，其余依赖需提前通过 `requirement.txt` 安装。
+当前 `submit.sh` 使用用户指定的 `def-plago` 账户、4 CPU、1 GPU、10 小时时限，加载 StdEnv/2023、gcc/12.3、opencv/4.9.0 和 python/3.11，激活 `./.venv` 后运行主入口。依赖需提前安装，提交脚本中的 pip 行保持注释。
 
-提交命令运行完整的 **训练 → 去噪评估 → 原始 200 步生成**，默认 10 个 epoch、batch size 8、4 个主机线程。各次运行单独保存源码、配置、checkpoint 和日志。
+提交命令运行完整的 **训练 → 去噪评估 → 原始 200 步生成**，默认最多 50 个训练 epoch、batch size 8、4 个主机线程。各次运行单独保存源码、配置、checkpoint 和日志。
 
 在**已经分配 GPU 的计算节点**上验证环境和完整流程：
 
@@ -55,7 +55,7 @@ python scripts/smoke_cuda.py --threads 4
 
 ## 数据目录与训练
 
-默认 `dataset_config.json` 的 `data_dir` 为 `example_data`。其中四个人的短记录是**人工格式样例**，仅用于检查安装和入口，不是 DREAMT 观测数据。真实数据需用户自行准备，仓库不包含真实受试者数据或训练 checkpoint。
+`dataset_config.json` 当前保留用户指定的集群数据路径；本地格式检查可通过 `--data-dir example_data` 使用随附样例。其中四个人的短记录是**人工格式样例**，仅用于检查安装和入口，不是 DREAMT 观测数据。真实数据需用户自行准备，仓库不包含真实受试者数据或训练 checkpoint。
 
 训练真实数据时，只需将 `data_dir` 改成兼容的 IBI NPZ 文件夹；`metadata_path` 和 `split_path` 可以保持 null。配置中的相对路径以配置文件所在目录为基准。
 
@@ -72,7 +72,7 @@ DREAMT/
 - NPZ 使用原字段 `data, stages, fs, ahi`。不要求模拟器字段、时间索引或额外 subject_id。IBI 可以是向量或单列数组。
 - CSV 位于 NPZ 文件夹或其直接上一层，必须有 `SID, AHI, BMI, AGE, GENDER`；SID 对应 NPZ 文件名，GENDER 为 F/M。原四字段 NPZ 不足以提供全部个人条件。
 - 原始 stage 编码为 W=0、N1=1、N2=2、N3=3、REM=4；读取后合并为 W=0、Light=1、REM=2、Deep=3。不要传入已经合并的标签再映射一次。
-- `splits.json` 可选；未提供时按固定种子 42 按受试者划分，目标比例 75% / 12.5% / 其余，至少需要三个人，且训练集和验证集各有合法两分钟窗口。已有 split 文件会严格校验。
+- `splits.json` 可选；未提供时按固定种子 42 按受试者划分，目标比例 75% / 12.5% / 其余，至少需要三个人，且训练集和验证集各有至少一个配置长度的合法窗口。已有 split 文件会严格校验。
 - 100 Hz 输入可设置 `downsample_rate=4`；其他单位通过 `multiplier` 明确换算。
 
 ```bash
@@ -84,9 +84,28 @@ python scripts/run_dreamt.py --epochs 50 --batch-size 8 --threads 4
 
 默认每次训练创建独立的 `runs/dreamt_<UTC时间戳>`，保存源码、配置、按人划分、训练集统计、checkpoint 和日志。每个 epoch 结束执行生成验证，训练结束后再执行去噪评估及原始 200 步采样。`--skip-generation` 只跳过最后的独立采样任务，每轮 validation 仍执行。旧模型评估绑定原训练 manifest，不跟随后来修改的数据目录。
 
+## 配置窗口包含的睡眠 epoch 数
+
+在 `dataset_config.json` 顶层设置：
+
+```json
+"window_epochs": 4
+```
+
+| window_epochs | 时间长度 | 窗口点数 / 向量维度 |
+|---|---|---|
+| 1 | 30 秒 | 750 |
+| 2 | 60 秒 | 1500 |
+| 4（默认） | 120 秒 | 3000 |
+| 8 | 240 秒 | 6000 |
+
+该值必须是正整数，省略时兼容旧配置使用 4。每个睡眠 epoch 固定为 30 秒 × 25 Hz = 750 点。主入口自动令 `window_size = s4_lmax = 750 × window_epochs`，数据加载、条件标签数、验证向量维度、去噪评估和生成使用同一长度；不需要改 `submit.sh` 或 Python 命令。短于该长度的记录无法提供窗口，若一个 split 没有合法窗口会明确报错。
+
+`window_epochs` 与训练次数 `--epochs`、单条记录截断选项 `max_epochs` 含义不同，也不会改变 W/Light/REM/Deep 四个标签类别或 10 个输入通道。新运行将窗口配置写入源码快照、冻结数据身份和 manifest；评估 checkpoint 按其原训练长度运行，不受后来修改全局 JSON 的影响。旧身份未记录该字段时按 4 处理。
+
 ## 每轮 validation 和平均 loss
 
-每个 epoch 完成全部 optimizer 更新后（包括最后一轮），用当前权重在验证集条件下从噪声生成两分钟 IBI。执行与训练相同的完整扩散日程，默认 200 步；直接复用经过哈希检查的原始采样片段。验证窗口独立生成，因此推理 stride 为完整的 3000 点，不将不同片段或受试者互相拼接；训练 stride 为 750 点（30 秒），相邻两分钟窗口重叠 90 秒，即 75%。
+每个 epoch 完成全部 optimizer 更新后（包括最后一轮），用当前权重在验证集条件下从噪声生成配置长度的 IBI。执行与训练相同的完整扩散日程，默认 200 步；直接复用经过哈希检查的原始采样片段。验证窗口独立生成，因此推理 stride 为完整的 `L = 750 × window_epochs` 点，不将不同片段或受试者互相拼接；训练 stride 固定为 750 点（30 秒）；默认 K=4 时相邻窗口重叠 90 秒，即 75%，K=1 时不重叠。
 
 在 `dataset_config.json` 中设置：
 
@@ -98,9 +117,9 @@ python scripts/run_dreamt.py --epochs 50 --batch-size 8 --threads 4
 }
 ```
 
-默认使用按受试者隔离的 val split 中全部互不重叠的合法两分钟窗口（`max_windows: null`）。不足两分钟的尾段和含无效睡眠标签的窗口不参与；完整选择清单记录在 protocol 中。候选搜索对齐 30 秒边界；若显式设置整数 `max_windows`，才按固定种子在受试者间轮流限量抽取，该模式属于子集验证。训练期间窗口、顺序、采样种子不变；修改 batch_size 也可能改变采样随机流，跨实验比较应保持整个 validation 配置一致。所选窗口和实际数量记录在 `training/validation/protocol.json`，不读取 test split，不重新拟合标准化参数。
+默认使用按受试者隔离的 val split 中全部互不重叠的配置长度合法窗口（`max_windows: null`）。不足一个窗口的尾段和含无效睡眠标签的窗口不参与；完整选择清单记录在 protocol 中。候选搜索对齐 30 秒边界；若显式设置整数 `max_windows`，才按固定种子在受试者间轮流限量抽取，该模式属于子集验证。训练期间窗口、顺序、采样种子不变；修改 batch_size 也可能改变采样随机流，跨实验比较应保持整个 validation 配置一致。所选窗口和实际数量记录在 `training/validation/protocol.json`，不读取 test split，不重新拟合标准化参数。
 
-指标只统计 IBI，反归一化到毫秒后用 float64 计算，总体方差采用 `correction=0`。每个连续 4 个睡眠 epoch（750 × 4 点）的窗口是一个 3000 维样本，全部窗口组织为 `X_real, X_gen: [N, 3000]`。在全部 N 个窗口上沿 `dim=0` 计算每个时间坐标的均值和方差，得到两个 3000 维向量：
+指标只统计 IBI，反归一化到毫秒后用 float64 计算，总体方差采用 `correction=0`。每个连续 K 个睡眠 epoch（750 × K 点）的窗口是一个 L 维样本，全部窗口组织为 `X_real, X_gen: [N, L]`，其中 `L = 750 × window_epochs`。在全部 N 个窗口上沿 `dim=0` 计算每个时间坐标的均值和方差，得到两个 L 维向量：
 
 ```text
 mu_real[j] = mean_n(X_real[n, j])
@@ -110,17 +129,17 @@ mean_vector_l2_ms     = sqrt(sum_j((mu_gen[j] - mu_real[j])²))
 variance_vector_l2_ms2 = sqrt(sum_j((v_gen[j] - v_real[j])²))
 ```
 
-两个欧式距离都不除以 √3000；例如所有坐标均值都偏移 1 ms，均值距离就是 √3000 ≈ 54.77 ms。方差向量是每个时间坐标的方差，不是 3000 × 3000 协方差矩阵；只比较一阶矩和对角二阶矩。一个窗口时跨窗口总体方差按定义为 0，不能据此判断方差是否学好。原有 pooled / per-window 统计仍保留作诊断：
+两个欧式距离都不除以 √L；默认 L=3000 时，例如所有坐标均值都偏移 1 ms，均值距离就是 √3000 ≈ 54.77 ms。不同窗口长度的 L2 数值尺度不同，不直接比较或沿用非零 min_delta。方差向量是每个时间坐标的方差，不是 L × L 协方差矩阵；只比较一阶矩和对角二阶矩。一个窗口时跨窗口总体方差按定义为 0，不能据此判断方差是否学好。原有 pooled / per-window 统计仍保留作诊断：
 
 | 字段 | 定义 |
 |---|---|
-| `mean_vector_l2_ms` | 真实与生成的 3000 维均值向量欧式距离；早停主指标 |
-| `variance_vector_l2_ms2` | 真实与生成的 3000 维方差向量欧式距离；早停主指标 |
+| `mean_vector_l2_ms` | 真实与生成的 L 维均值向量欧式距离；早停主指标 |
+| `variance_vector_l2_ms2` | 真实与生成的 L 维方差向量欧式距离；早停主指标 |
 | `mean_error_ms` | 所有验证样本合并后的生成均值 − 参考均值 |
 | `variance_error_ms2` | 所有验证样本合并后的生成方差 − 参考方差 |
 | `mean_absolute_error_ms` / `variance_absolute_error_ms2` | 上述整体差值的绝对值 |
-| `mean_window_absolute_error_ms` | 每个两分钟窗口均值差的绝对值，再对窗口取平均 |
-| `variance_window_absolute_error_ms2` | 每个两分钟窗口方差差的绝对值，再对窗口取平均 |
+| `mean_window_absolute_error_ms` | 每个窗口均值差的绝对值，再对窗口取平均 |
+| `variance_window_absolute_error_ms2` | 每个窗口方差差的绝对值，再对窗口取平均 |
 
 新增向量指标与原整体、逐窗口指标使用独立字段，旧字段定义不变。新指标对所有窗口一起估计矩，再计算距离；不对每个 batch 或每个窗口的距离取平均。原存储零值（包括缺失标记）仍计入统计，不裁剪生成值。每轮使用独立的 eval 模型副本；退出验证时恢复随机数状态，不改变训练模型的模式、梯度、buffer 或后续训练随机流。
 
@@ -195,7 +214,7 @@ python scripts/evaluate_original_sampler.py \
 
 | 项目 | 原 WatchSleepNet | 本生成任务 |
 |---|---|---|
-| 模型输入 | 整夜 epoch 序列，可 padding | 同一人的四个 epoch，3000 点，不跨人或 padding |
+| 模型输入 | 整夜 epoch 序列，可 padding | 同一人的 K 个连续 epoch，750 × K 点，不跨人或 padding |
 | 长度上限 | 1100 个 epoch | 默认保留整夜；max_epochs=1100 可复现上限 |
 | 标签条件 | 四类分类目标 | 四类 one-hot 条件，另加 AHI/BMI/AGE/GENDER |
 | 数值标准化 | loader/engine 不做输入 z-score | 仅训练集拟合 IBI 与连续个人条件的 z-score |

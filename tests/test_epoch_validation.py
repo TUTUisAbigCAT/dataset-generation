@@ -36,20 +36,22 @@ def rng_state():
 
 class TwoWindowPreprocessor:
     """Two constant windows whose pooled variance comes entirely between windows."""
-    def __init__(self):
+    def __init__(self, window_epochs=4):
+        self.window_epochs = window_epochs
+        self.window_size = window_epochs * 750
         self.splits = {"train": ["train.npz"], "val": ["val_a.npz", "val_b.npz"], "test": ["test.npz"]}
         self.scaler = {"signal_std_seconds": .5, "signal_mean_seconds": 1., "fit_split": "train"}
         self.split_fingerprint = "fixed-test-split"
         names = ["IBI", "stage_W", "stage_Light", "stage_REM", "stage_Deep", "AHI", "BMI", "AGE", "gender_F", "gender_M"]
         self.columns = SimpleNamespace(tolist=lambda: names.copy())
         self.records = {
-            name: {"ibi": np.full(3000, value, dtype=np.float64),
-                   "stages": np.full(3000, index, dtype=np.int8), "file_sha256": str(index) * 64}
+            name: {"ibi": np.full(self.window_size, value, dtype=np.float64),
+                   "stages": np.full(self.window_size, index, dtype=np.int8), "file_sha256": str(index) * 64}
             for index, (name, value) in enumerate(zip(self.splits["val"], (.5, 1.5)))
         }
 
     def make_validation_dataset(self, *, window_size, stride):
-        if window_size != 3000 or stride != 750:
+        if window_size != self.window_size or stride != 750:
             raise AssertionError("Expected complete windows searched every 30 seconds")
         return SimpleNamespace(window_index=[(name, 0) for name in self.splits["val"]])
 
@@ -91,7 +93,7 @@ class ValidationOptionsAndSelectionTests(unittest.TestCase):
         index = [("a.npz", start) for start in range(750, 7501, 750)]
         index += [("b.npz", start) for start in range(0, 6001, 750)]
         index += [("c.npz", 1500)]
-        processor = mock.Mock(splits={"val": ["a.npz", "b.npz", "c.npz"]})
+        processor = mock.Mock(splits={"val": ["a.npz", "b.npz", "c.npz"]}, window_size=3000, window_epochs=4)
         processor.make_validation_dataset.return_value = SimpleNamespace(window_index=index)
         options = {"max_windows": 5, "batch_size": 2, "seed": 42}
         before = rng_state()
@@ -116,7 +118,7 @@ class ValidationOptionsAndSelectionTests(unittest.TestCase):
         processor.make_validation_dataset.assert_called_with(window_size=3000, stride=750)
 
     def test_selection_rejects_training_records_and_empty_candidates(self):
-        processor = mock.Mock(splits={"val": ["val.npz"]})
+        processor = mock.Mock(splits={"val": ["val.npz"]}, window_size=3000, window_epochs=4)
         processor.make_validation_dataset.return_value = SimpleNamespace(window_index=[("train.npz", 0)])
         with self.assertRaisesRegex(RuntimeError, "escaped"):
             coordinator.select_fixed_windows(processor, coordinator.DEFAULT_VALIDATION)
@@ -126,7 +128,7 @@ class ValidationOptionsAndSelectionTests(unittest.TestCase):
 
     def test_default_selection_includes_all_windows_beyond_previous_sixty_four_cap(self):
         index = [("val.npz", start) for start in range(0, 80 * 3000, 750)]
-        processor = mock.Mock(splits={"val": ["val.npz"]})
+        processor = mock.Mock(splits={"val": ["val.npz"]}, window_size=3000, window_epochs=4)
         processor.make_validation_dataset.return_value = SimpleNamespace(window_index=index)
         options = coordinator.validation_options({})
         self.assertIsNone(options["max_windows"])
@@ -134,6 +136,20 @@ class ValidationOptionsAndSelectionTests(unittest.TestCase):
         self.assertEqual(selected, [("val.npz", start) for start in range(0, 80 * 3000, 3000)])
         self.assertEqual(metadata["available_nonoverlapping_windows"], 80)
         self.assertEqual(metadata["selected_windows"], 80)
+
+    def test_selection_uses_configured_whole_epoch_window_lengths(self):
+        for epochs in (1, 2, 3, 8):
+            with self.subTest(window_epochs=epochs):
+                length = epochs * 750
+                processor = mock.Mock(splits={"val": ["val.npz"]},
+                                      window_size=length, window_epochs=epochs)
+                index = [("val.npz", start) for start in range(750, 750 + 3 * length, 750)]
+                processor.make_validation_dataset.return_value = SimpleNamespace(window_index=index)
+                selected, metadata = coordinator.select_fixed_windows(processor, coordinator.validation_options({}))
+                self.assertEqual(selected, [("val.npz", 750 + offset * length) for offset in range(3)])
+                self.assertEqual(metadata["window_size_samples"], length)
+                self.assertEqual(metadata["candidate_stride_samples"], 750)
+                processor.make_validation_dataset.assert_called_once_with(window_size=length, stride=750)
 
 
 class EpochCoordinatorTests(unittest.TestCase):
@@ -230,6 +246,43 @@ class EpochCoordinatorTests(unittest.TestCase):
         self.assertEqual(selected, [("val.npz", 750)])
         self.assertEqual(metadata["selected_windows"], 1)
         self.assertNotIn("test.npz", processor.accessed_files)
+
+    def test_configured_window_length_controls_shapes_metrics_stages_and_protocol(self):
+        for epochs in (1, 2, 3, 8):
+            with self.subTest(window_epochs=epochs):
+                length = epochs * 750
+                self.args = SimpleNamespace(window_size=length, s4_lmax=length)
+                processor = TwoWindowPreprocessor(window_epochs=epochs)
+                validator = self.make_validator(processor, output=self.output / f"window_{epochs}",
+                                                config={**self.config, "window_epochs": epochs})
+                self.assertEqual(validator.windows.shape, (2, length, 10))
+                self.assertEqual(validator.reference.shape, (2, length))
+                self.assertEqual([len(row["sleep_stages"]) for row in validator.windows_metadata], [epochs, epochs])
+                protocol = json.loads((validator.output / "protocol.json").read_text(encoding="utf-8"))
+                self.assertEqual(protocol["window"]["window_epochs"], epochs)
+                self.assertEqual(protocol["window"]["window_seconds"], epochs * 30)
+                self.assertEqual(protocol["vector_metrics"]["dimension"], length)
+                self.assertEqual(protocol["selection"]["window_size_samples"], length)
+                measured = summarize_distribution(validator.reference + .1, validator.reference)
+                output = io.StringIO()
+                with mock.patch.object(validator, "_generate", return_value=(measured, {}, [])), \
+                     contextlib.redirect_stdout(output):
+                    report = validator.run(1, self.model, .1)
+                started = json.loads(output.getvalue().splitlines()[0])
+                self.assertEqual(started["window_size"], length)
+                self.assertEqual(started["window_epochs"], epochs)
+                self.assertAlmostEqual(report["aggregate"]["mean_vector_l2_ms"], 100. * length ** .5)
+                self.assertEqual(validator.summary()["window"]["window_size"], length)
+
+    def test_validation_rejects_configuration_mismatch_and_insufficient_kernel(self):
+        for args, processor, config in (
+                (SimpleNamespace(window_size=3000, s4_lmax=6000), TwoWindowPreprocessor(2), self.config),
+                (SimpleNamespace(window_size=1500, s4_lmax=6000), self.processor, self.config),
+                (SimpleNamespace(window_size=3000, s4_lmax=6000), self.processor, {**self.config, "window_epochs": 2}),
+                (SimpleNamespace(window_size=3000, s4_lmax=1500), self.processor, self.config)):
+            with self.subTest(args=args, config=config), self.assertRaisesRegex(ValueError, "window_epochs|kernel length"):
+                self.args = args
+                self.make_validator(processor=processor, config=config)
 
     def test_pooled_metrics_history_and_unchanged_training(self):
         before_init = rng_state()

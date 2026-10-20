@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 from cuda_runtime import require_cuda, cuda_environment
 from epoch_validation import weighted_loss
+from window_config import EPOCH_SAMPLES, window_settings
 
 
 def save_json(path, value):
@@ -71,6 +72,9 @@ def main():
     if min(args.batch_size, args.epochs, args.log_every) < 1:
         parser.error('Positive batch size, epoch count and log interval required')
     device = require_cuda()
+    config_path = Path(os.environ.get("DREAMT_CONFIG_PATH", ROOT / "dataset_config.json"))
+    config = json.loads(config_path.read_text(encoding="utf-8-sig")) if config_path.is_file() else {}
+    dimensions = window_settings(config)
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
     checkpoint_path = ROOT / 'saved_models' / args.dataset / 'model.pth'
@@ -89,17 +93,17 @@ def main():
                     ROOT / 'TSImputers/SSSDS4Imputer.py', ROOT / 'TSImputers/S4Model.py', ROOT / 'utils/util.py',
                     ROOT / 'watchsleep_loader.py', ROOT / 'dataset_config.json', ROOT / 'cuda_runtime.py',
                     ROOT / 'third_party/WatchSleepNet/data_setup.py', ROOT / 'epoch_validation.py',
-                    ROOT / 'validation_metrics.py', ROOT / 'validation_sampling.py',
+                    ROOT / 'validation_metrics.py', ROOT / 'validation_sampling.py', ROOT / 'window_config.py',
                     ROOT / 'scripts/evaluate_original_sampler.py']
     hashes = {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
-    command = [filename, '-d', args.dataset, '-window_size', '3000', '-s4_lmax', '3000',
-               '-stride', '750', '-batch_size', str(args.batch_size), '-epochs', str(args.epochs),
+    command = [filename, '-d', args.dataset, '-window_size', str(dimensions['window_size']), '-s4_lmax', str(dimensions['window_size']),
+               '-stride', str(EPOCH_SAMPLES), '-batch_size', str(args.batch_size), '-epochs', str(args.epochs),
                '-validation_output', str(output / 'validation')]
     manifest = dict(status='starting', python=sys.executable, python_version=sys.version,
                     torch=torch.__version__, numpy=np.__version__, cuda=torch.cuda.is_available(),
                     mkldnn_enabled=torch.backends.mkldnn.enabled, threads=torch.get_num_threads(),
                     process_id=os.getpid(), command=command, source_sha256=hashes,
-                    device=str(device), cuda_environment=cuda_environment(device),
+                    device=str(device), cuda_environment=cuda_environment(device), window_settings=dimensions,
                     observer='sys.settrace reads current loss and completed updates only; no training hooks or replacements',
                     observer_sha256=sha(Path(__file__)), training_args=None,
                     checkpoint=str(checkpoint_path), data_synthetic=None)
