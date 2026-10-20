@@ -51,7 +51,7 @@ def validate_completion(validation, steps, batches_per_epoch, requested_epochs):
 
 def save_best_manifests(output, manifest, best_checkpoints):
     # A distinct manifest keeps strict checkpoint hash validation intact when
-    # evaluating either best model; the main manifest still selects final weights.
+    # evaluating the selected best model; the main manifest still selects final weights.
     for name, best in best_checkpoints.items():
         selected = dict(manifest, checkpoint=best['checkpoint'],
                         checkpoint_sha256=best['checkpoint_sha256'], checkpoint_epoch=best['epoch'],

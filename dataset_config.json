@@ -10,14 +10,14 @@
   "early_stopping": {
     "enabled": true,
     "patience": 10,
-    "min_delta_mean_ms": 0.0,
-    "min_delta_variance_ms2": 0.0,
-    "smoothing_window": 5
+    "smoothing_window": 5,
+    "min_delta_kl": 0.0
   },
   "validation": {
     "max_windows": null,
     "batch_size": 8,
-    "seed": 20261020
+    "seed": 20261020,
+    "kl_variance_floor_ms2": 1.0
   },
   "window_epochs": 4
 }

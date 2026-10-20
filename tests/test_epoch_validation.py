@@ -10,6 +10,7 @@ import contextlib
 import csv
 import io
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -75,15 +76,18 @@ class ValidationOptionsAndSelectionTests(unittest.TestCase):
     def test_options_defaults_and_strict_numeric_ranges(self):
         defaults = coordinator.validation_options({})
         self.assertEqual(defaults, coordinator.DEFAULT_VALIDATION)
+        self.assertEqual(defaults["kl_variance_floor_ms2"], 1.0)
         defaults["seed"] = 0
         self.assertNotEqual(defaults, coordinator.DEFAULT_VALIDATION)
-        valid = {"validation": {"max_windows": None, "batch_size": 1, "seed": 2**32 - 1}}
+        valid = {"validation": {"max_windows": None, "batch_size": 1, "seed": 2**32 - 1, "kl_variance_floor_ms2": .25}}
         self.assertEqual(coordinator.validation_options(valid), valid["validation"])
         bad_values = [
             {"validation": None}, {"validation": []}, {"validation": {"unknown": 1}},
             *({"validation": {"max_windows": value}} for value in (0, -1, True, 1., "2")),
             *({"validation": {"batch_size": value}} for value in (0, -1, False, None, 1., "2")),
             *({"validation": {"seed": value}} for value in (-1, 2**32, True, None, 1., "2")),
+            *({"validation": {"kl_variance_floor_ms2": value}}
+              for value in (0, -1, True, False, None, "1", float("nan"), float("inf"))),
         ]
         for config in bad_values:
             with self.subTest(config=config), self.assertRaises(ValueError):
@@ -261,7 +265,7 @@ class EpochCoordinatorTests(unittest.TestCase):
                 protocol = json.loads((validator.output / "protocol.json").read_text(encoding="utf-8"))
                 self.assertEqual(protocol["window"]["window_epochs"], epochs)
                 self.assertEqual(protocol["window"]["window_seconds"], epochs * 30)
-                self.assertEqual(protocol["vector_metrics"]["dimension"], length)
+                self.assertEqual(protocol["schema"], "ibi_epoch_diagonal_gaussian_kl_v3")
                 self.assertEqual(protocol["selection"]["window_size_samples"], length)
                 measured = summarize_distribution(validator.reference + .1, validator.reference)
                 output = io.StringIO()
@@ -271,7 +275,7 @@ class EpochCoordinatorTests(unittest.TestCase):
                 started = json.loads(output.getvalue().splitlines()[0])
                 self.assertEqual(started["window_size"], length)
                 self.assertEqual(started["window_epochs"], epochs)
-                self.assertAlmostEqual(report["aggregate"]["mean_vector_l2_ms"], 100. * length ** .5)
+                self.assertAlmostEqual(report["aggregate"]["gaussian_kl_real_to_generated"], length * .02)
                 self.assertEqual(validator.summary()["window"]["window_size"], length)
 
     def test_validation_rejects_configuration_mismatch_and_insufficient_kernel(self):
@@ -284,7 +288,7 @@ class EpochCoordinatorTests(unittest.TestCase):
                 self.args = args
                 self.make_validator(processor=processor, config=config)
 
-    def test_pooled_metrics_history_and_unchanged_training(self):
+    def test_sequence_distribution_kl_history_and_unchanged_training(self):
         before_init = rng_state()
         validator = self.make_validator()
         self.assertRngEqual(before_init)
@@ -311,16 +315,14 @@ class EpochCoordinatorTests(unittest.TestCase):
             self.assertRngEqual(random_before)
             self.assertModelEqual(model_before)
         first, second, third = reports
-        self.assertAlmostEqual(first["aggregate"]["reference_mean_ms"], 1000.)
-        self.assertAlmostEqual(first["aggregate"]["reference_variance_ms2"], 250000.)
-        self.assertTrue(all(row["reference_variance_ms2"] == 0. for row in first["per_window"]))
-        self.assertAlmostEqual(first["aggregate"]["mean_absolute_error_ms"], 100.)
-        self.assertAlmostEqual(first["aggregate"]["mean_vector_l2_ms"], 100. * 3000 ** .5)
-        self.assertAlmostEqual(first["aggregate"]["variance_vector_l2_ms2"], 0.)
-        self.assertAlmostEqual(second["aggregate"]["mean_absolute_error_ms"], 0.)
-        self.assertAlmostEqual(second["aggregate"]["variance_absolute_error_ms2"], 750000.)
-        self.assertAlmostEqual(second["aggregate"]["mean_vector_l2_ms"], 0.)
-        self.assertAlmostEqual(second["aggregate"]["variance_vector_l2_ms2"], 750000. * 3000 ** .5)
+        self.assertEqual(set(first["aggregate"]), {"gaussian_kl_real_to_generated"})
+        # Across-window variance is 250000 ms^2 at every coordinate. A 100 ms
+        # shift contributes .5 * 100^2 / 250000 = .02 nats per coordinate.
+        self.assertAlmostEqual(first["aggregate"]["gaussian_kl_real_to_generated"], 3000. * .02)
+        self.assertAlmostEqual(second["aggregate"]["gaussian_kl_real_to_generated"],
+                               .5 * 3000 * (math.log(4.) + .25 - 1.))
+        self.assertEqual(second["aggregate"], third["aggregate"])
+        self.assertNotIn("per_window", first)
         summary = validator.summary()
         self.assertEqual(summary["completed_epochs"], 3)
         with (self.output.parent / "epoch_metrics.csv").open(newline="", encoding="utf-8") as stream:
@@ -350,57 +352,69 @@ class EpochCoordinatorTests(unittest.TestCase):
         self.assertModelEqual(model_before)
         self.assertEqual(validator.summary()["completed_epochs"], 0)
 
-    def test_joint_checkpoint_updates_exactly_when_patience_resets(self):
+    def test_kl_checkpoint_updates_exactly_when_patience_resets(self):
         validator = self.make_validator(config={**self.config, "early_stopping": {"smoothing_window": 1}})
-        means, variances = [10., 9., 9., 8.], [100., 100., 90., 80.]
-        for epoch, (mean, variance) in enumerate(zip(means, variances), 1):
+        for epoch, kl in enumerate((10., 9., 9., 8.), 1):
             with torch.no_grad():
                 self.model[0].weight.fill_(epoch)
-            measured = dict(aggregate=dict(mean_vector_l2_ms=mean,
-                                          variance_vector_l2_ms2=variance),
-                            per_window=[{}, {}])
+            measured = dict(aggregate=dict(gaussian_kl_real_to_generated=kl))
             with mock.patch.object(validator, "_generate", return_value=(measured, {}, [])), \
                  contextlib.redirect_stdout(io.StringIO()):
                 report = validator.run(epoch, self.model, .1)
-            joint_epoch = 4 if epoch == 4 else 1
-            selected = validator.summary()["best_checkpoints"]["joint"]
-            self.assertEqual(selected["epoch"], joint_epoch)
+            selected_epoch = [1, 2, 2, 4][epoch-1]
+            selected = validator.summary()["best_checkpoints"]["kl"]
+            self.assertEqual(selected["epoch"], selected_epoch)
             saved = torch.load(selected["checkpoint"], map_location="cpu", weights_only=True)
-            self.assertEqual(saved["0.weight"].item(), joint_epoch)
-            self.assertEqual(report["early_stopping"]["joint_improvement"], epoch in (1, 4))
-            self.assertEqual(report["early_stopping"]["bad_epochs"], [0, 1, 2, 0][epoch-1])
+            self.assertEqual(saved["0.weight"].item(), selected_epoch)
+            self.assertEqual(report["early_stopping"]["metric_improvement"], epoch in (1, 2, 4))
+            self.assertNotIn("joint_improvement", report["early_stopping"])
+            self.assertEqual(report["early_stopping"]["bad_epochs"], [0, 0, 1, 0][epoch-1])
+            self.assertEqual(set(validator.summary()["best_checkpoints"]), {"kl"})
 
     def test_smoothed_checkpoint_warmup_and_current_weights(self):
         validator = self.make_validator(config={**self.config, "early_stopping": {"smoothing_window": 3}})
-        for epoch, mean in enumerate((10., 10., 10., 7., 20.), 1):
+        # Epoch four improves SMA 5 -> 4 while raw KL rises 0 -> 9.
+        # Its current model must replace epoch three despite the worse raw KL.
+        for epoch, kl in enumerate((12., 3., 0., 9., 8.), 1):
             with torch.no_grad():
                 self.model[0].weight.fill_(epoch)
-            measured = dict(aggregate=dict(mean_vector_l2_ms=mean,
-                                          variance_vector_l2_ms2=mean * 10),
-                            per_window=[{}, {}])
+            measured = dict(aggregate=dict(gaussian_kl_real_to_generated=kl))
             with mock.patch.object(validator, "_generate", return_value=(measured, {}, [])), \
                  contextlib.redirect_stdout(io.StringIO()):
                 report = validator.run(epoch, self.model, .1)
             checkpoints = validator.summary()["best_checkpoints"]
             if epoch < 3:
-                self.assertNotIn("joint", checkpoints)
-                self.assertFalse((self.output.parent / "best_joint_model.pth").exists())
+                self.assertEqual(checkpoints, {})
+                self.assertEqual(list(self.output.parent.glob("best_*_model.pth")), [])
                 self.assertFalse(report["early_stopping"]["smoothing_ready"])
             else:
-                selected = checkpoints["joint"]
+                selected = checkpoints["kl"]
                 expected_epoch = 3 if epoch == 3 else 4
                 self.assertEqual(selected["epoch"], expected_epoch)
                 saved = torch.load(selected["checkpoint"], map_location="cpu", weights_only=True)
                 self.assertEqual(saved["0.weight"].item(), expected_epoch)
-        self.assertEqual(selected["value"], dict(mean_vector_l2_ms=9., variance_vector_l2_ms2=90.))
-        self.assertEqual(selected["raw_metrics"]["mean_vector_l2_ms"], 7.)
+        self.assertEqual(selected["metric"], "gaussian_kl_real_to_generated")
+        self.assertEqual(selected["selection_rule"], "smoothed_kl")
+        self.assertEqual(selected["value"], 4.)
+        self.assertEqual(selected["raw_metrics"], {"gaussian_kl_real_to_generated": 9.})
+        self.assertEqual(validator.summary()["early_stopping"]["best_metrics"]["kl"]["epoch"], 3)
         self.assertEqual(selected["window_start_epoch"], 2)
+        self.assertEqual(selected["smoothing_window"], 3)
         with (self.output.parent / "epoch_metrics.csv").open(newline="", encoding="utf-8") as stream:
-            rows = list(csv.DictReader(stream))
-        self.assertEqual(rows[0]["smoothed_mean_vector_l2_ms"], "")
+            reader = csv.DictReader(stream)
+            rows = list(reader)
+            self.assertEqual(reader.fieldnames, [
+                "epoch", "train_mean_loss", "gaussian_kl_real_to_generated",
+                "smoothed_gaussian_kl_real_to_generated", "validation_seconds",
+                "smoothing_ready", "metric_improvement", "early_stopping_bad_epochs", "stopped_early"])
+        self.assertEqual(rows[0]["smoothed_gaussian_kl_real_to_generated"], "")
         self.assertEqual(rows[0]["smoothing_ready"], "False")
-        self.assertEqual(float(rows[3]["smoothed_mean_vector_l2_ms"]), 9.)
+        self.assertEqual(float(rows[3]["smoothed_gaussian_kl_real_to_generated"]), 4.)
+        self.assertEqual(rows[3]["metric_improvement"], "True")
+        self.assertEqual(rows[4]["metric_improvement"], "False")
         self.assertEqual(rows[4]["early_stopping_bad_epochs"], "1")
+        for obsolete in ("mean", "variance", "joint"):
+            self.assertFalse((self.output.parent / f"best_{obsolete}_model.pth").exists())
 
     def test_epoch_order_and_nonfinite_loss_rejected(self):
         validator = self.make_validator()
@@ -471,7 +485,8 @@ class EpochCoordinatorTests(unittest.TestCase):
                        file_sha256=str(index) * 64)
             for index, name in enumerate(processor.splits["val"])
         }
-        validator = self.make_validator(processor)
+        validator = self.make_validator(processor, config={**self.config, "validation": {
+            **self.config["validation"], "kl_variance_floor_ms2": 100000.}})
         self.assertEqual(validator.options["batch_size"], 2)
         batch_sizes, generated_batches = [], []
 
@@ -491,16 +506,17 @@ class EpochCoordinatorTests(unittest.TestCase):
         self.assertEqual([entry["windows"] for entry in report["sampling"]], [2, 2, 1])
         generated_ms = torch.cat(generated_batches) * 1000.
         reference_ms = validator.reference * 1000.
-        expected_mean_distance = torch.linalg.vector_norm(generated_ms.mean(dim=0) - reference_ms.mean(dim=0))
-        expected_variance_distance = torch.linalg.vector_norm(
-            generated_ms.var(dim=0, unbiased=False) - reference_ms.var(dim=0, unbiased=False))
-        self.assertAlmostEqual(report["aggregate"]["mean_vector_l2_ms"], float(expected_mean_distance), places=7)
-        self.assertAlmostEqual(report["aggregate"]["variance_vector_l2_ms2"], float(expected_variance_distance), places=6)
-        self.assertEqual(len(report["per_window"]), 5)
-        self.assertEqual([row["window_index"] for row in report["per_window"]], list(range(5)))
-        self.assertEqual([row["filename"] for row in report["per_window"]], processor.splits["val"])
-        self.assertEqual(report["early_stopping"]["best_metrics"]["mean"]["metric"], "mean_vector_l2_ms")
-        self.assertEqual(report["early_stopping"]["best_metrics"]["variance"]["metric"], "variance_vector_l2_ms2")
+        ref_variance, ref_mean = torch.var_mean(reference_ms, dim=0, unbiased=False)
+        gen_variance, gen_mean = torch.var_mean(generated_ms, dim=0, unbiased=False)
+        ref_variance = ref_variance.clamp_min(validator.options["kl_variance_floor_ms2"])
+        gen_variance = gen_variance.clamp_min(validator.options["kl_variance_floor_ms2"])
+        expected_kl = .5 * (torch.log(gen_variance / ref_variance)
+                             + (ref_variance + (ref_mean - gen_mean).square()) / gen_variance - 1).sum()
+        self.assertEqual(set(report["aggregate"]), {"gaussian_kl_real_to_generated"})
+        self.assertAlmostEqual(report["aggregate"]["gaussian_kl_real_to_generated"], float(expected_kl), places=7)
+        self.assertNotIn("per_window", report)
+        self.assertEqual(report["early_stopping"]["best_metrics"]["kl"]["metric"], "gaussian_kl_real_to_generated")
+        self.assertEqual(validator.summary()["best_checkpoints"], {})  # No checkpoint during warmup.
 
 if __name__ == "__main__":
     unittest.main()

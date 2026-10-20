@@ -1,5 +1,6 @@
 """Early-stop decisions and the real launcher loop with explicit CPU test mocks."""
 import contextlib
+import csv
 import io
 import json
 import os
@@ -19,100 +20,98 @@ from scripts.evaluate_denoising import resolve_checkpoint, load_training_run
 from validation_metrics import summarize_distribution
 
 
-def metrics(mean, variance):
-    return dict(mean_vector_l2_ms=mean, variance_vector_l2_ms2=variance)
+def metrics(kl):
+    return dict(gaussian_kl_real_to_generated=kl)
 
 
 class EarlyStoppingTests(unittest.TestCase):
     def test_default_warmup_and_ten_plateau_epochs_stop_at_fifteen(self):
         stopping = EarlyStopping({})
         for epoch in range(1, 16):
-            result = stopping.update(epoch, metrics(10., 1000000.))
+            result = stopping.update(epoch, metrics(10.))
             self.assertEqual(result['bad_epochs'], max(0, epoch - 5))
             self.assertEqual(result['stopped_early'], epoch == 15)
             self.assertEqual(result['smoothing_ready'], epoch >= 5)
-            self.assertEqual(result['joint_improvement'], epoch == 5)
-            self.assertEqual(result['smoothed_metrics'], metrics(10., 1000000.) if epoch >= 5 else metrics(None, None))
-        self.assertEqual(result['best_metrics']['mean']['epoch'], 1)
+            self.assertEqual(result['metric_improvement'], epoch == 5)
+            self.assertNotIn('joint_improvement', result)
+            self.assertEqual(result['improvement_rule'], 'smoothed_kl')
+            self.assertEqual(result['smoothed_metrics'], metrics(10.) if epoch >= 5 else metrics(None))
+        self.assertEqual(result['best_metrics']['kl']['epoch'], 1)
         with self.assertRaises(ValueError):
-            stopping.update(16, metrics(9., 0.))
+            stopping.update(16, metrics(9.))
 
     def test_sliding_window_eviction_and_snapshot_independence(self):
         stopping = EarlyStopping({'early_stopping': {'smoothing_window': 3}})
-        results = [stopping.update(i, metrics(value, value * 10))
-                   for i, value in enumerate((3, 6, 9, 0), 1)]
-        self.assertEqual(results[1]['smoothed_metrics'], metrics(None, None))
-        self.assertEqual(results[2]['smoothed_metrics'], metrics(6., 60.))
-        self.assertEqual(results[3]['smoothed_metrics'], metrics(5., 50.))
-        self.assertTrue(results[3]['joint_improvement'])
+        results = [stopping.update(i, metrics(value)) for i, value in enumerate((3, 6, 9, 0), 1)]
+        self.assertEqual(results[1]['smoothed_metrics'], metrics(None))
+        self.assertEqual(results[2]['smoothed_metrics'], metrics(6.))
+        self.assertEqual(results[3]['smoothed_metrics'], metrics(5.))
+        self.assertTrue(results[3]['metric_improvement'])
+        self.assertEqual(results[0]['best_metrics']['kl']['value'], 3.)
 
     def test_smoothed_improvement_can_disagree_with_raw_direction(self):
         stopping = EarlyStopping({'early_stopping': {'smoothing_window': 3}})
         # Raw rises 0->9 while SMA falls 5->4; then raw falls 9->8 while SMA rises.
-        results = [stopping.update(i, metrics(value, value * 10))
-                   for i, value in enumerate((12, 3, 0, 9, 8), 1)]
-        self.assertEqual(results[2]['smoothed_metrics'], metrics(5., 50.))
-        self.assertEqual(results[3]['smoothed_metrics'], metrics(4., 40.))
-        self.assertTrue(results[3]['joint_improvement'])
-        self.assertEqual(results[3]['new_best_metrics'], [])
-        self.assertFalse(results[4]['joint_improvement'])
+        results = [stopping.update(i, metrics(value)) for i, value in enumerate((12, 3, 0, 9, 8), 1)]
+        self.assertEqual(results[2]['smoothed_metrics'], metrics(5.))
+        self.assertEqual(results[3]['smoothed_metrics'], metrics(4.))
+        self.assertTrue(results[3]['metric_improvement'])
+        self.assertEqual(results[3]['best_metrics']['kl']['value'], 0.)
+        self.assertFalse(results[4]['metric_improvement'])
         self.assertEqual(results[4]['bad_epochs'], 1)
 
-    def test_only_simultaneous_improvement_resets_patience(self):
+    def test_single_kl_improvement_resets_patience(self):
         stopping = EarlyStopping({'early_stopping': {'patience': 3, 'smoothing_window': 1}})
-        values = [(10, 100), (9, 100), (9, 90), (8, 80), (7, 90), (8, 70), (7, 70)]
-        results = [stopping.update(i, metrics(*pair)) for i, pair in enumerate(values, 1)]
-        self.assertEqual([r['bad_epochs'] for r in results], [0, 1, 2, 0, 1, 2, 3])
-        self.assertEqual([r['joint_improvement'] for r in results], [True, False, False, True, False, False, False])
-        self.assertEqual(results[2]['improved_metrics'], ['variance'])
-        self.assertEqual(results[4]['improved_metrics'], ['mean'])
+        results = [stopping.update(i, metrics(value)) for i, value in enumerate((10, 9, 10, 8, 8, 9, 8), 1)]
+        self.assertEqual([r['bad_epochs'] for r in results], [0, 0, 1, 0, 1, 2, 3])
+        self.assertEqual([r['metric_improvement'] for r in results], [True, True, False, True, False, False, False])
         self.assertEqual(results[-1]['stopped_epoch'], 7)
-        self.assertEqual(results[-1]['best_metrics']['mean']['epoch'], 5)
-        self.assertEqual(results[-1]['best_metrics']['variance']['epoch'], 6)
-        # Earlier rows must remain immutable when later best values change.
-        self.assertEqual(results[0]['best_metrics']['mean']['epoch'], 1)
+        self.assertEqual(results[-1]['best_metrics']['kl']['epoch'], 4)
+        self.assertEqual(results[0]['best_metrics']['kl']['epoch'], 1)
 
     def test_threshold_is_strict_and_small_improvements_accumulate(self):
         stopping = EarlyStopping({'early_stopping': {
-            'patience': 4, 'smoothing_window': 1, 'min_delta_mean_ms': 1., 'min_delta_variance_ms2': 5.}})
-        stopping.update(1, metrics(10, 100))
-        result = stopping.update(2, metrics(9, 95))
-        self.assertEqual(result['improved_metrics'], [])  # Exactly min_delta is insufficient.
-        self.assertEqual(set(result['new_best_metrics']), {'mean', 'variance'})
-        self.assertEqual(result['threshold_anchors'], {'mean': 10., 'variance': 100.})
-        result = stopping.update(3, metrics(8.9, 95))
-        self.assertEqual(result['improved_metrics'], ['mean'])
-        self.assertEqual(result['bad_epochs'], 2)
-        self.assertFalse(result['joint_improvement'])
-        result = stopping.update(4, metrics(8.9, 94.9))
-        self.assertEqual(result['improved_metrics'], ['variance'])
-        self.assertEqual(result['bad_epochs'], 3)
-        result = stopping.update(5, metrics(7.8, 89.8))
-        self.assertTrue(result['joint_improvement'])
-        self.assertEqual(result['bad_epochs'], 0)
+            'patience': 4, 'smoothing_window': 1, 'min_delta_kl': 1.}})
+        results = [stopping.update(i, metrics(value)) for i, value in enumerate((10, 9, 8.9, 8, 7.8), 1)]
+        self.assertFalse(results[1]['metric_improvement'])  # Exactly min_delta is insufficient.
+        self.assertEqual(results[1]['best_metrics']['kl']['value'], 9.)
+        self.assertEqual([r['bad_epochs'] for r in results], [0, 1, 0, 1, 0])
+        self.assertTrue(results[2]['metric_improvement'])
+        self.assertFalse(results[3]['metric_improvement'])
+        self.assertTrue(results[4]['metric_improvement'])
 
-    def test_repeated_single_metric_improvement_cannot_prevent_stopping(self):
-        for improving in ('mean', 'variance'):
-            with self.subTest(improving=improving):
-                stopping = EarlyStopping({'early_stopping': {'patience': 5, 'smoothing_window': 1}})
-                for epoch in range(1, 7):
-                    value = 100 - epoch
-                    row = metrics(value, 100) if improving == 'mean' else metrics(100, value)
-                    result = stopping.update(epoch, row)
-                    self.assertEqual(result['bad_epochs'], epoch - 1)
-                    self.assertEqual(result['stopped_early'], epoch == 6)
+    def test_obsolete_mean_variance_values_do_not_control_stopping(self):
+        stopping = EarlyStopping({'early_stopping': {'patience': 5, 'smoothing_window': 1}})
+        for epoch in range(1, 7):
+            row = dict(**metrics(100.), mean_vector_l2_ms=100. - epoch, variance_vector_l2_ms2=1000. - epoch)
+            result = stopping.update(epoch, row)
+            self.assertEqual(result['bad_epochs'], epoch - 1)
+            self.assertEqual(result['stopped_early'], epoch == 6)
 
-    def test_disabled_stopping_and_zero_errors(self):
+    def test_disabled_stopping_and_zero_kl(self):
         stopping = EarlyStopping({'early_stopping': {'enabled': False, 'patience': 1, 'smoothing_window': 1}})
         for epoch in range(1, 9):
-            self.assertFalse(stopping.update(epoch, metrics(0., 0.))['stopped_early'])
+            self.assertFalse(stopping.update(epoch, metrics(0.))['stopped_early'])
         self.assertEqual(stopping.summary()['bad_epochs'], 7)
+
+    def test_legacy_zero_thresholds_migrate_without_reintroducing_old_keys(self):
+        for old in ({'min_delta_mean_ms': 0}, {'min_delta_variance_ms2': 0.},
+                    {'min_delta_mean_ms': 0., 'min_delta_variance_ms2': 0}):
+            with self.subTest(legacy=old):
+                result = early_stopping_options({'early_stopping': {**old, 'min_delta_kl': .2}})
+                self.assertEqual(result['min_delta_kl'], .2)
+                self.assertNotIn('min_delta_mean_ms', result)
+                self.assertNotIn('min_delta_variance_ms2', result)
+        for key in ('min_delta_mean_ms', 'min_delta_variance_ms2'):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                early_stopping_options({'early_stopping': {key: 1.}})
 
     def test_rejects_invalid_options_metrics_and_epoch_order(self):
         invalid = [None, [], {'unknown': 1}, {'enabled': 1}, {'patience': 0},
-                   {'patience': True}, {'patience': 1.5}, {'min_delta_mean_ms': -1},
-                   {'min_delta_variance_ms2': float('inf')}, {'min_delta_mean_ms': float('nan')},
-                   {'min_delta_mean_ms': True}, {'min_delta_variance_ms2': '1'}]
+                   {'patience': True}, {'patience': 1.5}]
+        invalid += [{'min_delta_kl': value} for value in (-1, float('nan'), float('inf'), True, '1', None)]
+        invalid += [{key: value} for key in ('min_delta_mean_ms', 'min_delta_variance_ms2')
+                    for value in (-1, float('nan'), float('inf'), True, '0', None)]
         invalid += [{'smoothing_window': value} for value in (0, -1, True, 1.5, '5', None)]
         for options in invalid:
             with self.subTest(options=options), self.assertRaises(ValueError):
@@ -120,7 +119,7 @@ class EarlyStoppingTests(unittest.TestCase):
         stopping = EarlyStopping({})
         for epoch, value in ((2, 1), (1, -1), (1, float('nan')), (1, float('inf'))):
             with self.subTest(epoch=epoch, value=value), self.assertRaises(ValueError):
-                stopping.update(epoch, metrics(value, 0))
+                stopping.update(epoch, metrics(value))
         self.assertEqual(stopping.summary()['completed_epochs'], 0)
 
     def test_completion_accepts_only_full_validated_epochs(self):
@@ -195,25 +194,37 @@ class LauncherEarlyStoppingTests(unittest.TestCase):
                 self.assertFalse((output / 'failure.json').exists())
                 self.assertEqual(len(list((output / 'validation').glob('epoch_*'))), completed)
                 final = torch.load(manifest['checkpoint'], map_location='cpu', weights_only=True)
-                kinds = ('mean', 'variance', 'joint') if completed >= 5 else ('mean', 'variance')
+                for obsolete in ('mean', 'variance', 'joint'):
+                    self.assertFalse((output / f'best_{obsolete}_model.pth').exists())
+                    self.assertFalse((output / f'best_{obsolete}_manifest.json').exists())
+                with (output / 'epoch_metrics.csv').open(newline='', encoding='utf-8') as stream:
+                    reader = csv.DictReader(stream)
+                    rows = list(reader)
+                    self.assertEqual(reader.fieldnames, [
+                        'epoch', 'train_mean_loss', 'gaussian_kl_real_to_generated',
+                        'smoothed_gaussian_kl_real_to_generated', 'validation_seconds',
+                        'smoothing_ready', 'metric_improvement', 'early_stopping_bad_epochs', 'stopped_early'])
+                self.assertEqual(len(rows), completed)
+                self.assertEqual([row['smoothed_gaussian_kl_real_to_generated'] for row in rows[:4]],
+                                 [''] * min(4, completed))
                 if completed < 5:
-                    self.assertFalse((output / 'best_joint_model.pth').exists())
-                    self.assertFalse((output / 'best_joint_manifest.json').exists())
-                for metric in kinds:
-                    best_path = output / f'best_{metric}_manifest.json'
+                    self.assertFalse((output / 'best_kl_model.pth').exists())
+                    self.assertFalse((output / 'best_kl_manifest.json').exists())
+                else:
+                    best_path = output / 'best_kl_manifest.json'
                     _, selected, _ = load_training_run(best_path)
                     checkpoint, identity = resolve_checkpoint(best_path, selected)
                     self.assertTrue(identity['recorded_digest_verified'])
-                    self.assertEqual(selected['checkpoint_epoch'], 5 if metric == 'joint' else 1)
-                    if metric != 'joint':
-                        expected_metric = 'mean_vector_l2_ms' if metric == 'mean' else 'variance_vector_l2_ms2'
-                        self.assertEqual(selected['checkpoint_selection']['metric'], expected_metric)
-                    if metric == 'joint':
-                        selection = selected['checkpoint_selection']
-                        self.assertEqual(selection['smoothing_window'], 5)
-                        self.assertEqual(selection['window_start_epoch'], 1)
-                        self.assertEqual(selection['value'], metrics(0., 0.))
-                        self.assertEqual(selection['raw_metrics'], metrics(0., 0.))
+                    self.assertEqual(selected['checkpoint_epoch'], 5)
+                    selection = selected['checkpoint_selection']
+                    self.assertEqual(selection['metric'], 'gaussian_kl_real_to_generated')
+                    self.assertEqual(selection['selection_rule'], 'smoothed_kl')
+                    self.assertEqual(selection['smoothing_window'], 5)
+                    self.assertEqual(selection['window_start_epoch'], 1)
+                    self.assertEqual(selection['value'], 0.)
+                    self.assertEqual(selection['raw_metrics'], metrics(0.))
+                    self.assertEqual(rows[4]['metric_improvement'], 'True')
+                    self.assertEqual(float(rows[4]['smoothed_gaussian_kl_real_to_generated']), 0.)
                     best = torch.load(checkpoint, map_location='cpu', weights_only=True)
                     self.assertFalse(torch.equal(best['weight'], final['weight']))
 

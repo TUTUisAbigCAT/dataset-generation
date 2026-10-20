@@ -18,29 +18,39 @@ from validation_metrics import DistributionAccumulator, preserve_random_state
 from validation_sampling import sample_validation_windows
 from window_config import EPOCH_SAMPLES, window_settings
 
-DEFAULT_VALIDATION = {"max_windows": None, "batch_size": 8, "seed": 20261020}
+DEFAULT_VALIDATION = {"max_windows": None, "batch_size": 8, "seed": 20261020,
+                      "kl_variance_floor_ms2": 1.0}
 DEFAULT_EARLY_STOPPING = {
     "enabled": True, "patience": 10, "smoothing_window": 5,
-    "min_delta_mean_ms": 0.0, "min_delta_variance_ms2": 0.0,
+    "min_delta_kl": 0.0,
 }
-EARLY_STOP_METRICS = {
-    "mean": ("mean_vector_l2_ms", "min_delta_mean_ms"),
-    "variance": ("variance_vector_l2_ms2", "min_delta_variance_ms2"),
-}
+EARLY_STOP_METRICS = {"kl": ("gaussian_kl_real_to_generated", "min_delta_kl")}
+EPOCH_METRIC_FIELDS = (
+    "epoch", "train_mean_loss", "gaussian_kl_real_to_generated",
+    "smoothed_gaussian_kl_real_to_generated", "validation_seconds",
+    "smoothing_ready", "metric_improvement", "early_stopping_bad_epochs", "stopped_early",
+)
 
 
 def early_stopping_options(config):
     values = config.get("early_stopping", {})
-    if not isinstance(values, dict) or set(values) - set(DEFAULT_EARLY_STOPPING):
+    # Zero-valued historical thresholds have an unambiguous migration. A
+    # nonzero threshold in ms or ms^2 cannot be reused for dimensionless KL.
+    legacy = {"min_delta_mean_ms", "min_delta_variance_ms2"}
+    if not isinstance(values, dict) or set(values) - (set(DEFAULT_EARLY_STOPPING) | legacy):
         raise ValueError("early_stopping must be an object with only supported options")
-    options = {**DEFAULT_EARLY_STOPPING, **values}
+    for key in legacy & values.keys():
+        value = values[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != 0:
+            raise ValueError(f"Remove legacy early_stopping.{key} and configure min_delta_kl in nats")
+    options = {**DEFAULT_EARLY_STOPPING, **{key: value for key, value in values.items() if key not in legacy}}
     if not isinstance(options["enabled"], bool):
         raise ValueError("early_stopping.enabled must be boolean")
     for key in ("patience", "smoothing_window"):
         value = options[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"early_stopping.{key} must be a positive integer")
-    for key in ("min_delta_mean_ms", "min_delta_variance_ms2"):
+    for key in ("min_delta_kl",):
         value = options[key]
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(value) or value < 0):
@@ -50,12 +60,11 @@ def early_stopping_options(config):
 
 
 class EarlyStopping:
-    """Reset patience only when both full-window moving averages improve.
+    """Track full-window SMA of KL(real || generated), lower is better.
 
-    Raw minima select individual checkpoints; joint checkpoints use smoothed
-    improvements. Separate threshold anchors allow several
-    small improvements to accumulate past min_delta, without resetting patience
-    on numerical jitter. No mean/variance sum mixes their different units.
+    The first complete smoothing window establishes the anchor. Only a
+    strict decrease exceeding min_delta_kl resets patience and selects the
+    current weights. Raw minima are diagnostics, not checkpoint triggers.
     """
     def __init__(self, config):
         self.options = early_stopping_options(config)
@@ -70,7 +79,7 @@ class EarlyStopping:
             raise ValueError("Early stopping requires consecutive, non-stopped epochs")
         values = {name: float(aggregate[key]) for name, (key, _) in EARLY_STOP_METRICS.items()}
         if any(not math.isfinite(value) or value < 0 for value in values.values()):
-            raise ValueError("Early-stopping metrics must be finite nonnegative absolute errors")
+            raise ValueError("Early-stopping KL must be finite and nonnegative")
         self.history.append(values)
         ready = len(self.history) == self.options["smoothing_window"]
         if ready:
@@ -86,17 +95,17 @@ class EarlyStopping:
                           or self.smoothed[name] < self.anchors[name] - self.options[delta_key]):
                 self.anchors[name] = self.smoothed[name]
                 improved.append(name)
-        joint_improvement = len(improved) == len(EARLY_STOP_METRICS)
+        metric_improvement = "kl" in improved
         if ready:
-            self.bad_epochs = 0 if joint_improvement else self.bad_epochs + 1
+            self.bad_epochs = 0 if metric_improvement else self.bad_epochs + 1
         self.completed_epochs = epoch
         if self.options["enabled"] and self.bad_epochs >= self.options["patience"]:
             self.stopped_epoch = epoch
         return dict(**self.summary(), improved_metrics=improved, new_best_metrics=new_best,
-                    joint_improvement=joint_improvement)
+                    metric_improvement=metric_improvement)
 
     def summary(self):
-        return dict(options=self.options.copy(), improvement_rule="both_smoothed_metrics_same_epoch",
+        return dict(options=self.options.copy(), improvement_rule="smoothed_kl",
                     smoothing_method="simple_moving_average",
                     smoothing_ready=len(self.history) == self.options["smoothing_window"],
                     smoothed_metrics={EARLY_STOP_METRICS[name][0]: value for name, value in self.smoothed.items()},
@@ -122,6 +131,11 @@ def validation_options(config):
             raise ValueError(f"validation.{key} must be an integer")
         if (key == "seed" and not 0 <= value < 2**32) or (key != "seed" and value < 1):
             raise ValueError(f"Invalid validation.{key}: {value}")
+    floor = result["kl_variance_floor_ms2"]
+    if (isinstance(floor, bool) or not isinstance(floor, (int, float))
+            or not math.isfinite(floor) or floor <= 0):
+        raise ValueError("validation.kl_variance_floor_ms2 must be finite and positive")
+    result["kl_variance_floor_ms2"] = float(floor)
     return result
 
 
@@ -208,8 +222,8 @@ class EpochValidator:
             raise ValueError("Validation window_epochs must match the configuration, preprocessor and training window_size")
         if training_args.s4_lmax < self.window_size:
             raise ValueError("Validation window_size must fit within the original S4 kernel length")
-        self.metric_description = (f"Euclidean distances between {self.window_size}-dimensional "
-                                   "coordinate mean and variance vectors")
+        self.metric_description = (f"KL(real || generated) between diagonal Gaussian fits to "
+                                   f"all {self.window_size}-dimensional validation windows; sum in nats")
         self.diffusion_config = diffusion_config
         self.output = Path(output_dir).resolve()
         self.training_output = self.output.parent
@@ -235,11 +249,11 @@ class EpochValidator:
                      file_sha256=preprocessor.record(name)["file_sha256"])
                 for name, start in selected]
         self.protocol = dict(
-            schema="ibi_epoch_coordinate_moments_v2", metric=self.metric_description,
+            schema="ibi_epoch_diagonal_gaussian_kl_v3", metric=self.metric_description,
             window=self.window,
             options=self.options, selection=selection, windows=self.windows_metadata,
             early_stopping=self.early_stopping.options,
-            early_stopping_improvement_rule="both_smoothed_metrics_same_epoch",
+            early_stopping_improvement_rule="smoothed_kl",
             early_stopping_smoothing_method="simple_moving_average",
             scaler=preprocessor.scaler, split_fingerprint=preprocessor.split_fingerprint,
             data_synthetic=preprocessor.provenance()["data_synthetic"],
@@ -249,13 +263,17 @@ class EpochValidator:
             validation_seed_reset_each_epoch=True, training_rng_restored=True,
             signal_unit="milliseconds", variance_unit="milliseconds_squared", variance_correction=0,
             aggregation=f"one {self.window_size}-dimensional sample per window; coordinate moments over all selected windows; stored zeros included; no clipping",
-            vector_metrics=dict(mean="mean_vector_l2_ms", variance="variance_vector_l2_ms2",
-                                dimension=self.window_size, moment_axis="windows (dim=0)", distance="L2, no dimension normalization",
-                                covariance="diagonal only", accumulation="CUDA batched centered-moment merge",
-                                single_window_variance="zero under population definition"),
-            diagnostic_aggregation="legacy pooled and per-window scalars retained; excluded from early stopping",
+            gaussian_kl=dict(metric="gaussian_kl_real_to_generated", direction="real || generated",
+                             dimension=self.window_size, moment_axis="windows (dim=0)",
+                             reduction="sum over coordinates; no dimension normalization",
+                             logarithm="natural", unit="nats", covariance="diagonal only",
+                             variance_floor_ms2=self.options["kl_variance_floor_ms2"],
+                             variance_regularization="clamp each real and generated coordinate variance to the fixed floor",
+                             accumulation="CUDA batched centered-moment merge",
+                             single_window_variance="zero population estimate; floor applies; insufficient for distribution assessment"),
             metric_dtype="float64", device=str(self.device), test_npz_opened=False,
-            limitations="Coordinate means and variances exclude cross-coordinate covariance and do not establish temporal or conditional fidelity.")
+            limitations="KL of moment-matched diagonal Gaussian approximations, not the true sequence distributions. "
+                        "Excludes cross-coordinate covariance and non-Gaussian structure; does not establish temporal or conditional fidelity.")
         _save_json(self.output / "protocol.json", self.protocol)
 
     def _generate(self, training_model):
@@ -270,7 +288,8 @@ class EpochValidator:
         model.eval()
         torch.manual_seed(self.options["seed"])
         np.random.seed(self.options["seed"])
-        accumulator, sampler_reports = DistributionAccumulator(), []
+        accumulator = DistributionAccumulator(kl_variance_floor_ms2=self.options["kl_variance_floor_ms2"])
+        sampler_reports = []
         for start in range(0, len(self.windows), self.options["batch_size"]):
             clean = self.windows[start:start+self.options["batch_size"]].to(self.device)
             ibi, metadata = sample_validation_windows(model, clean, self.diffusion_config, self.args, self.device)
@@ -294,17 +313,14 @@ class EpochValidator:
         epoch_dir.mkdir(exist_ok=False)
         with preserve_random_state(self.device):
             metrics, copied, sampler_reports = self._generate(training_model)
-            for row, metadata in zip(metrics["per_window"], self.windows_metadata):
-                row.update(metadata)
         aggregate = metrics["aggregate"]
         stopping = self.early_stopping.update(epoch, aggregate)
         self.should_stop = stopping["stopped_early"]
-        checkpoint_updates = {
-            name: stopping["best_metrics"][name] for name in stopping["new_best_metrics"]}
-        if stopping["joint_improvement"]:
-            checkpoint_updates["joint"] = dict(
-                epoch=epoch, metric="both_smoothed_metrics_same_epoch",
-                value=stopping["smoothed_metrics"].copy(),
+        checkpoint_updates = {}
+        if stopping["metric_improvement"]:
+            checkpoint_updates["kl"] = dict(
+                epoch=epoch, metric="gaussian_kl_real_to_generated", selection_rule="smoothed_kl",
+                value=stopping["smoothed_metrics"]["gaussian_kl_real_to_generated"],
                 raw_metrics={key: aggregate[key] for key, _ in EARLY_STOP_METRICS.values()},
                 smoothing_window=self.early_stopping.options["smoothing_window"],
                 window_start_epoch=epoch-self.early_stopping.options["smoothing_window"]+1)
@@ -319,7 +335,7 @@ class EpochValidator:
                 **checkpoint_metrics, checkpoint=str(checkpoint),
                 checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest())
         report = dict(status="completed", epoch=epoch, train_mean_loss=float(train_mean_loss),
-                      aggregate=aggregate, per_window=metrics["per_window"],
+                      aggregate=aggregate,
                       validation_seconds=time.perf_counter()-started, device=str(self.device),
                       protocol=str(self.output / "protocol.json"), model_copy=copied,
                       sampling=sampler_reports, early_stopping=stopping)
@@ -328,18 +344,14 @@ class EpochValidator:
         # Rewriting a short history avoids partial CSV rows after a failed append.
         csv_path = self.training_output / "epoch_metrics.csv"
         with csv_path.open("w", encoding="utf-8", newline="") as stream:
-            fields = ["epoch", "train_mean_loss", *aggregate, "validation_seconds",
-                      *("smoothed_" + key for key, _ in EARLY_STOP_METRICS.values()),
-                      "smoothing_ready",
-                      "joint_improvement", "early_stopping_bad_epochs", "stopped_early"]
-            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer = csv.DictWriter(stream, fieldnames=EPOCH_METRIC_FIELDS)
             writer.writeheader()
             for row in self.reports:
                 writer.writerow(dict(epoch=row["epoch"], train_mean_loss=row["train_mean_loss"],
                                      **row["aggregate"], validation_seconds=row["validation_seconds"],
                                      **{"smoothed_" + key: value for key, value in row["early_stopping"]["smoothed_metrics"].items()},
                                      smoothing_ready=row["early_stopping"]["smoothing_ready"],
-                                     joint_improvement=row["early_stopping"]["joint_improvement"],
+                                     metric_improvement=row["early_stopping"]["metric_improvement"],
                                      early_stopping_bad_epochs=row["early_stopping"]["bad_epochs"],
                                      stopped_early=row["early_stopping"]["stopped_early"]))
         _save_json(self.output / "summary.json", self.summary())

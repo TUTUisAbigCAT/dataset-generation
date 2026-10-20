@@ -1,4 +1,4 @@
-"""Sequence-coordinate moments and legacy IBI distribution diagnostics.
+"""Diagonal Gaussian KL on all validation sequence samples.
 
 One row is a sequence sample; dim=0 estimates each time coordinate's mean and
 population variance across windows. All tensor arithmetic stays on the input
@@ -7,15 +7,11 @@ device in float64. Production callers require CUDA; CPU supports unit tests.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import math
 import random
 
 import numpy as np
 import torch
-
-
-_ROW_FIELDS = ("generated_mean_ms", "reference_mean_ms", "mean_error_ms",
-               "mean_absolute_error_ms", "generated_variance_ms2",
-               "reference_variance_ms2", "variance_error_ms2", "variance_absolute_error_ms2")
 
 
 def _prepare_pair(generated_seconds, reference_seconds):
@@ -35,34 +31,24 @@ def _prepare_pair(generated_seconds, reference_seconds):
     return generated, reference
 
 
-def _moment_rows(gen_mean, ref_mean, gen_var, ref_var):
-    """Transfer a batch of final diagnostics together, avoiding per-row CUDA sync."""
-    values = torch.stack((gen_mean, ref_mean, gen_mean - ref_mean,
-                          (gen_mean - ref_mean).abs(), gen_var, ref_var,
-                          gen_var - ref_var, (gen_var - ref_var).abs()), dim=-1).reshape(-1, 8)
-    valid = ref_var != 0
-    ratio = gen_var / torch.where(valid, ref_var, torch.ones_like(ref_var))
-    if not bool(torch.isfinite(values).all() & torch.isfinite(ratio[valid]).all()):
-        raise FloatingPointError("Nonfinite IBI distribution statistic")
-    packed = torch.cat((values, ratio.reshape(-1, 1), valid.to(torch.float64).reshape(-1, 1)), dim=1)
-    return [dict(zip(_ROW_FIELDS, row[:8]), variance_ratio=row[8] if row[9] else None)
-            for row in packed.tolist()]
-
-
 class DistributionAccumulator:
     """Merge batch moments into moments of ALL sequence samples, on device.
 
     Chan's centered-moment merge weights unequal batches by their window counts.
     No generated waveform is retained after update. Only O(sequence length)
-    running tensors and serialized per-window diagnostics remain. The L2 metrics
-    are neither per-window waveform distances nor RMS (no division by sqrt(D)).
+    running tensors remain. Gaussian KL fits independent coordinate Gaussians to these ALL-window
+    moments; it does not estimate the full joint sequence distribution.
     """
-    def __init__(self):
+    def __init__(self, *, kl_variance_floor_ms2=1.0):
+        if (isinstance(kl_variance_floor_ms2, bool)
+                or not isinstance(kl_variance_floor_ms2, (int, float))
+                or not math.isfinite(kl_variance_floor_ms2)
+                or kl_variance_floor_ms2 <= 0):
+            raise ValueError("kl_variance_floor_ms2 must be a finite positive number")
+        self.kl_variance_floor_ms2 = float(kl_variance_floor_ms2)
         self.count = 0
         self.generated_mean = self.reference_mean = None
         self.generated_m2 = self.reference_m2 = None
-        self.window_errors = None
-        self.per_window = []
 
     @torch.no_grad()
     def update(self, generated_seconds, reference_seconds):
@@ -71,21 +57,14 @@ class DistributionAccumulator:
                            or generated.device != self.generated_mean.device):
             raise ValueError("Batches must have the same feature dimension and device")
         batch_count = len(generated)
-        gen_window_var, gen_window_mean = torch.var_mean(generated, dim=1, unbiased=False)
-        ref_window_var, ref_window_mean = torch.var_mean(reference, dim=1, unbiased=False)
-        rows = _moment_rows(gen_window_mean, ref_window_mean, gen_window_var, ref_window_var)
-        errors = torch.stack(((gen_window_mean - ref_window_mean).abs().sum(),
-                              (gen_window_var - ref_window_var).abs().sum()))
         gen_var, gen_mean = torch.var_mean(generated, dim=0, unbiased=False)
         ref_var, ref_mean = torch.var_mean(reference, dim=0, unbiased=False)
         if not bool(torch.isfinite(gen_var).all() & torch.isfinite(ref_var).all()
-                    & torch.isfinite(gen_mean).all() & torch.isfinite(ref_mean).all()
-                    & torch.isfinite(errors).all()):
+                    & torch.isfinite(gen_mean).all() & torch.isfinite(ref_mean).all()):
             raise FloatingPointError("Nonfinite sequence-coordinate moments")
         if self.count == 0:
             self.generated_mean, self.reference_mean = gen_mean, ref_mean
             self.generated_m2, self.reference_m2 = gen_var * batch_count, ref_var * batch_count
-            self.window_errors = errors
         else:
             total = self.count + batch_count
             for prefix, mean, variance in (("generated", gen_mean, gen_var), ("reference", ref_mean, ref_var)):
@@ -95,8 +74,6 @@ class DistributionAccumulator:
                       + delta.square() * (self.count * batch_count / total))
                 setattr(self, prefix + "_mean", old_mean + delta * (batch_count / total))
                 setattr(self, prefix + "_m2", m2)
-            self.window_errors = self.window_errors + errors
-        self.per_window.extend(dict(window_index=self.count + index, **row) for index, row in enumerate(rows))
         self.count += batch_count
 
     @torch.no_grad()
@@ -105,31 +82,37 @@ class DistributionAccumulator:
             raise ValueError("Cannot summarize empty validation data")
         gen_var = self.generated_m2 / self.count
         ref_var = self.reference_m2 / self.count
-        gen_mean = self.generated_mean.mean()
-        ref_mean = self.reference_mean.mean()
-        # Law of total variance recovers the original pooled scalar diagnostic.
-        pooled_gen_var = (gen_var + (self.generated_mean - gen_mean).square()).mean()
-        pooled_ref_var = (ref_var + (self.reference_mean - ref_mean).square()).mean()
-        aggregate = _moment_rows(gen_mean, ref_mean, pooled_gen_var, pooled_ref_var)[0]
-        distances = torch.stack((torch.linalg.vector_norm(self.generated_mean - self.reference_mean),
-                                 torch.linalg.vector_norm(gen_var - ref_var)))
-        window_errors = self.window_errors / self.count
-        if not bool(torch.isfinite(distances).all() & torch.isfinite(window_errors).all()):
-            raise FloatingPointError("Nonfinite validation error")
-        aggregate.update(zip(("mean_window_absolute_error_ms", "variance_window_absolute_error_ms2"),
-                             window_errors.tolist()))
-        aggregate.update(zip(("mean_vector_l2_ms", "variance_vector_l2_ms2"), distances.tolist()))
-        return {"aggregate": aggregate, "per_window": [row.copy() for row in self.per_window]}
+        # KL(real || generated), in nats, for fitted diagonal Gaussians. The
+        # lower bound changes only the KL approximation, never the waveforms
+        # or the stored moments.
+        kl_gen_var = gen_var.clamp_min(self.kl_variance_floor_ms2)
+        kl_ref_var = ref_var.clamp_min(self.kl_variance_floor_ms2)
+        relative_change = (kl_ref_var - kl_gen_var) / kl_gen_var
+        # For small d, d - log1p(d) loses significant digits. Its expansion
+        # through d^5 has sub-float64 relative truncation error at |d| <= 1e-4.
+        # Clamp the unused polynomial arguments to avoid overflow from torch's
+        # eager evaluation of both where branches when variance ratios are huge.
+        small = relative_change.clamp(-1e-4, 1e-4)
+        near_equal = small.square() * (0.5 + small * (-1.0 / 3.0 + small * (0.25 - small / 5.0)))
+        log_ratio = kl_ref_var.log() - kl_gen_var.log()
+        general = kl_ref_var / kl_gen_var - 1.0 - log_ratio
+        variance_term = torch.where(relative_change.abs() <= 1e-4, near_equal, general).clamp_min(0.0)
+        mean_term = ((self.reference_mean - self.generated_mean) / kl_gen_var.sqrt()).square()
+        gaussian_kl = (0.5 * variance_term + 0.5 * mean_term).sum()
+        if not bool(torch.isfinite(gaussian_kl)):
+            raise FloatingPointError("Nonfinite diagonal Gaussian KL divergence")
+        return {"aggregate": {"gaussian_kl_real_to_generated": float(gaussian_kl)}}
 
 
-def summarize_distribution(generated_seconds, reference_seconds):
+def summarize_distribution(generated_seconds, reference_seconds, *, kl_variance_floor_ms2=1.0):
     """Compare [windows, time coordinates] using the same all-window estimator.
 
     Inputs are seconds. Coordinate population variances use correction=0; for
-    one window they are zero. Legacy pooled/window diagnostics retain their
-    definitions. Stored zeros and negative generated values are not clipped.
+    one window they are zero. Stored zeros and negative generated values are not clipped.
+    Diagonal Gaussian KL(real || generated) sums over coordinates after fitting
+    their moments across all windows. The fixed variance floor is in ms squared.
     """
-    accumulator = DistributionAccumulator()
+    accumulator = DistributionAccumulator(kl_variance_floor_ms2=kl_variance_floor_ms2)
     accumulator.update(generated_seconds, reference_seconds)
     return accumulator.finalize()
 

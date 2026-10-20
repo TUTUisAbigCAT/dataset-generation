@@ -103,9 +103,9 @@ python scripts/run_dreamt.py --epochs 50 --batch-size 8 --threads 4
 
 `window_epochs` 与训练次数 `--epochs`、单条记录截断选项 `max_epochs` 含义不同，也不会改变 W/Light/REM/Deep 四个标签类别或 10 个输入通道。新运行将窗口配置写入源码快照、冻结数据身份和 manifest；评估 checkpoint 按其原训练长度运行，不受后来修改全局 JSON 的影响。旧身份未记录该字段时按 4 处理。
 
-## 每轮 validation 和平均 loss
+## 每轮 validation、对角高斯 KL 和平均 loss
 
-每个 epoch 完成全部 optimizer 更新后（包括最后一轮），用当前权重在验证集条件下从噪声生成配置长度的 IBI。执行与训练相同的完整扩散日程，默认 200 步；直接复用经过哈希检查的原始采样片段。验证窗口独立生成，因此推理 stride 为完整的 `L = 750 × window_epochs` 点，不将不同片段或受试者互相拼接；训练 stride 固定为 750 点（30 秒）；默认 K=4 时相邻窗口重叠 90 秒，即 75%，K=1 时不重叠。
+每个 epoch 完成全部 optimizer 更新后（包括最后一轮），用当前权重在验证集条件下从噪声生成配置长度的 IBI。执行与训练相同的完整扩散日程，默认 200 步；直接复用经过哈希检查的原始采样片段。验证窗口独立生成，推理 stride 为完整的 `L = 750 × window_epochs` 点，不将不同片段或受试者互相拼接；训练 stride 固定为 750 点（30 秒），K=4 时相邻窗口重叠 90 秒，K=1 时不重叠。
 
 在 `dataset_config.json` 中设置：
 
@@ -113,74 +113,82 @@ python scripts/run_dreamt.py --epochs 50 --batch-size 8 --threads 4
 "validation": {
   "max_windows": null,
   "batch_size": 8,
-  "seed": 20261020
+  "seed": 20261020,
+  "kl_variance_floor_ms2": 1.0
 }
 ```
 
-默认使用按受试者隔离的 val split 中全部互不重叠的配置长度合法窗口（`max_windows: null`）。不足一个窗口的尾段和含无效睡眠标签的窗口不参与；完整选择清单记录在 protocol 中。候选搜索对齐 30 秒边界；若显式设置整数 `max_windows`，才按固定种子在受试者间轮流限量抽取，该模式属于子集验证。训练期间窗口、顺序、采样种子不变；修改 batch_size 也可能改变采样随机流，跨实验比较应保持整个 validation 配置一致。所选窗口和实际数量记录在 `training/validation/protocol.json`，不读取 test split，不重新拟合标准化参数。
+默认使用按受试者隔离的 val split 中全部互不重叠的配置长度合法窗口（`max_windows: null`）。不足一个窗口的尾段和含无效睡眠标签的窗口不参与；候选搜索对齐 30 秒边界。只有显式设置整数 `max_windows` 才执行固定种子的子集验证。所选窗口及数量记录在 `training/validation/protocol.json`，不读取 test split，不重新拟合标准化参数。训练期间窗口、顺序、采样种子不变；修改 batch_size 可能改变采样随机流，跨实验比较应保持整个 validation 配置一致。
 
-指标只统计 IBI，反归一化到毫秒后用 float64 计算，总体方差采用 `correction=0`。每个连续 K 个睡眠 epoch（750 × K 点）的窗口是一个 L 维样本，全部窗口组织为 `X_real, X_gen: [N, L]`，其中 `L = 750 × window_epochs`。在全部 N 个窗口上沿 `dim=0` 计算每个时间坐标的均值和方差，得到两个 L 维向量：
+唯一的生成验证指标是 `gaussian_kl_real_to_generated`：**真实集到生成集的对角高斯近似 KL**，使用自然对数，单位为 nats，越小越好。每个完整窗口作为一个 L 维样本，全部窗口形成 `X_real, X_gen: [N, L]`。只统计 IBI，反归一化到毫秒后以 float64 沿 `dim=0` 在全部窗口上估计各坐标的均值和总体方差（`correction=0`）：
 
 ```text
 mu_real[j] = mean_n(X_real[n, j])
 v_real[j]  = mean_n((X_real[n, j] - mu_real[j])²)
 mu_gen、v_gen 同理
-mean_vector_l2_ms     = sqrt(sum_j((mu_gen[j] - mu_real[j])²))
-variance_vector_l2_ms2 = sqrt(sum_j((v_gen[j] - v_real[j])²))
+
+vr[j] = max(v_real[j], kl_variance_floor_ms2)
+vg[j] = max(v_gen[j], kl_variance_floor_ms2)
+
+KL(real || generated)
+  = 0.5 * sum_j(log(vg[j] / vr[j])
+               + (vr[j] + (mu_real[j] - mu_gen[j])²) / vg[j] - 1)
 ```
 
-两个欧式距离都不除以 √L；默认 L=3000 时，例如所有坐标均值都偏移 1 ms，均值距离就是 √3000 ≈ 54.77 ms。不同窗口长度的 L2 数值尺度不同，不直接比较或沿用非零 min_delta。方差向量是每个时间坐标的方差，不是 L × L 协方差矩阵；只比较一阶矩和对角二阶矩。一个窗口时跨窗口总体方差按定义为 0，不能据此判断方差是否学好。原有 pooled / per-window 统计仍保留作诊断：
+先合并所有 batch 的坐标矩，再计算一次 KL，不平均逐 batch 或逐窗口的 KL。对全部 L 个坐标求和，**不除以 L**；改变 `window_epochs` 后，不直接横比原始 KL 或沿用非零阈值。两侧方差采用相同的固定下界，默认 `1.0 ms²`（对应 1 ms 标准差）；配置必须为正有限数，下界及方向写入验证协议并随运行冻结。下界只用于拟合高斯的方差，不裁剪 IBI 波形，不改变训练标准化；原存储零值（包括缺失标记）仍计入统计。
 
-| 字段 | 定义 |
+这只是匹配一阶矩和对角二阶矩的高斯近似，忽略跨时间坐标的相关性及非高斯结构，不能单独证明整夜连续性或条件生成质量。只有一个验证窗口时，跨窗口总体方差为 0，计算会使用下界；这种小样本结果不能评估总体分布质量。协议版本为 `ibi_epoch_diagonal_gaussian_kl_v3`，与旧 L2 / 逐窗口误差协议区分。
+
+生成和坐标矩合并按 batch 在 CUDA 上执行，不保留跨 batch 的生成波形，运行统计张量规模为 O(L)。条件、参考数据和协议元数据存放在主机；退出验证时恢复随机数状态，不改变训练模型的模式、梯度、buffer 或后续训练随机流。KL 不增加采样次数，每轮仍需 `ceil(N/validation.batch_size) × 200` 次采样模型调用和一个独立模型副本。全量采样仍是主要计算工作，修改指标不会跳过它。
+
+训练 `train_mean_loss = Σ(batch_MSE × batch样本数) / Σ(batch样本数)`，最后一个短 batch 按实际样本数加权，输出普通数值。`training_report.json` 中的 `mean_loss` 为实际训练过程的同口径平均；反向传播仍使用原始 MSE，没有将训练 loss 改为 KL。
+
+`training/epoch_metrics.csv` 仅保留以下字段：
+
+| 字段 | 含义 |
 |---|---|
-| `mean_vector_l2_ms` | 真实与生成的 L 维均值向量欧式距离；早停主指标 |
-| `variance_vector_l2_ms2` | 真实与生成的 L 维方差向量欧式距离；早停主指标 |
-| `mean_error_ms` | 所有验证样本合并后的生成均值 − 参考均值 |
-| `variance_error_ms2` | 所有验证样本合并后的生成方差 − 参考方差 |
-| `mean_absolute_error_ms` / `variance_absolute_error_ms2` | 上述整体差值的绝对值 |
-| `mean_window_absolute_error_ms` | 每个窗口均值差的绝对值，再对窗口取平均 |
-| `variance_window_absolute_error_ms2` | 每个窗口方差差的绝对值，再对窗口取平均 |
+| `epoch` | 已完成的训练轮次 |
+| `train_mean_loss` | 当轮按样本数加权的平均训练 MSE |
+| `gaussian_kl_real_to_generated` | 当轮全验证集对角高斯 KL，nats |
+| `smoothed_gaussian_kl_real_to_generated` | 最近完整滑动窗口的平均 KL；预热期为空 |
+| `validation_seconds` | 当轮验证耗时，包含采样、KL 和最佳权重保存 |
+| `smoothing_ready` | 是否已达到滑动平均所需轮数 |
+| `metric_improvement` | 平滑 KL 是否达到本轮改善条件 |
+| `early_stopping_bad_epochs` | 连续没有达到改善条件的轮数 |
+| `stopped_early` | 是否在本轮触发早停 |
 
-新增向量指标与原整体、逐窗口指标使用独立字段，旧字段定义不变。新指标对所有窗口一起估计矩，再计算距离；不对每个 batch 或每个窗口的距离取平均。原存储零值（包括缺失标记）仍计入统计，不裁剪生成值。每轮使用独立的 eval 模型副本；退出验证时恢复随机数状态，不改变训练模型的模式、梯度、buffer 或后续训练随机流。
+旧整体／逐窗口均值方差误差、方差比、向量 L2、`joint_improvement` 及其相关计算已从每轮验证中移除。每轮 `training/validation/epoch_0001/metrics.json` 等文件保留 KL、采样信息、早停状态；不再输出逐窗口误差。所选窗口元数据只在协议中保存。独立去噪评估、最终生成报告保持各自的输出用途。历史运行的 CSV 和冻结源码不改写，新配置对新启动的运行生效。
 
-训练 `train_mean_loss = Σ(batch_MSE × batch样本数) / Σ(batch样本数)`，输出普通数值，不累积带计算图的 loss tensor。最后一个短 batch 按实际样本数加权；`training_report.json` 中的 `mean_loss` 为整个训练过程的同口径平均。反向传播仍使用原始 MSE，没有增加均值或方差损失项。
+## 基于平滑 KL 的早停与 checkpoint
 
-每轮结果见 `training/epoch_metrics.csv`，详细逐窗口结果见 `training/validation/epoch_0001/metrics.json` 等文件，最新摘要见 `training/validation/summary.json`。每轮增加 `ceil(N/validation.batch_size) × 200` 次采样模型前向调用，并需要一个额外的模型副本；全量验证耗时随实际窗口数增长。生成和统计按 batch 在 CUDA 上执行，用按窗口数加权的中心矩合并得到全量结果，生成波形不跨 batch 保留在显存；所选条件、参考数据和输出元数据存放在主机。显存不足时可调小 validation.batch_size。向量均值、方差不包含时间位置之间的协方差，不能单独证明整夜连续性或条件生成质量。
-
-## 基于均值和方差误差的早停
-
-`dataset_config.json` 默认启用以下配置；旧配置未填写时也使用这些默认值：
+`dataset_config.json` 默认启用：
 
 ```json
 "early_stopping": {
   "enabled": true,
   "patience": 10,
   "smoothing_window": 5,
-  "min_delta_mean_ms": 0.0,
-  "min_delta_variance_ms2": 0.0
+  "min_delta_kl": 0.0
 }
 ```
 
-监控 `mean_vector_l2_ms` 和 `variance_vector_l2_ms2`，越低越好。分别对最近 5 个 epoch 的误差计算简单滑动平均（SMA）。前 4 轮只记录原始指标，不计早停等待次数；第 5 轮建立平滑参考值并保存首个整体 checkpoint。只有同一轮两项平滑指标都改善才重置等待计数（AND 规则）；仅一项改善或两项均未改善，计数加 1。连续 10 轮没有双指标同时改善，在该轮 validation 完成后停止，默认最早在第 15 轮结束。
+监控 `gaussian_kl_real_to_generated` 最近 5 个训练 epoch 的简单滑动平均（SMA）。前 4 轮预热，等待次数为 0，不生成最佳 KL checkpoint；第 5 轮建立平滑参考值并首次保存。以后仅当 `当前平滑 KL < 参考值 - min_delta_kl` 才更新参考值、清零等待计数并保存当前权重；否则等待次数加 1。连续 10 轮没有改善时，在当轮验证结束后停止，默认最早第 15 轮。相等不算改善，小幅下降可以累计超过固定参考值上的阈值。
 
-主入口默认上限和 `submit.sh` 均为 `--epochs 50`，可通过命令行覆盖。设置 `enabled: false` 关闭提前停止，但继续记录平滑指标、等待次数和最佳 checkpoint。若训练未满 `smoothing_window` 轮，不产生整体最佳 checkpoint；原始单项最佳和最终 checkpoint 仍正常保存。
+`min_delta_kl` 必须为有限非负数，单位为 nats，默认 0 表示任何严格下降。旧配置中的 `min_delta_mean_ms` 和 `min_delta_variance_ms2` 仅在值为 0 时兼容并从冻结配置中移除；非零旧阈值会报错，需改用 KL 阈值。这里判断的是历史相对改善，没有绝对质量达标线。
 
-改善要求平滑误差下降幅度严格大于对应的 `min_delta`；默认 0 表示任何严格下降都算单项改善。需要忽略微小波动时，可分别设置毫秒和平方毫秒单位的正阈值；这两个 `min_delta` 现在作用于向量 L2 距离，不能直接沿用旧逐窗口误差的非零阈值。两项各自维护历史平滑参考值，单项改善也更新该项参考值，但不能单独清零等待计数；先后两轮分别改善不算同一轮整体改善。小幅改善可以累计超过各自阈值。此处判断相对历史表现的改善，没有设置绝对误差达标线。均值与方差单位不同，不直接相加形成总分。
+主入口和 `submit.sh` 默认最多 `--epochs 50`，可以从命令行覆盖。`enabled: false` 只关闭提前停止，仍更新平滑指标、等待次数及最佳 KL 权重；未满滑动窗口的短训仅保存最终权重。
 
-结果和权重：
+- `training/best_kl_model.pth` 与早停计数清零同步更新，保存触发平滑 KL 改善的当轮模型。只平滑指标，不平均权重、不做模型 EMA。
+- 训练结束时，`training/best_kl_manifest.json` 记录所选 epoch、原始和平滑 KL、滑动区间、权重哈希以及验证协议，供原评估入口使用。新运行不再创建 `best_mean`、`best_variance`、`best_joint` checkpoint。
+- 最终 `saved_models/DREAMT/model.pth`（主工作流位于运行目录 `workspace/` 下）仍保存实际停止时的权重。主流程后续评估默认使用最终模型，不自动切换为最佳 KL 模型。
+- `training/training_report.json` 的 `epochs` 是实际完成轮数，`requested_epochs` 是上限；`stop_reason` 区分 `early_stopping` 和 `max_epochs`。
 
-- `training/epoch_metrics.csv` 保留原始指标，记录 `smoothed_mean_vector_l2_ms`、`smoothed_variance_vector_l2_ms2` 和 `smoothing_ready`。窗口未满时平滑值为 CSV 空值 / JSON null。`joint_improvement` 表示本轮两项平滑指标是否同时改善，另记录 `early_stopping_bad_epochs`、`stopped_early`；每轮 JSON 记录向量距离原始最佳值及平滑参考值。新协议为 `ibi_epoch_coordinate_moments_v2`，不与旧逐窗口误差混用。
-- `training/training_report.json` 的 `epochs` 是实际完成轮数，`requested_epochs` 是指定上限；`mean_loss` 只平均实际执行的训练样本。`stop_reason` 区分 `early_stopping` 与 `max_epochs`。
-- `training/best_joint_model.pth` 与早停计数清零同步更新，保存触发双指标平滑改善的当轮模型权重。这里平滑的是指标，不做模型权重平均或 EMA。`best_joint_manifest.json` 记录当轮原始值、平滑值、滑动窗口起始 epoch、窗口长度、所选 epoch 和权重哈希。
-- `training/best_mean_model.pth` 和 `training/best_variance_model.pth` 分别按单轮 `mean_vector_l2_ms`、`variance_vector_l2_ms2` 的最小值保存，可能来自不同 epoch。相应的 `best_mean_manifest.json`、`best_variance_manifest.json` 记录权重哈希和所选 epoch，供原评估入口使用。
-- 原 `saved_models/DREAMT/model.pth`（主工作流中位于运行目录的 `workspace/` 下）仍保存实际停止时的最终权重。主流程后续评估默认使用它，不自动切换到整体最佳 checkpoint。
-
-例如，训练结束后使用整体最佳权重执行原始采样（把路径替换成实际运行目录，输出目录须尚不存在）：
+训练结束后使用最佳 KL 权重执行原始采样：
 
 ```bash
 python scripts/evaluate_original_sampler.py \
-  --training-args-json /path/to/run/training/best_joint_manifest.json \
-  --output-dir /path/to/run/generation_best_joint
+  --training-args-json /path/to/run/training/best_kl_manifest.json \
+  --output-dir /path/to/run/generation_best_kl
 ```
 
 ## 实验输出目录
