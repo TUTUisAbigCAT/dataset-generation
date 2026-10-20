@@ -23,20 +23,42 @@ def metrics(mean, variance):
 
 
 class EarlyStoppingTests(unittest.TestCase):
-    def test_default_five_plateau_epochs_stop_after_first_reference_epoch(self):
+    def test_default_warmup_and_ten_plateau_epochs_stop_at_fifteen(self):
         stopping = EarlyStopping({})
-        first = stopping.update(1, metrics(10., 1000000.))
-        self.assertEqual(first['bad_epochs'], 0)
-        for epoch in range(2, 7):
+        for epoch in range(1, 16):
             result = stopping.update(epoch, metrics(10., 1000000.))
-            self.assertEqual(result['bad_epochs'], epoch - 1)
-            self.assertEqual(result['stopped_early'], epoch == 6)
-        self.assertEqual(first['best_metrics']['mean']['epoch'], 1)
+            self.assertEqual(result['bad_epochs'], max(0, epoch - 5))
+            self.assertEqual(result['stopped_early'], epoch == 15)
+            self.assertEqual(result['smoothing_ready'], epoch >= 5)
+            self.assertEqual(result['joint_improvement'], epoch == 5)
+            self.assertEqual(result['smoothed_metrics'], metrics(10., 1000000.) if epoch >= 5 else metrics(None, None))
+        self.assertEqual(result['best_metrics']['mean']['epoch'], 1)
         with self.assertRaises(ValueError):
-            stopping.update(7, metrics(9., 0.))
+            stopping.update(16, metrics(9., 0.))
+
+    def test_sliding_window_eviction_and_snapshot_independence(self):
+        stopping = EarlyStopping({'early_stopping': {'smoothing_window': 3}})
+        results = [stopping.update(i, metrics(value, value * 10))
+                   for i, value in enumerate((3, 6, 9, 0), 1)]
+        self.assertEqual(results[1]['smoothed_metrics'], metrics(None, None))
+        self.assertEqual(results[2]['smoothed_metrics'], metrics(6., 60.))
+        self.assertEqual(results[3]['smoothed_metrics'], metrics(5., 50.))
+        self.assertTrue(results[3]['joint_improvement'])
+
+    def test_smoothed_improvement_can_disagree_with_raw_direction(self):
+        stopping = EarlyStopping({'early_stopping': {'smoothing_window': 3}})
+        # Raw rises 0->9 while SMA falls 5->4; then raw falls 9->8 while SMA rises.
+        results = [stopping.update(i, metrics(value, value * 10))
+                   for i, value in enumerate((12, 3, 0, 9, 8), 1)]
+        self.assertEqual(results[2]['smoothed_metrics'], metrics(5., 50.))
+        self.assertEqual(results[3]['smoothed_metrics'], metrics(4., 40.))
+        self.assertTrue(results[3]['joint_improvement'])
+        self.assertEqual(results[3]['new_best_metrics'], [])
+        self.assertFalse(results[4]['joint_improvement'])
+        self.assertEqual(results[4]['bad_epochs'], 1)
 
     def test_only_simultaneous_improvement_resets_patience(self):
-        stopping = EarlyStopping({'early_stopping': {'patience': 3}})
+        stopping = EarlyStopping({'early_stopping': {'patience': 3, 'smoothing_window': 1}})
         values = [(10, 100), (9, 100), (9, 90), (8, 80), (7, 90), (8, 70), (7, 70)]
         results = [stopping.update(i, metrics(*pair)) for i, pair in enumerate(values, 1)]
         self.assertEqual([r['bad_epochs'] for r in results], [0, 1, 2, 0, 1, 2, 3])
@@ -51,7 +73,7 @@ class EarlyStoppingTests(unittest.TestCase):
 
     def test_threshold_is_strict_and_small_improvements_accumulate(self):
         stopping = EarlyStopping({'early_stopping': {
-            'patience': 4, 'min_delta_mean_ms': 1., 'min_delta_variance_ms2': 5.}})
+            'patience': 4, 'smoothing_window': 1, 'min_delta_mean_ms': 1., 'min_delta_variance_ms2': 5.}})
         stopping.update(1, metrics(10, 100))
         result = stopping.update(2, metrics(9, 95))
         self.assertEqual(result['improved_metrics'], [])  # Exactly min_delta is insufficient.
@@ -71,7 +93,7 @@ class EarlyStoppingTests(unittest.TestCase):
     def test_repeated_single_metric_improvement_cannot_prevent_stopping(self):
         for improving in ('mean', 'variance'):
             with self.subTest(improving=improving):
-                stopping = EarlyStopping({})
+                stopping = EarlyStopping({'early_stopping': {'patience': 5, 'smoothing_window': 1}})
                 for epoch in range(1, 7):
                     value = 100 - epoch
                     row = metrics(value, 100) if improving == 'mean' else metrics(100, value)
@@ -80,7 +102,7 @@ class EarlyStoppingTests(unittest.TestCase):
                     self.assertEqual(result['stopped_early'], epoch == 6)
 
     def test_disabled_stopping_and_zero_errors(self):
-        stopping = EarlyStopping({'early_stopping': {'enabled': False, 'patience': 1}})
+        stopping = EarlyStopping({'early_stopping': {'enabled': False, 'patience': 1, 'smoothing_window': 1}})
         for epoch in range(1, 9):
             self.assertFalse(stopping.update(epoch, metrics(0., 0.))['stopped_early'])
         self.assertEqual(stopping.summary()['bad_epochs'], 7)
@@ -90,6 +112,7 @@ class EarlyStoppingTests(unittest.TestCase):
                    {'patience': True}, {'patience': 1.5}, {'min_delta_mean_ms': -1},
                    {'min_delta_variance_ms2': float('inf')}, {'min_delta_mean_ms': float('nan')},
                    {'min_delta_mean_ms': True}, {'min_delta_variance_ms2': '1'}]
+        invalid += [{'smoothing_window': value} for value in (0, -1, True, 1.5, '5', None)]
         for options in invalid:
             with self.subTest(options=options), self.assertRaises(ValueError):
                 early_stopping_options({'early_stopping': options})
@@ -126,7 +149,7 @@ class LauncherEarlyStoppingTests(unittest.TestCase):
     def test_launcher_stops_normally_saves_best_and_final_and_supports_disabled_mode(self):
         # Actual training script, trace observer, validation metrics and file I/O.
         # CUDA guards and generation are mocked explicitly; this is not a GPU run.
-        for enabled, requested, completed in ((True, 8, 3), (False, 3, 3)):
+        for enabled, requested, completed in ((True, 8, 7), (False, 7, 7), (False, 3, 3)):
             with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as temp:
                 base = Path(temp)
                 workspace, output = base / 'workspace', base / 'training'
@@ -171,12 +194,22 @@ class LauncherEarlyStoppingTests(unittest.TestCase):
                 self.assertFalse((output / 'failure.json').exists())
                 self.assertEqual(len(list((output / 'validation').glob('epoch_*'))), completed)
                 final = torch.load(manifest['checkpoint'], map_location='cpu', weights_only=True)
-                for metric in ('mean', 'variance', 'joint'):
+                kinds = ('mean', 'variance', 'joint') if completed >= 5 else ('mean', 'variance')
+                if completed < 5:
+                    self.assertFalse((output / 'best_joint_model.pth').exists())
+                    self.assertFalse((output / 'best_joint_manifest.json').exists())
+                for metric in kinds:
                     best_path = output / f'best_{metric}_manifest.json'
                     _, selected, _ = load_training_run(best_path)
                     checkpoint, identity = resolve_checkpoint(best_path, selected)
                     self.assertTrue(identity['recorded_digest_verified'])
-                    self.assertEqual(selected['checkpoint_epoch'], 1)
+                    self.assertEqual(selected['checkpoint_epoch'], 5 if metric == 'joint' else 1)
+                    if metric == 'joint':
+                        selection = selected['checkpoint_selection']
+                        self.assertEqual(selection['smoothing_window'], 5)
+                        self.assertEqual(selection['window_start_epoch'], 1)
+                        self.assertEqual(selection['value'], metrics(0., 0.))
+                        self.assertEqual(selection['raw_metrics'], metrics(0., 0.))
                     best = torch.load(checkpoint, map_location='cpu', weights_only=True)
                     self.assertFalse(torch.equal(best['weight'], final['weight']))
 

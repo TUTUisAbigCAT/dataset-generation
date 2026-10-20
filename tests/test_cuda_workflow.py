@@ -27,7 +27,7 @@ class CudaWorkflowTests(unittest.TestCase):
         # Cluster directives now follow the user's supplied submission script.
         new = (ROOT / "submit.sh").read_bytes()
         commands = [line for line in new.splitlines() if line.startswith(b"python ")]
-        self.assertEqual(commands, [b"python scripts/run_dreamt.py --epochs 10 --batch-size 8 --threads 4"])
+        self.assertEqual(commands, [b"python scripts/run_dreamt.py --epochs 50 --batch-size 8 --threads 4"])
         self.assertNotIn(b"\r", new)
 
     def test_production_entry_points_reject_missing_cuda(self):

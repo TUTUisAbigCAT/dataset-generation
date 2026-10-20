@@ -1,7 +1,7 @@
 """Epoch-end distribution checks without changing the WaveStitch updates."""
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 import csv
 import hashlib
 import json
@@ -19,7 +19,7 @@ from validation_sampling import sample_validation_windows
 
 DEFAULT_VALIDATION = {"max_windows": 64, "batch_size": 8, "seed": 20261020}
 DEFAULT_EARLY_STOPPING = {
-    "enabled": True, "patience": 5,
+    "enabled": True, "patience": 10, "smoothing_window": 5,
     "min_delta_mean_ms": 0.0, "min_delta_variance_ms2": 0.0,
 }
 EARLY_STOP_METRICS = {
@@ -35,9 +35,10 @@ def early_stopping_options(config):
     options = {**DEFAULT_EARLY_STOPPING, **values}
     if not isinstance(options["enabled"], bool):
         raise ValueError("early_stopping.enabled must be boolean")
-    patience = options["patience"]
-    if isinstance(patience, bool) or not isinstance(patience, int) or patience < 1:
-        raise ValueError("early_stopping.patience must be a positive integer")
+    for key in ("patience", "smoothing_window"):
+        value = options[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"early_stopping.{key} must be a positive integer")
     for key in ("min_delta_mean_ms", "min_delta_variance_ms2"):
         value = options[key]
         if (isinstance(value, bool) or not isinstance(value, (int, float))
@@ -48,15 +49,18 @@ def early_stopping_options(config):
 
 
 class EarlyStopping:
-    """Reset patience only when both window errors improve in the same epoch.
+    """Reset patience only when both full-window moving averages improve.
 
-    Actual minima select checkpoints. Separate threshold anchors allow several
+    Raw minima select individual checkpoints; joint checkpoints use smoothed
+    improvements. Separate threshold anchors allow several
     small improvements to accumulate past min_delta, without resetting patience
     on numerical jitter. No mean/variance sum mixes their different units.
     """
     def __init__(self, config):
         self.options = early_stopping_options(config)
         self.best, self.anchors = {}, {}
+        self.history = deque(maxlen=self.options["smoothing_window"])
+        self.smoothed = {name: None for name in EARLY_STOP_METRICS}
         self.completed_epochs = self.bad_epochs = 0
         self.stopped_epoch = None
 
@@ -66,17 +70,24 @@ class EarlyStopping:
         values = {name: float(aggregate[key]) for name, (key, _) in EARLY_STOP_METRICS.items()}
         if any(not math.isfinite(value) or value < 0 for value in values.values()):
             raise ValueError("Early-stopping metrics must be finite nonnegative absolute errors")
+        self.history.append(values)
+        ready = len(self.history) == self.options["smoothing_window"]
+        if ready:
+            self.smoothed = {name: math.fsum(row[name] for row in self.history) / len(self.history)
+                             for name in EARLY_STOP_METRICS}
         improved, new_best = [], []
         for name, value in values.items():
             metric, delta_key = EARLY_STOP_METRICS[name]
             if name not in self.best or value < self.best[name]["value"]:
                 self.best[name] = dict(epoch=epoch, metric=metric, value=value)
                 new_best.append(name)
-            if name not in self.anchors or value < self.anchors[name] - self.options[delta_key]:
-                self.anchors[name] = value
+            if ready and (name not in self.anchors
+                          or self.smoothed[name] < self.anchors[name] - self.options[delta_key]):
+                self.anchors[name] = self.smoothed[name]
                 improved.append(name)
         joint_improvement = len(improved) == len(EARLY_STOP_METRICS)
-        self.bad_epochs = 0 if joint_improvement else self.bad_epochs + 1
+        if ready:
+            self.bad_epochs = 0 if joint_improvement else self.bad_epochs + 1
         self.completed_epochs = epoch
         if self.options["enabled"] and self.bad_epochs >= self.options["patience"]:
             self.stopped_epoch = epoch
@@ -84,7 +95,10 @@ class EarlyStopping:
                     joint_improvement=joint_improvement)
 
     def summary(self):
-        return dict(options=self.options.copy(), improvement_rule="both_metrics_same_epoch",
+        return dict(options=self.options.copy(), improvement_rule="both_smoothed_metrics_same_epoch",
+                    smoothing_method="simple_moving_average",
+                    smoothing_ready=len(self.history) == self.options["smoothing_window"],
+                    smoothed_metrics={EARLY_STOP_METRICS[name][0]: value for name, value in self.smoothed.items()},
                     bad_epochs=self.bad_epochs,
                     stopped_early=self.stopped_epoch is not None, stopped_epoch=self.stopped_epoch,
                     completed_epochs=self.completed_epochs, threshold_anchors=self.anchors.copy(),
@@ -209,7 +223,8 @@ class EpochValidator:
             schema="ibi_epoch_mean_variance_v1", metric="IBI distribution mean and population variance",
             options=self.options, selection=selection, windows=self.windows_metadata,
             early_stopping=self.early_stopping.options,
-            early_stopping_improvement_rule="both_metrics_same_epoch",
+            early_stopping_improvement_rule="both_smoothed_metrics_same_epoch",
+            early_stopping_smoothing_method="simple_moving_average",
             scaler=preprocessor.scaler, split_fingerprint=preprocessor.split_fingerprint,
             data_synthetic=preprocessor.provenance()["data_synthetic"],
             condition_columns=preprocessor.columns.tolist()[1:],
@@ -265,8 +280,11 @@ class EpochValidator:
             name: stopping["best_metrics"][name] for name in stopping["new_best_metrics"]}
         if stopping["joint_improvement"]:
             checkpoint_updates["joint"] = dict(
-                epoch=epoch, metric="both_metrics_same_epoch",
-                value={key: aggregate[key] for key, _ in EARLY_STOP_METRICS.values()})
+                epoch=epoch, metric="both_smoothed_metrics_same_epoch",
+                value=stopping["smoothed_metrics"].copy(),
+                raw_metrics={key: aggregate[key] for key, _ in EARLY_STOP_METRICS.values()},
+                smoothing_window=self.early_stopping.options["smoothing_window"],
+                window_start_epoch=epoch-self.early_stopping.options["smoothing_window"]+1)
         for name, checkpoint_metrics in checkpoint_updates.items():
             checkpoint = self.training_output / f"best_{name}_model.pth"
             # Save only state_dict, matching the baseline checkpoint format.
@@ -288,12 +306,16 @@ class EpochValidator:
         csv_path = self.training_output / "epoch_metrics.csv"
         with csv_path.open("w", encoding="utf-8", newline="") as stream:
             fields = ["epoch", "train_mean_loss", *aggregate, "validation_seconds",
+                      "smoothed_mean_window_absolute_error_ms", "smoothed_variance_window_absolute_error_ms2",
+                      "smoothing_ready",
                       "joint_improvement", "early_stopping_bad_epochs", "stopped_early"]
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
             for row in self.reports:
                 writer.writerow(dict(epoch=row["epoch"], train_mean_loss=row["train_mean_loss"],
                                      **row["aggregate"], validation_seconds=row["validation_seconds"],
+                                     **{"smoothed_" + key: value for key, value in row["early_stopping"]["smoothed_metrics"].items()},
+                                     smoothing_ready=row["early_stopping"]["smoothing_ready"],
                                      joint_improvement=row["early_stopping"]["joint_improvement"],
                                      early_stopping_bad_epochs=row["early_stopping"]["bad_epochs"],
                                      stopped_early=row["early_stopping"]["stopped_early"]))

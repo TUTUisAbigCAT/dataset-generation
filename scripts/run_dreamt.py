@@ -65,7 +65,7 @@ def main():
     parser.add_argument("--data-dir", type=Path, help="Override only the NPZ folder; otherwise read dataset_config.json")
     parser.add_argument("--config", type=Path, default=ROOT / "dataset_config.json")
     parser.add_argument("--check-only", action="store_true", help="Validate the complete data interface without training")
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--output-dir", type=Path, help="An exact new run directory; overrides JSON output_root (which receives a timestamped subdirectory)")

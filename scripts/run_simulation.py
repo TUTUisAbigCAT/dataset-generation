@@ -54,7 +54,8 @@ def save_best_manifests(output, manifest, best_checkpoints):
     for name, best in best_checkpoints.items():
         selected = dict(manifest, checkpoint=best['checkpoint'],
                         checkpoint_sha256=best['checkpoint_sha256'], checkpoint_epoch=best['epoch'],
-                        checkpoint_selection=dict(metric=best['metric'], value=best['value']),
+                        checkpoint_selection={key: value for key, value in best.items()
+                                              if key not in ('checkpoint', 'checkpoint_sha256')},
                         parent_run_manifest=str(output / 'run_manifest.json'))
         save_json(output / f'best_{name}_manifest.json', selected)
 

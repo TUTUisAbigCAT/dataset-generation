@@ -14,4 +14,4 @@ module load python/3.11
 source ./.venv/bin/activate
 # 3. 运行训练代码
 # pip install --no-index scikit-learn numpy pandas torch
-python scripts/run_dreamt.py --epochs 10 --batch-size 8 --threads 4
+python scripts/run_dreamt.py --epochs 50 --batch-size 8 --threads 4

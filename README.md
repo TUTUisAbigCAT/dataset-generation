@@ -77,7 +77,7 @@ DREAMT/
 
 ```bash
 python scripts/run_dreamt.py --check-only
-python scripts/run_dreamt.py --epochs 10 --batch-size 8 --threads 4
+python scripts/run_dreamt.py --epochs 50 --batch-size 8 --threads 4
 ```
 
 也可通过 `--data-dir /path/to/DREAMT_PIBI_SE_new` 覆盖 NPZ 目录，或把私人路径写进已忽略的 `dataset_config.local.json` 并传入 `--config dataset_config.local.json`。Windows 使用 `run.ps1` 时传入相同参数即可。
@@ -123,23 +123,26 @@ python scripts/run_dreamt.py --epochs 10 --batch-size 8 --threads 4
 ```json
 "early_stopping": {
   "enabled": true,
-  "patience": 5,
+  "patience": 10,
+  "smoothing_window": 5,
   "min_delta_mean_ms": 0.0,
   "min_delta_variance_ms2": 0.0
 }
 ```
 
-监控 `mean_window_absolute_error_ms` 和 `variance_window_absolute_error_ms2`，越低越好。分别保存两项指标的最佳值，只有同一轮两项都改善才重置等待计数（AND 规则）；仅均值改善、仅方差改善或两项均未改善，都将等待计数加 1。连续 5 个 epoch 没有出现双指标同时改善，在该轮 validation 完成后停止。第一轮建立参考值，因此最早在第 6 轮结束。`--epochs 10` 是最大轮数，触发早停后不会继续训练剩余轮数；设置 `enabled: false` 可关闭早停。
+监控 `mean_window_absolute_error_ms` 和 `variance_window_absolute_error_ms2`，越低越好。分别对最近 5 个 epoch 的误差计算简单滑动平均（SMA）。前 4 轮只记录原始指标，不计早停等待次数；第 5 轮建立平滑参考值并保存首个整体 checkpoint。只有同一轮两项平滑指标都改善才重置等待计数（AND 规则）；仅一项改善或两项均未改善，计数加 1。连续 10 轮没有双指标同时改善，在该轮 validation 完成后停止，默认最早在第 15 轮结束。
 
-改善要求误差下降幅度严格大于对应的 `min_delta`；默认 0 表示任何严格下降都算单项改善。需要忽略微小波动时，可分别设置毫秒和平方毫秒单位的正阈值。两项各自维护比较基准，单项改善也会更新该项基准，但不能单独清零等待计数；先后两轮分别改善不算同一轮整体改善。小幅改善可以累计超过各自阈值；最佳权重始终按实际最小误差保存。此处判断相对历史表现的改善，没有设置绝对误差达标线。均值与方差单位不同，不直接相加形成总分。
+主入口默认上限和 `submit.sh` 均为 `--epochs 50`，可通过命令行覆盖。设置 `enabled: false` 关闭提前停止，但继续记录平滑指标、等待次数和最佳 checkpoint。若训练未满 `smoothing_window` 轮，不产生整体最佳 checkpoint；原始单项最佳和最终 checkpoint 仍正常保存。
+
+改善要求平滑误差下降幅度严格大于对应的 `min_delta`；默认 0 表示任何严格下降都算单项改善。需要忽略微小波动时，可分别设置毫秒和平方毫秒单位的正阈值。两项各自维护历史平滑参考值，单项改善也更新该项参考值，但不能单独清零等待计数；先后两轮分别改善不算同一轮整体改善。小幅改善可以累计超过各自阈值。此处判断相对历史表现的改善，没有设置绝对误差达标线。均值与方差单位不同，不直接相加形成总分。
 
 结果和权重：
 
-- `training/epoch_metrics.csv` 记录 `joint_improvement`（本轮两项是否同时改善）、`early_stopping_bad_epochs` 和 `stopped_early`；每轮 JSON 同时记录最佳值、改善项和阈值参考值。
+- `training/epoch_metrics.csv` 保留原始指标，新增 `smoothed_mean_window_absolute_error_ms`、`smoothed_variance_window_absolute_error_ms2` 和 `smoothing_ready`。窗口未满时平滑值为 CSV 空值 / JSON null。`joint_improvement` 表示本轮两项平滑指标是否同时改善，另记录 `early_stopping_bad_epochs`、`stopped_early`；每轮 JSON 记录原始最佳值及平滑参考值。
 - `training/training_report.json` 的 `epochs` 是实际完成轮数，`requested_epochs` 是指定上限；`mean_loss` 只平均实际执行的训练样本。`stop_reason` 区分 `early_stopping` 与 `max_epochs`。
-- `training/best_joint_model.pth` 保存双指标同时改善的整体最佳权重，与早停计数清零同步更新；第一轮保存初始参考 checkpoint。仅一项改善时不会覆盖此文件。`best_joint_manifest.json` 记录该轮两个指标、epoch 和权重哈希，供评估入口使用。
-- `training/best_mean_model.pth` 和 `training/best_variance_model.pth` 分别保存两项指标最佳的权重，可能来自不同 epoch。相应的 `best_mean_manifest.json`、`best_variance_manifest.json` 记录权重哈希和所选 epoch，供原评估入口使用。
-- 原 `saved_models/DREAMT/model.pth`（主工作流中位于运行目录的 `workspace/` 下）仍保存实际停止时的最终权重。主流程后续评估默认使用它，不自动将两项最佳模型之一认定为共同最优。
+- `training/best_joint_model.pth` 与早停计数清零同步更新，保存触发双指标平滑改善的当轮模型权重。这里平滑的是指标，不做模型权重平均或 EMA。`best_joint_manifest.json` 记录当轮原始值、平滑值、滑动窗口起始 epoch、窗口长度、所选 epoch 和权重哈希。
+- `training/best_mean_model.pth` 和 `training/best_variance_model.pth` 继续按原始单轮指标的最小误差保存，可能来自不同 epoch。相应的 `best_mean_manifest.json`、`best_variance_manifest.json` 记录权重哈希和所选 epoch，供原评估入口使用。
+- 原 `saved_models/DREAMT/model.pth`（主工作流中位于运行目录的 `workspace/` 下）仍保存实际停止时的最终权重。主流程后续评估默认使用它，不自动切换到整体最佳 checkpoint。
 
 例如，训练结束后使用整体最佳权重执行原始采样（把路径替换成实际运行目录，输出目录须尚不存在）：
 
