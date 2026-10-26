@@ -1,7 +1,8 @@
-"""Validate one DREAMT folder, then run the unchanged baseline in an isolated run.
+"""Validate one DREAMT folder, then run the adapted baseline in an isolated run.
 
-Only data configuration, source copying and subprocess orchestration live here.
-Every optimizer update and sampling step belongs to the official baseline.
+Data/schedule configuration, source copying and subprocess orchestration live here.
+Optimizer updates retain the official baseline. Sampling applies the authorized
+posterior-variance square-root correction to the preserved upstream excerpt.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from cuda_runtime import require_cuda, cuda_environment
+from diffusion_schedule import diffusion_settings, diffusion_identity
 
 
 def save_json(path, value):
@@ -49,7 +51,7 @@ def resolve_output_directory(config_path, explicit_output=None):
 def snapshot_source(destination):
     destination.mkdir()
     for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "cuda_runtime.py",
-                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "window_config.py"):
+                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "window_config.py", "diffusion_schedule.py"):
         shutil.copy2(ROOT / name, destination / name)
     for name in ("TSImputers", "utils", "third_party"):
         shutil.copytree(ROOT / name, destination / name,
@@ -100,6 +102,8 @@ def main():
             raise ValueError("No valid configured-length training windows in the selected folder")
         from epoch_validation import select_fixed_windows, validation_options, early_stopping_options
         selected_config = json.loads(cli.config.read_text(encoding="utf-8-sig"))
+        schedule_config = diffusion_settings(selected_config, default_schedule="linear_power")
+        schedule_identity = diffusion_identity(dict(schedule_config, beta_0=.0001, beta_T=.02, timesteps=200))
         validation_config = validation_options(selected_config)
         stopping_config = early_stopping_options(selected_config)
         validation, selection = select_fixed_windows(preprocessor, validation_config)
@@ -110,6 +114,8 @@ def main():
             validation_windows=[dict(filename=name, start_sample=start) for name, start in validation],
             validation_selection=selection, validation_options=validation_config,
             early_stopping=stopping_config,
+            diffusion_settings=schedule_config,
+            diffusion_identity=schedule_identity,
             provenance=preprocessor.provenance(), test_npz_opened=False,
             scope="Original WatchSleepNet preprocessed IBI NPZ interface; no real-data or convergence claim")
         save_json(output / "preflight.json", preflight)
@@ -127,6 +133,7 @@ def main():
             ("metadata_path", "split_path", "split_seed", "multiplier", "downsample_rate", "max_epochs", "window_epochs")}
         frozen_config["validation"] = validation_config
         frozen_config["early_stopping"] = stopping_config
+        frozen_config.update(schedule_config)
         frozen_config["data_dir"] = identity["data_directory"]
         frozen_config["generate_splits"] = identity["split_source"] == "generated_subject_split"
         save_json(workspace / "dataset_config.json", frozen_config)

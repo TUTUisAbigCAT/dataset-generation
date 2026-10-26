@@ -3,7 +3,8 @@ import argparse
 import torch
 
 from data_utils import Preprocessor
-from training_utils import MyDataset, fetchModel, fetchDiffusionConfig
+from training_utils import MyDataset, fetchModel
+from diffusion_schedule import build_diffusion_config as fetchDiffusionConfig
 import numpy as np
 
 from torch import from_numpy, optim, nn, randint, normal, sqrt, device, save
@@ -22,6 +23,8 @@ if __name__ == "__main__":
     parser.add_argument('-beta_0', type=float, default=0.0001, help='initial variance schedule')
     parser.add_argument('-beta_T', type=float, default=0.02, help='last variance schedule')
     parser.add_argument('-timesteps', '-T', type=int, default=200, help='training/inference timesteps')
+    parser.add_argument('-diffusion_schedule', choices=('linear', 'linear_power'), default='linear_power')
+    parser.add_argument('-terminal_alpha_bar', type=float, default=1e-8)
     parser.add_argument('-hdim', type=int, default=64, help='hidden embedding dimension')
     parser.add_argument('-lr', type=float, default=1e-4, help='learning rate')
     parser.add_argument('-batch_size', type=int, help='batch size', default=1024)

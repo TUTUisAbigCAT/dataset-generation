@@ -13,7 +13,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from scripts.evaluate_original_sampler import extract_original_pipeline
+from tests.test_posterior_noise import independent_corrected_pipeline
 from validation_sampling import _sample_windows_from_original, sample_validation_windows
 
 
@@ -38,9 +38,9 @@ def fixture(device="cpu", length=6, steps=200):
     return TinyDenoiser(device).eval(), windows, config, args
 
 
-def direct_upstream(model, clean, config, args):
-    """Independent setup of the raw excerpt, without invoking the adapter."""
-    noise, _, generation, _ = extract_original_pipeline()
+def direct_corrected_reference(model, clean, config, args):
+    """Independent AST-corrected baseline, without invoking the adapter patch."""
+    noise, generation = independent_corrected_pipeline()
     windows = clean.clone()
     windows[:, :, 0] = 0
     device = clean.device
@@ -58,7 +58,7 @@ def direct_upstream(model, clean, config, args):
 
 
 class ValidationSamplingTests(unittest.TestCase):
-    def test_all_200_steps_match_exact_upstream_and_preserve_training_state(self):
+    def test_all_200_steps_match_corrected_reference_and_preserve_training_state(self):
         model, clean, config, args = fixture()
         original_input = clean.clone()
         original_args = vars(args).copy()
@@ -69,7 +69,7 @@ class ValidationSamplingTests(unittest.TestCase):
             torch.manual_seed(1951)
             generated, metadata = _sample_windows_from_original(model, clean, config, args, "cpu")
             torch.manual_seed(1951)
-            expected = direct_upstream(TinyDenoiser().eval(), clean, config, args)
+            expected = direct_corrected_reference(TinyDenoiser().eval(), clean, config, args)
         self.assertTrue(torch.equal(generated, expected))
         self.assertEqual(tuple(generated.shape), (2, 6))
         self.assertFalse(generated.requires_grad)
@@ -80,8 +80,12 @@ class ValidationSamplingTests(unittest.TestCase):
         self.assertEqual(metadata["training_stride"], 3)
         self.assertEqual(metadata["inference_stride"], 6)
         self.assertTrue(metadata["condition_columns_bitwise_preserved"])
-        self.assertTrue(metadata["source_provenance"]["excerpts_byte_identical_to_upstream"])
-        self.assertFalse(metadata["source_provenance"]["sampler_expressions_edited"])
+        self.assertFalse(metadata["source_provenance"]["excerpts_byte_identical_to_upstream"])
+        self.assertTrue(metadata["source_provenance"]["sampler_expressions_edited"])
+        self.assertTrue(metadata["source_provenance"]["upstream_snapshot_byte_identical"])
+        self.assertFalse(metadata["source_provenance"]["original_variance_times_noise_preserved"])
+        self.assertFalse(metadata["source_provenance"]["random_draws_added_or_removed"])
+        self.assertEqual(metadata["source_provenance"]["posterior_noise_scale"], "sqrt_posterior_variance")
         self.assertFalse(metadata["clipping_applied"])
         self.assertEqual(vars(args), original_args)
         self.assertTrue(torch.equal(clean, original_input))
@@ -147,7 +151,7 @@ class ValidationSamplingTests(unittest.TestCase):
                     torch.manual_seed(1951)
                     generated, metadata = _sample_windows_from_original(model, clean, config, args, "cpu")
                     torch.manual_seed(1951)
-                    expected = direct_upstream(TinyDenoiser().eval(), clean, config, args)
+                    expected = direct_corrected_reference(TinyDenoiser().eval(), clean, config, args)
                 self.assertTrue(torch.equal(generated, expected))
                 self.assertEqual(generated.shape, (2, length))
                 self.assertEqual(metadata["mask_shape"], [2, length])

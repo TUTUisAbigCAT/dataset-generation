@@ -1,8 +1,11 @@
-"""Data/output adapter around an exact excerpt of the official pipeline sampler.
+"""WaveStitch pipeline adapter with the DDPM posterior noise scale corrected.
 
-No sampler expression, noise draw, guidance coefficient, model buffer, or backend
-is changed. Tensor factories run in a local CUDA device context; no CPU
-fallback is permitted. All requested windows belong to one subject and one batch. The
+The immutable upstream excerpt is verified before one explicit correction:
+scale standard normal noise by sqrt(posterior variance), not the variance.
+Noise draws, guidance and model buffers otherwise stay unchanged. The schedule
+is restored from the selected training manifest through the local adapter.
+Tensor factories run in a local CUDA device context; no CPU fallback is
+permitted. All requested windows belong to one subject and one batch. The
 adapter's clean condition columns are supplied; IBI is zero and wholly unknown.
 This is a window-level check, not evidence of whole-night generation quality.
 """
@@ -24,6 +27,8 @@ SOURCE = UPSTREAM / 'synthesis_wavestitch_pipeline_strided_preconditioning.py'
 sys.path.insert(0, str(ROOT))
 
 from window_config import EPOCH_SAMPLES, FS
+from diffusion_schedule import build_diffusion_config, diffusion_identity
+from scripts.verify_upstream_boundary import CORE_FILES, expected_core_source
 
 
 def digest(value):
@@ -87,11 +92,57 @@ def extract_original_pipeline():
         sampler_expressions_edited=False, random_draws_added_or_removed=False,
         original_variance_times_noise_preserved=True,
         original_guidance_minus_0_1_gradient_preserved=True)
-    for name in ('training_utils.py', 'TSImputers/SSSDS4Imputer.py',
-                 'TSImputers/S4Model.py', 'utils/util.py'):
-        actual = digest((ROOT / name).read_bytes())
-        if actual != entries[name]:
-            raise RuntimeError('Imported original source differs: ' + name)
+    core_hashes = {}
+    for name in CORE_FILES:
+        original = (UPSTREAM / name).read_bytes()
+        if digest(original) != entries[name]:
+            raise RuntimeError('Official core snapshot differs from its manifest: ' + name)
+        actual = (ROOT / name).read_bytes()
+        if actual != expected_core_source(name, original):
+            raise RuntimeError('Imported source exceeds the exact core correction allowlist: ' + name)
+        core_hashes[name] = digest(actual)
+    provenance.update(imported_core_byte_identical=False,
+                      s4_fallback_conjugate_corrected=True,
+                      s4_device_dtype_dispatch_corrected=True,
+                      imported_core_sha256=core_hashes)
+    return noise_source, generation_source, compiled_source, provenance
+
+
+def extract_corrected_pipeline():
+    """Apply the single authorized posterior-standard-deviation correction.
+
+    Keep the vendored source and manifest intact for reproducibility. Every
+    production sampling entry point uses this function; the raw extractor is
+    retained only for source audits and regression comparisons.
+    """
+    noise_source, original_generation, _, original_provenance = extract_original_pipeline()
+    before = 'vari = beta_t * ((1 - alpha_bar_t_1) / (1 - alpha_bar_t)) * torch.normal'
+    after = 'vari = torch.sqrt(beta_t * ((1 - alpha_bar_t_1) / (1 - alpha_bar_t))) * torch.normal'
+    if original_generation.count(before) != 1:
+        raise RuntimeError('Expected exactly one reviewed posterior variance noise coefficient')
+    generation_source = original_generation.replace(before, after, 1)
+    compiled_source = 'if True:\n    if True:\n' + generation_source
+    tree = ast.parse(compiled_source)
+    step_loops = [node for node in ast.walk(tree) if isinstance(node, ast.For)
+                  and isinstance(node.target, ast.Name) and node.target.id == 'step']
+    if len(step_loops) != 1:
+        raise RuntimeError('Corrected sampler must retain the single upstream DDPM loop')
+    lines = compiled_source.splitlines(keepends=True)
+    step_source = ''.join(lines[step_loops[0].lineno - 1:step_loops[0].end_lineno])
+    provenance = dict(original_provenance)
+    provenance.update(
+        upstream_snapshot_byte_identical=True,
+        upstream_generation_block_sha256=original_provenance['generation_block_sha256'],
+        upstream_ddpm_for_step_sha256=original_provenance['ddpm_for_step_sha256'],
+        generation_block_sha256=digest(generation_source.encode('utf-8')),
+        ddpm_for_step_sha256=digest(step_source.encode('utf-8')),
+        executed_sampler_sha256=digest(compiled_source.encode('utf-8')),
+        excerpts_byte_identical_to_upstream=False,
+        sampler_expressions_edited=True,
+        original_variance_times_noise_preserved=False,
+        posterior_noise_scale='sqrt_posterior_variance',
+        runtime_corrections=[dict(id='posterior_variance_to_std', before=before, after=after)],
+    )
     return noise_source, generation_source, compiled_source, provenance
 
 
@@ -162,7 +213,7 @@ def main():
                         help='Contiguous overlapping windows in one original pipeline batch.')
     parser.add_argument('--threads', type=int, default=2)
     parser.add_argument('--extract-only', action='store_true',
-                        help='Verify and save the unchanged excerpts without loading a model or data.')
+                        help='Verify the upstream snapshot and save the corrected sampler without inference.')
     cli = parser.parse_args()
     if cli.windows <= 0 or cli.threads <= 0:
         parser.error('--windows and --threads must be positive')
@@ -179,10 +230,10 @@ def main():
             json.dumps(report, indent=2), encoding='utf-8')
 
     try:
-        noise_source, generation_source, compiled_source, provenance = extract_original_pipeline()
+        noise_source, generation_source, compiled_source, provenance = extract_corrected_pipeline()
         report['source_provenance'] = provenance
         (cli.output_dir / 'original_create_pipelined_noise.py').write_bytes(noise_source.encode('utf-8'))
-        (cli.output_dir / 'original_generation_block.py.txt').write_bytes(generation_source.encode('utf-8'))
+        (cli.output_dir / 'corrected_generation_block.py.txt').write_bytes(generation_source.encode('utf-8'))
         save_report()
         if cli.extract_only:
             compile(noise_source, str(SOURCE), 'exec')
@@ -198,7 +249,7 @@ def main():
         device = require_cuda()
         from torch.utils.data import DataLoader
         from data_utils import Preprocessor
-        from training_utils import MyDataset, fetchModel, fetchDiffusionConfig
+        from training_utils import MyDataset, fetchModel
         from scripts.evaluate_denoising import load_training_run, bind_training_data, resolve_checkpoint
 
         torch.set_num_threads(cli.threads)
@@ -206,7 +257,7 @@ def main():
             'python': sys.version, 'executable': sys.executable, 'torch': torch.__version__,
             'threads': cli.threads, 'compute_policy': 'CUDA required; no CPU fallback',
             'host_boundaries': ['file I/O and WatchSleepNet preprocessing',
-                'original seeded constructor and exact diffusion schedule initialization',
+                'original seeded constructor and recorded diffusion schedule initialization',
                 'final result serialization']}
         args, manifest, config_provenance = load_training_run(cli.training_args_json)
         cli.checkpoint, checkpoint_identity = resolve_checkpoint(cli.training_args_json, manifest, cli.checkpoint)
@@ -219,13 +270,14 @@ def main():
         if args.backbone.lower() != 's4':
             raise ValueError('Only the original S4 backbone is supported')
         report['training_args'] = vars(args)
+        report['diffusion_identity'] = diffusion_identity(args)
         np.random.seed(42)
         torch.manual_seed(42)
         preprocessor, identity_checks = bind_training_data(args, manifest, cli.training_args_json, Preprocessor)
         report['training_data_identity_checks'] = identity_checks
         report['artificial_data'] = preprocessor.provenance().get('data_synthetic')
         report['source_sha256'] = {name: digest((ROOT / name).read_bytes()) for name in
-            ('data_utils.py', 'watchsleep_loader.py', 'window_config.py', 'scripts/evaluate_denoising.py',
+             ('data_utils.py', 'watchsleep_loader.py', 'window_config.py', 'diffusion_schedule.py', 'scripts/evaluate_denoising.py',
              'scripts/evaluate_original_sampler.py')}
         columns = preprocessor.columns
         input_features = len(columns)
@@ -258,7 +310,7 @@ def main():
         model = fetchModel(input_features, 1, args).to(device)
         assert_cuda_model(model)
         diffusion_config = {key: value.to(device) if torch.is_tensor(value) else value
-                            for key, value in fetchDiffusionConfig(args).items()}
+                            for key, value in build_diffusion_config(args).items()}
         test_dataloader = DataLoader(test_dataset, batch_size=cli.windows)
         mask_dataloader = DataLoader(mask_dataset, batch_size=cli.windows)
         saved_params = torch.load(cli.checkpoint, map_location=device)
@@ -268,7 +320,7 @@ def main():
         report['data'].update(selected_subject=Path(filename).stem,
             start_sample=start_sample, generated_samples=total_length)
         model.eval()
-        # Original setup names consumed by the byte-identical generation block.
+        # Preserve the original setup names consumed by the corrected excerpt.
         scope = dict(torch=torch, sqrt=torch.sqrt, args=args, device=device, model=model,
             diffusion_config=diffusion_config, test_dataset=test_dataset,
             test_dataloader=test_dataloader, mask_dataloader=mask_dataloader,
@@ -278,7 +330,7 @@ def main():
         save_report()
         torch.cuda.synchronize(device)
         start = time.perf_counter()
-        # Keep the exact upstream excerpt, including draw count/order and algebra.
+        # Preserve draw count/order; only the posterior noise scale is corrected.
         # A local device context places its normal/full/empty and model embedding
         # factories directly on CUDA; it changes the RNG backend, not the schedule.
         with torch.device(device):
@@ -304,8 +356,11 @@ def main():
             generated_min_ms=float(generated_seconds.min() * 1000) if finite else None,
             generated_max_ms=float(generated_seconds.max() * 1000) if finite else None)
         report['cuda_execution'] = dict(device=str(device),
-            sampler_source_byte_identical=True, local_default_device_context=True,
-            random_draw_backend='CUDA', random_draw_count_and_schedule_unchanged=True,
+            sampler_source_byte_identical=False, upstream_snapshot_byte_identical=True,
+            posterior_variance_sqrt_corrected=True, local_default_device_context=True,
+            random_draw_backend='CUDA', random_draw_count_unchanged=True,
+            schedule_matches_training=True,
+            schedule_is_legacy_linear=report['diffusion_identity']['diffusion_schedule'] == 'linear',
             cpu_bitwise_random_stream_equivalence_claim=False)
         # The only device-to-host array transfers are final NPZ serialization.
         np.savez_compressed(cli.output_dir / 'generated_samples.npz',
@@ -318,7 +373,7 @@ def main():
         save_report()
         print(json.dumps(report['result'], indent=2))
         if not finite:
-            raise RuntimeError('Original sampler returned nonfinite values; saved without algorithm changes')
+            raise RuntimeError('Corrected sampler returned nonfinite values; saved without clipping')
     except Exception:
         report['status'] = 'failed'
         report['traceback'] = traceback.format_exc()

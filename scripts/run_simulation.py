@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT))
 from cuda_runtime import require_cuda, cuda_environment
 from epoch_validation import weighted_loss
 from window_config import EPOCH_SAMPLES, window_settings
+from diffusion_schedule import diffusion_settings, diffusion_identity
 
 
 def save_json(path, value):
@@ -75,6 +76,7 @@ def main():
     config_path = Path(os.environ.get("DREAMT_CONFIG_PATH", ROOT / "dataset_config.json"))
     config = json.loads(config_path.read_text(encoding="utf-8-sig")) if config_path.is_file() else {}
     dimensions = window_settings(config)
+    schedule_settings = diffusion_settings(config, default_schedule="linear_power")
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
     checkpoint_path = ROOT / 'saved_models' / args.dataset / 'model.pth'
@@ -94,16 +96,19 @@ def main():
                     ROOT / 'watchsleep_loader.py', ROOT / 'dataset_config.json', ROOT / 'cuda_runtime.py',
                     ROOT / 'third_party/WatchSleepNet/data_setup.py', ROOT / 'epoch_validation.py',
                     ROOT / 'validation_metrics.py', ROOT / 'validation_sampling.py', ROOT / 'window_config.py',
-                    ROOT / 'scripts/evaluate_original_sampler.py']
+                    ROOT / 'scripts/evaluate_original_sampler.py', ROOT / 'diffusion_schedule.py']
     hashes = {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
     command = [filename, '-d', args.dataset, '-window_size', str(dimensions['window_size']), '-s4_lmax', str(dimensions['window_size']),
                '-stride', str(EPOCH_SAMPLES), '-batch_size', str(args.batch_size), '-epochs', str(args.epochs),
+               '-diffusion_schedule', schedule_settings['diffusion_schedule'],
+               '-terminal_alpha_bar', str(schedule_settings['terminal_alpha_bar']),
                '-validation_output', str(output / 'validation')]
     manifest = dict(status='starting', python=sys.executable, python_version=sys.version,
                     torch=torch.__version__, numpy=np.__version__, cuda=torch.cuda.is_available(),
                     mkldnn_enabled=torch.backends.mkldnn.enabled, threads=torch.get_num_threads(),
                     process_id=os.getpid(), command=command, source_sha256=hashes,
                     device=str(device), cuda_environment=cuda_environment(device), window_settings=dimensions,
+                    diffusion_settings=schedule_settings,
                     observer='sys.settrace reads current loss and completed updates only; no training hooks or replacements',
                     observer_sha256=sha(Path(__file__)), training_args=None,
                     checkpoint=str(checkpoint_path), data_synthetic=None)
@@ -144,6 +149,7 @@ def main():
                                     data=state['preprocessor'].provenance(),
                                     data_identity=state['preprocessor'].data_identity(),
                                     model_input_columns=state['preprocessor'].columns.tolist())
+                    manifest['diffusion_identity'] = diffusion_identity(state['args'], state['diffusion_config'])
                     manifest['data_synthetic'] = manifest['data']['data_synthetic']
                     save_json(output / 'run_manifest.json', manifest)
                     print(json.dumps({k:manifest[k] for k in ['status','parameter_count','train_windows','expected_updates']}), flush=True)

@@ -222,9 +222,11 @@ class EpochValidator:
             raise ValueError("Validation window_epochs must match the configuration, preprocessor and training window_size")
         if training_args.s4_lmax < self.window_size:
             raise ValueError("Validation window_size must fit within the original S4 kernel length")
-        self.metric_description = (f"KL(real || generated) between diagonal Gaussian fits to "
-                                   f"all {self.window_size}-dimensional validation windows; sum in nats")
+        self.metric_description = (f"Mean paired-window KL(real || generated) between univariate Gaussian fits "
+                                   f"to the {self.window_size} time samples within each window; nats per window")
         self.diffusion_config = diffusion_config
+        from diffusion_schedule import diffusion_identity
+        self.diffusion_identity = diffusion_identity(training_args, diffusion_config)
         self.output = Path(output_dir).resolve()
         self.training_output = self.output.parent
         self.output.mkdir(parents=True, exist_ok=False)
@@ -243,13 +245,13 @@ class EpochValidator:
             if not math.isfinite(self.scale) or self.scale <= 0 or not math.isfinite(self.center):
                 raise ValueError("Invalid training-only IBI scaler")
             self.windows_metadata = [
-                dict(filename=name, subject_id=Path(name).stem, start_sample=start,
+                dict(validation_index=index, filename=name, subject_id=Path(name).stem, start_sample=start,
                      start_second=start / self.window["sample_rate_hz"],
                      sleep_stages=preprocessor.record(name)["stages"][start:start+self.window_size:EPOCH_SAMPLES].tolist(),
                      file_sha256=preprocessor.record(name)["file_sha256"])
-                for name, start in selected]
+                for index, (name, start) in enumerate(selected)]
         self.protocol = dict(
-            schema="ibi_epoch_diagonal_gaussian_kl_v3", metric=self.metric_description,
+            schema="ibi_epoch_window_gaussian_kl_v4", metric=self.metric_description,
             window=self.window,
             options=self.options, selection=selection, windows=self.windows_metadata,
             early_stopping=self.early_stopping.options,
@@ -258,22 +260,26 @@ class EpochValidator:
             scaler=preprocessor.scaler, split_fingerprint=preprocessor.split_fingerprint,
             data_synthetic=preprocessor.provenance()["data_synthetic"],
             condition_columns=preprocessor.columns.tolist()[1:],
-            generation="full original DDPM schedule; unknown IBI; clean conditions; independent windows",
+            generation="full recorded training DDPM schedule; unknown IBI; clean conditions; independent windows",
+            diffusion_identity=self.diffusion_identity,
             diffusion_steps=diffusion_config["T"], initialization_seed=42,
             validation_seed_reset_each_epoch=True, training_rng_restored=True,
             signal_unit="milliseconds", variance_unit="milliseconds_squared", variance_correction=0,
-            aggregation=f"one {self.window_size}-dimensional sample per window; coordinate moments over all selected windows; stored zeros included; no clipping",
+            aggregation="paired-window temporal population moments; mean KL over all selected windows; stored zeros included; no clipping",
             gaussian_kl=dict(metric="gaussian_kl_real_to_generated", direction="real || generated",
-                             dimension=self.window_size, moment_axis="windows (dim=0)",
-                             reduction="sum over coordinates; no dimension normalization",
-                             logarithm="natural", unit="nats", covariance="diagonal only",
+                             dimension=1, window_samples=self.window_size,
+                             moment_axis="time within each window (dim=1)",
+                             pairing="real[i] and generated[i] share validation_index, source window and conditions",
+                             reduction="mean over windows; equal weight per window, not batch means",
+                             logarithm="natural", unit="nats per window", distribution="univariate Gaussian per window",
                              variance_floor_ms2=self.options["kl_variance_floor_ms2"],
-                             variance_regularization="clamp each real and generated coordinate variance to the fixed floor",
-                             accumulation="CUDA batched centered-moment merge",
-                             single_window_variance="zero population estimate; floor applies; insufficient for distribution assessment"),
+                             variance_regularization="clamp each real and generated within-window variance to the fixed floor",
+                             accumulation="CUDA sum of per-window KL divided by total window count; short batches weighted by window count",
+                             single_window_variance="population variance over time samples within that window; nonconstant windows may have positive variance"),
             metric_dtype="float64", device=str(self.device), test_npz_opened=False,
-            limitations="KL of moment-matched diagonal Gaussian approximations, not the true sequence distributions. "
-                        "Excludes cross-coordinate covariance and non-Gaussian structure; does not establish temporal or conditional fidelity.")
+            limitations="KL of paired moment-matched univariate Gaussian approximations, not the joint sequence distributions. "
+                        "Invariant to temporal permutations within each window; does not assess temporal order, autocorrelation "
+                        "or non-Gaussian structure and does not establish conditional fidelity.")
         _save_json(self.output / "protocol.json", self.protocol)
 
     def _generate(self, training_model):
@@ -294,6 +300,7 @@ class EpochValidator:
             clean = self.windows[start:start+self.options["batch_size"]].to(self.device)
             ibi, metadata = sample_validation_windows(model, clean, self.diffusion_config, self.args, self.device)
             generated_seconds = ibi.to(dtype=torch.float64) * self.scale + self.center
+            # Preserve the same frozen window order in both sides of each pair.
             reference_seconds = self.reference[start:start+self.options["batch_size"]].to(self.device)
             accumulator.update(generated_seconds, reference_seconds)
             sampler_reports.append(metadata)

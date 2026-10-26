@@ -19,5 +19,7 @@
     "seed": 20261020,
     "kl_variance_floor_ms2": 1.0
   },
-  "window_epochs": 4
+  "window_epochs": 4,
+  "diffusion_schedule": "linear_power",
+  "terminal_alpha_bar": 1e-8
 }

@@ -10,7 +10,6 @@ import contextlib
 import csv
 import io
 import json
-import math
 import os
 from pathlib import Path
 import random
@@ -26,6 +25,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from data_utils import Preprocessor
+from diffusion_schedule import build_diffusion_config, diffusion_identity
 import epoch_validation as coordinator
 from validation_metrics import summarize_distribution
 
@@ -35,8 +35,16 @@ def rng_state():
     return random.getstate(), np.random.get_state(), torch.random.get_rng_state().clone()
 
 
+def training_args(**changes):
+    """A complete, small legacy schedule for the explicitly mocked CUDA tests."""
+    values = dict(window_size=3000, s4_lmax=3000, timesteps=3, beta_0=.0001,
+                  beta_T=.02, diffusion_schedule="linear", terminal_alpha_bar=1e-8)
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
 class TwoWindowPreprocessor:
-    """Two constant windows whose pooled variance comes entirely between windows."""
+    """Different constant windows: each temporal variance is zero despite pooling."""
     def __init__(self, window_epochs=4):
         self.window_epochs = window_epochs
         self.window_size = window_epochs * 750
@@ -174,7 +182,7 @@ class EpochCoordinatorTests(unittest.TestCase):
             if name.startswith(("DG_", "DREAMT_")) or name == "SLURM_JOB_ID":
                 del os.environ[name]
         os.environ["DREAMT_CONFIG_PATH"] = str(self.config_path)
-        self.args = SimpleNamespace(window_size=3000, s4_lmax=3000)
+        self.args = training_args()
         self.model = torch.nn.Sequential(torch.nn.Linear(1, 1))
         self.model.register_buffer("fixed", torch.tensor([7.]))
         self.model.train()
@@ -187,7 +195,7 @@ class EpochCoordinatorTests(unittest.TestCase):
         # Explicit unit-test mock: real production device checks still reject CPU.
         with mock.patch.object(coordinator, "_require_device", return_value=torch.device("cpu")):
             return coordinator.EpochValidator(
-                processor or self.processor, self.args, self.model, {"T": 3},
+                processor or self.processor, self.args, self.model, build_diffusion_config(self.args),
                 torch.device("cpu"), output or self.output, config or self.config)
 
     def assertRngEqual(self, before):
@@ -223,6 +231,7 @@ class EpochCoordinatorTests(unittest.TestCase):
         self.assertFalse(set(processor.accessed_files) & set(processor.splits["test"]))
         self.assertTrue(all(Path(call.args[0]).name in processor.splits["val"] for call in load.call_args_list))
         for index, metadata in enumerate(validator.windows_metadata):
+            self.assertEqual(metadata["validation_index"], index)
             self.assertIn(metadata["filename"], processor.splits["val"])
             record = processor.record(metadata["filename"])
             start = metadata["start_sample"]
@@ -232,6 +241,7 @@ class EpochCoordinatorTests(unittest.TestCase):
         protocol = json.loads((self.output / "protocol.json").read_text())
         self.assertFalse(protocol["test_npz_opened"])
         self.assertEqual(protocol["scaler"]["fit_split"], "train")
+        self.assertEqual(protocol["diffusion_identity"], diffusion_identity(self.args))
         self.assertEqual(validator.summary()["completed_epochs"], 0)
 
     def test_actual_loader_finds_window_after_invalid_first_epoch(self):
@@ -255,7 +265,7 @@ class EpochCoordinatorTests(unittest.TestCase):
         for epochs in (1, 2, 3, 8):
             with self.subTest(window_epochs=epochs):
                 length = epochs * 750
-                self.args = SimpleNamespace(window_size=length, s4_lmax=length)
+                self.args = training_args(window_size=length, s4_lmax=length)
                 processor = TwoWindowPreprocessor(window_epochs=epochs)
                 validator = self.make_validator(processor, output=self.output / f"window_{epochs}",
                                                 config={**self.config, "window_epochs": epochs})
@@ -265,8 +275,17 @@ class EpochCoordinatorTests(unittest.TestCase):
                 protocol = json.loads((validator.output / "protocol.json").read_text(encoding="utf-8"))
                 self.assertEqual(protocol["window"]["window_epochs"], epochs)
                 self.assertEqual(protocol["window"]["window_seconds"], epochs * 30)
-                self.assertEqual(protocol["schema"], "ibi_epoch_diagonal_gaussian_kl_v3")
+                self.assertEqual(protocol["schema"], "ibi_epoch_window_gaussian_kl_v4")
                 self.assertEqual(protocol["selection"]["window_size_samples"], length)
+                metric = protocol["gaussian_kl"]
+                self.assertEqual(metric["dimension"], 1)
+                self.assertEqual(metric["window_samples"], length)
+                self.assertEqual(metric["moment_axis"], "time within each window (dim=1)")
+                self.assertIn("validation_index", metric["pairing"])
+                self.assertIn("mean over windows", metric["reduction"])
+                self.assertIn("not batch means", metric["reduction"])
+                self.assertIn("temporal permutations", protocol["limitations"])
+                self.assertEqual([row["validation_index"] for row in protocol["windows"]], [0, 1])
                 measured = summarize_distribution(validator.reference + .1, validator.reference)
                 output = io.StringIO()
                 with mock.patch.object(validator, "_generate", return_value=(measured, {}, [])), \
@@ -275,20 +294,42 @@ class EpochCoordinatorTests(unittest.TestCase):
                 started = json.loads(output.getvalue().splitlines()[0])
                 self.assertEqual(started["window_size"], length)
                 self.assertEqual(started["window_epochs"], epochs)
-                self.assertAlmostEqual(report["aggregate"]["gaussian_kl_real_to_generated"], length * .02)
+                # Both constant windows have temporal variance 0, floored at
+                # 1 ms^2. Their 100 ms offsets each yield .5*100^2 = 5000 nats.
+                # Averaging these window scores must not multiply by length.
+                self.assertAlmostEqual(report["aggregate"]["gaussian_kl_real_to_generated"], 5000.)
                 self.assertEqual(validator.summary()["window"]["window_size"], length)
+
+    def test_one_nonconstant_window_uses_its_temporal_variance(self):
+        processor = TwoWindowPreprocessor()
+        processor.splits["val"] = ["val_a.npz"]
+        processor.records["val_a.npz"]["ibi"] = .8 + np.tile([-.1, .1], 1500)
+        validator = self.make_validator(processor)
+        self.assertEqual(validator.reference.shape, (1, 3000))
+        # A single window still has temporal variance 10000 ms^2. A 100 ms
+        # mean offset gives KL=.5, instead of the floor-based 5000 result.
+        self.assertAlmostEqual(float((validator.reference * 1000.).var(dim=1, unbiased=False)), 10000.)
+        measured = summarize_distribution(validator.reference + .1, validator.reference)
+        before_rng, before_model = rng_state(), self.model_state()
+        with mock.patch.object(validator, "_generate", return_value=(measured, {}, [])), \
+             contextlib.redirect_stdout(io.StringIO()):
+            report = validator.run(1, self.model, .1)
+        self.assertAlmostEqual(report["aggregate"]["gaussian_kl_real_to_generated"], .5, places=10)
+        self.assertIn("over time samples", validator.protocol["gaussian_kl"]["single_window_variance"])
+        self.assertRngEqual(before_rng)
+        self.assertModelEqual(before_model)
 
     def test_validation_rejects_configuration_mismatch_and_insufficient_kernel(self):
         for args, processor, config in (
-                (SimpleNamespace(window_size=3000, s4_lmax=6000), TwoWindowPreprocessor(2), self.config),
-                (SimpleNamespace(window_size=1500, s4_lmax=6000), self.processor, self.config),
-                (SimpleNamespace(window_size=3000, s4_lmax=6000), self.processor, {**self.config, "window_epochs": 2}),
-                (SimpleNamespace(window_size=3000, s4_lmax=1500), self.processor, self.config)):
+                (training_args(window_size=3000, s4_lmax=6000), TwoWindowPreprocessor(2), self.config),
+                (training_args(window_size=1500, s4_lmax=6000), self.processor, self.config),
+                (training_args(window_size=3000, s4_lmax=6000), self.processor, {**self.config, "window_epochs": 2}),
+                (training_args(window_size=3000, s4_lmax=1500), self.processor, self.config)):
             with self.subTest(args=args, config=config), self.assertRaisesRegex(ValueError, "window_epochs|kernel length"):
                 self.args = args
                 self.make_validator(processor=processor, config=config)
 
-    def test_sequence_distribution_kl_history_and_unchanged_training(self):
+    def test_paired_window_kl_history_and_unchanged_training(self):
         before_init = rng_state()
         validator = self.make_validator()
         self.assertRngEqual(before_init)
@@ -316,11 +357,10 @@ class EpochCoordinatorTests(unittest.TestCase):
             self.assertModelEqual(model_before)
         first, second, third = reports
         self.assertEqual(set(first["aggregate"]), {"gaussian_kl_real_to_generated"})
-        # Across-window variance is 250000 ms^2 at every coordinate. A 100 ms
-        # shift contributes .5 * 100^2 / 250000 = .02 nats per coordinate.
-        self.assertAlmostEqual(first["aggregate"]["gaussian_kl_real_to_generated"], 3000. * .02)
-        self.assertAlmostEqual(second["aggregate"]["gaussian_kl_real_to_generated"],
-                               .5 * 3000 * (math.log(4.) + .25 - 1.))
+        # Each window is constant in time, so both variances use the 1 ms^2
+        # floor. Paired offsets are 100 ms in epoch one, +/-500 ms thereafter.
+        self.assertAlmostEqual(first["aggregate"]["gaussian_kl_real_to_generated"], 5000.)
+        self.assertAlmostEqual(second["aggregate"]["gaussian_kl_real_to_generated"], 125000.)
         self.assertEqual(second["aggregate"], third["aggregate"])
         self.assertNotIn("per_window", first)
         summary = validator.summary()
@@ -441,11 +481,8 @@ class EpochCoordinatorTests(unittest.TestCase):
 
         self.model = TinyModel().train()
         self.model.weight.grad = torch.tensor(.25)
-        self.args = SimpleNamespace(window_size=3000, s4_lmax=3000, stride=1500, timesteps=3)
+        self.args = training_args(stride=1500)
         validator = self.make_validator()
-        betas = torch.linspace(.0001, .02, 3).reshape(3, 1)
-        validator.diffusion_config = dict(T=3, betas=betas, alphas=1-betas,
-                                         alpha_bars=torch.cumprod(1-betas, dim=0))
         original_rng, original_model = rng_state(), self.model_state()
         created = []
 
@@ -469,13 +506,14 @@ class EpochCoordinatorTests(unittest.TestCase):
         self.assertRngEqual(original_rng)
         self.assertModelEqual(original_model)
 
-    def test_actual_generation_accumulates_coordinate_moments_across_uneven_batches(self):
+    def test_actual_generation_averages_paired_window_kl_across_uneven_batches(self):
         class TinyModel(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.tensor(.05))
 
         self.model = TinyModel().train()
+        self.model.weight.grad = torch.tensor(.25)
         processor = TwoWindowPreprocessor()
         processor.splits["val"] = [f"val_{index}.npz" for index in range(5)]
         coordinate = np.linspace(-1., 1., 3000, dtype=np.float64)
@@ -486,13 +524,23 @@ class EpochCoordinatorTests(unittest.TestCase):
             for index, name in enumerate(processor.splits["val"])
         }
         validator = self.make_validator(processor, config={**self.config, "validation": {
-            **self.config["validation"], "kl_variance_floor_ms2": 100000.}})
+            **self.config["validation"], "kl_variance_floor_ms2": 1000.}})
         self.assertEqual(validator.options["batch_size"], 2)
         batch_sizes, generated_batches = [], []
+        before_rng, before_model = rng_state(), self.model_state()
+        frozen_reference, frozen_inputs = validator.reference.clone(), validator.windows.clone()
 
         def sample(model, clean, diffusion_config, args, device):
             self.assertFalse(model.training)
+            self.assertIsNot(model, self.model)
+            start = sum(batch_sizes)
+            self.assertTrue(torch.equal(clean, frozen_inputs[start:start+len(clean)]))
             batch_sizes.append(len(clean))
+            # Exercise complete RNG preservation while keeping this numerical
+            # reference deterministic and independent of the diffusion model.
+            random.random()
+            np.random.rand()
+            torch.rand(1)
             pattern = torch.linspace(-.2, .3, 3000, dtype=clean.dtype, device=clean.device)
             generated = clean[:, :, 0] * .7 + pattern
             generated_batches.append(generated.to(torch.float64) * validator.scale + validator.center)
@@ -504,14 +552,27 @@ class EpochCoordinatorTests(unittest.TestCase):
             report = validator.run(1, self.model, .1)
         self.assertEqual(batch_sizes, [2, 2, 1])
         self.assertEqual([entry["windows"] for entry in report["sampling"]], [2, 2, 1])
+        self.assertRngEqual(before_rng)
+        self.assertModelEqual(before_model)
+        self.assertTrue(torch.equal(validator.reference, frozen_reference))
+        self.assertTrue(torch.equal(validator.windows, frozen_inputs))
         generated_ms = torch.cat(generated_batches) * 1000.
         reference_ms = validator.reference * 1000.
-        ref_variance, ref_mean = torch.var_mean(reference_ms, dim=0, unbiased=False)
-        gen_variance, gen_mean = torch.var_mean(generated_ms, dim=0, unbiased=False)
+        ref_variance, ref_mean = torch.var_mean(reference_ms, dim=1, unbiased=False)
+        gen_variance, gen_mean = torch.var_mean(generated_ms, dim=1, unbiased=False)
         ref_variance = ref_variance.clamp_min(validator.options["kl_variance_floor_ms2"])
         gen_variance = gen_variance.clamp_min(validator.options["kl_variance_floor_ms2"])
-        expected_kl = .5 * (torch.log(gen_variance / ref_variance)
-                             + (ref_variance + (ref_mean - gen_mean).square()) / gen_variance - 1).sum()
+        paired_kl = .5 * (torch.log(gen_variance / ref_variance)
+                         + (ref_variance + (ref_mean - gen_mean).square()) / gen_variance - 1)
+        expected_kl = paired_kl.mean()
+        batch_mean_average = torch.stack([part.mean() for part in paired_kl.split(2)]).mean()
+        self.assertGreater(float((expected_kl - batch_mean_average).abs()), 1e-3)
+        # Permuting generated window order breaks the pairing even though each
+        # side's pooled distribution would remain exactly the same.
+        mismatched_kl = .5 * (torch.log(gen_variance.flip(0) / ref_variance)
+                              + (ref_variance + (ref_mean - gen_mean.flip(0)).square())
+                              / gen_variance.flip(0) - 1)
+        self.assertGreater(float((expected_kl - mismatched_kl.mean()).abs()), .1)
         self.assertEqual(set(report["aggregate"]), {"gaussian_kl_real_to_generated"})
         self.assertAlmostEqual(report["aggregate"]["gaussian_kl_real_to_generated"], float(expected_kl), places=7)
         self.assertNotIn("per_window", report)

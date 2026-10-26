@@ -50,10 +50,13 @@ def main():
     assert denoising["status"] == "passed"
     assert generation["status"] == "completed"
     assert generation["result"]["all_finite"] and generation["result"]["condition_columns_bitwise_preserved"]
-    assert generation["cuda_execution"]["sampler_source_byte_identical"]
+    assert generation["cuda_execution"]["sampler_source_byte_identical"] is False
+    assert generation["cuda_execution"]["upstream_snapshot_byte_identical"] is True
+    assert generation["cuda_execution"]["posterior_variance_sqrt_corrected"] is True
     report = dict(status="cuda_workflow_passed", runtime=cuda_environment(device), devices=devices,
         training_updates=training["updates"], epochs=1, artificial_data=True,
-        stages=["training", "epoch_validation", "denoising", "original_200_step_generation"],
+        stages=["training", "epoch_validation", "denoising", "corrected_200_step_generation"],
+        upstream_snapshot_byte_identical=True, posterior_variance_sqrt_corrected=True,
         no_real_data_or_convergence_claim=True, workflow=str(workflow))
     (output / "cuda_smoke_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report), flush=True)

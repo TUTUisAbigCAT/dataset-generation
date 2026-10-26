@@ -1,4 +1,4 @@
-"""Read-only teacher-forced denoising audit of the strict upstream model.
+"""Read-only teacher-forced denoising audit of the recorded S4 implementation.
 
 This is an external observation: no sampling, training, loss modification,
 missing-value masking, output clipping, or state-dict loading repair. It uses
@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from window_config import DEFAULT_WINDOW_EPOCHS, EPOCH_SAMPLES, FS, window_settings
+from diffusion_schedule import (build_diffusion_config, diffusion_settings,
+                                diffusion_identity, verify_diffusion_identity)
 
 DEFAULT_TRAINING_ARGS = dict(dataset="DREAMT_SIM", backbone="S4", beta_0=.0001, beta_T=.02,
     timesteps=200, hdim=64, lr=.0001, batch_size=1024, epochs=1000, layers=4,
@@ -82,11 +84,36 @@ def load_training_run(manifest_path):
                 "s4_dstate", "s4_dropout", "s4_bidirectional", "s4_layernorm", "propCycEnc"):
         if config[key] != DEFAULT_TRAINING_ARGS[key]:
             raise ValueError(f"This audit expects the planned strict model; {key} differs: {config[key]!r}")
+    # Historical manifests have no selector: explicitly restore linear, never
+    # the default of the current dataset JSON or a new training launcher.
+    config = dict(config, **diffusion_settings(config, default_schedule="linear"))
     model_args = SimpleNamespace(**config)
+    schedule_check = verify_diffusion_identity(model_args, manifest.get("diffusion_identity"))
     settings = _validate_frozen_window(model_args, _manifest_data_identity(manifest))
+    # The fallback correction changes the S4 operator even though state keys and
+    # tensor shapes are unchanged. Never silently reinterpret historical weights.
+    s4_source = "TSImputers/S4Model.py"
+    recorded_sources = manifest.get("source_sha256")
+    # Historical Windows launchers serialized Path keys with backslashes.
+    recorded_hashes = [value for key, value in recorded_sources.items()
+                       if isinstance(key, str) and key.replace("\\", "/") == s4_source] \
+        if isinstance(recorded_sources, dict) else []
+    if len(recorded_hashes) > 1 and any(value != recorded_hashes[0] for value in recorded_hashes[1:]):
+        raise ValueError("Conflicting recorded S4 source hashes for Windows/POSIX path aliases")
+    recorded_hash = recorded_hashes[0] if recorded_hashes else None
+    if not isinstance(recorded_hash, str) or len(recorded_hash) != 64:
+        raise ValueError("Training manifest must record source_sha256['TSImputers/S4Model.py']; "
+                         "the S4 implementation cannot be inferred safely from checkpoint tensor shapes")
+    actual_hash = sha256(ROOT / s4_source)
+    if recorded_hash != actual_hash:
+        raise ValueError("S4 implementation differs from the checkpoint's recorded training source. "
+                         "Use its original frozen workspace to reproduce historical results; "
+                         "do not silently load old fallback weights into the corrected kernel")
     info = dict(source="explicit run_manifest.training_args and data",
         manifest=str(manifest_path.resolve()), manifest_sha256=sha256(manifest_path),
-        supplied_training_args=config, frozen_window=settings, actual_training_duration_verified=False)
+        supplied_training_args=config, frozen_window=settings, diffusion_schedule=schedule_check,
+        s4_source_identity=dict(path=s4_source, recorded_sha256=recorded_hash, runtime_sha256=actual_hash, matched=True),
+        actual_training_duration_verified=False)
     return model_args, manifest, info
 
 
@@ -207,7 +234,7 @@ def main():
     import torch
     from torch import from_numpy, nn, sqrt
     from data_utils import Preprocessor
-    from training_utils import fetchModel, fetchDiffusionConfig
+    from training_utils import fetchModel
 
     torch.set_num_threads(args.threads)
     # Same seeds and construction order as official training. Preprocessor is
@@ -227,9 +254,9 @@ def main():
     # Preserve the original seeded constructor, then transfer every model tensor.
     model = fetchModel(input_features, 1, model_args).to(device)
     assert_cuda_model(model)
-    # Preserve upstream NumPy schedule values exactly; transfer once before use.
+    # Rebuild only the recorded training schedule; transfer once before use.
     diffusion = {key: value.to(device) if torch.is_tensor(value) else value
-                 for key, value in fetchDiffusionConfig(model_args).items()}
+                 for key, value in build_diffusion_config(model_args).items()}
     model.eval()
     checkpoint_before = sha256(args.checkpoint)
     saved = torch.load(args.checkpoint, map_location=device)
@@ -364,7 +391,7 @@ def main():
             for key, value in row.items():
                 if torch.is_tensor(value):
                     row[key] = float(value)
-    sources = {name: sha256(ROOT / name) for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "window_config.py",
+    sources = {name: sha256(ROOT / name) for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "window_config.py", "diffusion_schedule.py",
         "TSImputers/SSSDS4Imputer.py", "TSImputers/S4Model.py", "utils/util.py", "scripts/evaluate_denoising.py")}
     report = dict(status="passed", evaluation_type="teacher-forced conditional epsilon denoising; not free generation",
         protocol=dict(initialization_seed=42, evaluation_noise_seed=20261017, scenarios=list(scenarios),
@@ -383,10 +410,11 @@ def main():
                  "backend_overrides": False, "monkeypatch": False,
                  "compute_policy": "CUDA required; no CPU fallback",
                  "host_boundaries": ["file I/O and WatchSleepNet preprocessing",
-                     "original seeded constructor and exact diffusion schedule initialization",
+                      "original seeded constructor and recorded diffusion schedule initialization",
                      "final result serialization"]},
         checkpoint=str(args.checkpoint.resolve()), checkpoint_sha256=checkpoint_before,
         training_args=vars(model_args), config_provenance=config_provenance,
+        diffusion_identity=diffusion_identity(model_args, diffusion),
         checkpoint_identity=checkpoint_identity, training_data_identity_checks=data_identity_checks,
         windows=identities, columns=list(columns), scaler=preprocessor.scaler,
         data_provenance=preprocessor.provenance(), source_sha256=sources,

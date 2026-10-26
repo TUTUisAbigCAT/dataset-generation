@@ -1,8 +1,10 @@
-"""Diagonal Gaussian KL on all validation sequence samples.
+"""Mean paired-window Gaussian KL for validation IBI sequences.
 
-One row is a sequence sample; dim=0 estimates each time coordinate's mean and
-population variance across windows. All tensor arithmetic stays on the input
-device in float64. Production callers require CUDA; CPU supports unit tests.
+Each row is one independent window. Its mean and population variance are
+estimated over time (dim=1), then paired with the corresponding reference row.
+The aggregate is the mean of these univariate Gaussian KL values over windows.
+All tensor arithmetic stays on the input device in float64. Production callers
+require CUDA; CPU supports unit tests.
 """
 from __future__ import annotations
 
@@ -32,12 +34,12 @@ def _prepare_pair(generated_seconds, reference_seconds):
 
 
 class DistributionAccumulator:
-    """Merge batch moments into moments of ALL sequence samples, on device.
+    """Accumulate paired-window KL with equal weight per validation window.
 
-    Chan's centered-moment merge weights unequal batches by their window counts.
-    No generated waveform is retained after update. Only O(sequence length)
-    running tensors remain. Gaussian KL fits independent coordinate Gaussians to these ALL-window
-    moments; it does not estimate the full joint sequence distribution.
+    Compute moments within each window, never across windows. Accumulating a
+    scalar KL sum and a window count correctly weights unequal batches. No
+    waveform or moment vector is retained after update. This compares each
+    pair's amplitude moments, not its temporal ordering or joint distribution.
     """
     def __init__(self, *, kl_variance_floor_ms2=1.0):
         if (isinstance(kl_variance_floor_ms2, bool)
@@ -47,44 +49,23 @@ class DistributionAccumulator:
             raise ValueError("kl_variance_floor_ms2 must be a finite positive number")
         self.kl_variance_floor_ms2 = float(kl_variance_floor_ms2)
         self.count = 0
-        self.generated_mean = self.reference_mean = None
-        self.generated_m2 = self.reference_m2 = None
+        self.window_size = self.device = None
+        self.kl_sum = None
 
     @torch.no_grad()
     def update(self, generated_seconds, reference_seconds):
         generated, reference = _prepare_pair(generated_seconds, reference_seconds)
-        if self.count and (generated.shape[1] != self.generated_mean.numel()
-                           or generated.device != self.generated_mean.device):
+        if self.count and (generated.shape[1] != self.window_size
+                           or generated.device != self.device):
             raise ValueError("Batches must have the same feature dimension and device")
         batch_count = len(generated)
-        gen_var, gen_mean = torch.var_mean(generated, dim=0, unbiased=False)
-        ref_var, ref_mean = torch.var_mean(reference, dim=0, unbiased=False)
+        gen_var, gen_mean = torch.var_mean(generated, dim=1, unbiased=False)
+        ref_var, ref_mean = torch.var_mean(reference, dim=1, unbiased=False)
         if not bool(torch.isfinite(gen_var).all() & torch.isfinite(ref_var).all()
                     & torch.isfinite(gen_mean).all() & torch.isfinite(ref_mean).all()):
-            raise FloatingPointError("Nonfinite sequence-coordinate moments")
-        if self.count == 0:
-            self.generated_mean, self.reference_mean = gen_mean, ref_mean
-            self.generated_m2, self.reference_m2 = gen_var * batch_count, ref_var * batch_count
-        else:
-            total = self.count + batch_count
-            for prefix, mean, variance in (("generated", gen_mean, gen_var), ("reference", ref_mean, ref_var)):
-                old_mean = getattr(self, prefix + "_mean")
-                delta = mean - old_mean
-                m2 = (getattr(self, prefix + "_m2") + variance * batch_count
-                      + delta.square() * (self.count * batch_count / total))
-                setattr(self, prefix + "_mean", old_mean + delta * (batch_count / total))
-                setattr(self, prefix + "_m2", m2)
-        self.count += batch_count
-
-    @torch.no_grad()
-    def finalize(self):
-        if self.count == 0:
-            raise ValueError("Cannot summarize empty validation data")
-        gen_var = self.generated_m2 / self.count
-        ref_var = self.reference_m2 / self.count
-        # KL(real || generated), in nats, for fitted diagonal Gaussians. The
-        # lower bound changes only the KL approximation, never the waveforms
-        # or the stored moments.
+            raise FloatingPointError("Nonfinite within-window moments")
+        # One KL(real || generated) per corresponding pair of windows. The
+        # lower bound regularizes the fitted variances, not the waveforms.
         kl_gen_var = gen_var.clamp_min(self.kl_variance_floor_ms2)
         kl_ref_var = ref_var.clamp_min(self.kl_variance_floor_ms2)
         relative_change = (kl_ref_var - kl_gen_var) / kl_gen_var
@@ -97,20 +78,32 @@ class DistributionAccumulator:
         log_ratio = kl_ref_var.log() - kl_gen_var.log()
         general = kl_ref_var / kl_gen_var - 1.0 - log_ratio
         variance_term = torch.where(relative_change.abs() <= 1e-4, near_equal, general).clamp_min(0.0)
-        mean_term = ((self.reference_mean - self.generated_mean) / kl_gen_var.sqrt()).square()
-        gaussian_kl = (0.5 * variance_term + 0.5 * mean_term).sum()
-        if not bool(torch.isfinite(gaussian_kl)):
-            raise FloatingPointError("Nonfinite diagonal Gaussian KL divergence")
-        return {"aggregate": {"gaussian_kl_real_to_generated": float(gaussian_kl)}}
+        mean_term = ((ref_mean - gen_mean) / kl_gen_var.sqrt()).square()
+        window_kl = 0.5 * variance_term + 0.5 * mean_term
+        batch_kl_sum = window_kl.sum()
+        total_kl = batch_kl_sum if self.count == 0 else self.kl_sum + batch_kl_sum
+        if not bool(torch.isfinite(window_kl).all() & torch.isfinite(total_kl)):
+            raise FloatingPointError("Nonfinite paired-window Gaussian KL divergence")
+        self.kl_sum = total_kl
+        self.window_size, self.device = generated.shape[1], generated.device
+        self.count += batch_count
+
+    @torch.no_grad()
+    def finalize(self):
+        if self.count == 0:
+            raise ValueError("Cannot summarize empty validation data")
+        mean_window_kl = self.kl_sum / self.count
+        return {"aggregate": {"gaussian_kl_real_to_generated": float(mean_window_kl)}}
 
 
 def summarize_distribution(generated_seconds, reference_seconds, *, kl_variance_floor_ms2=1.0):
-    """Compare [windows, time coordinates] using the same all-window estimator.
+    """Mean KL of same-index window pairs in [windows, time samples] tensors.
 
-    Inputs are seconds. Coordinate population variances use correction=0; for
-    one window they are zero. Stored zeros and negative generated values are not clipped.
-    Diagonal Gaussian KL(real || generated) sums over coordinates after fitting
-    their moments across all windows. The fixed variance floor is in ms squared.
+    Inputs are seconds. Each window's time samples determine its mean and
+    population variance (correction=0), even when there is just one window.
+    KL(real || generated) is computed for each pair of fitted univariate
+    Gaussians, then averaged equally over windows. Stored zeros and negative
+    generated values are not clipped; the variance floor is in ms squared.
     """
     accumulator = DistributionAccumulator(kl_variance_floor_ms2=kl_variance_floor_ms2)
     accumulator.update(generated_seconds, reference_seconds)

@@ -16,6 +16,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts import evaluate_denoising, evaluate_original_sampler
+from tests.test_posterior_noise import independent_corrected_pipeline
 
 
 class CudaEvaluatorPolicyTests(unittest.TestCase):
@@ -43,6 +44,20 @@ class CudaEvaluatorPolicyTests(unittest.TestCase):
         compile(noise, "upstream_noise", "exec")
         compile(compiled, "upstream_generation", "exec")
 
+    def test_corrected_sampler_changes_only_the_posterior_noise_coefficient(self):
+        noise, generation, compiled, provenance = evaluate_original_sampler.extract_corrected_pipeline()
+        expected_noise, expected_compiled = independent_corrected_pipeline()
+        self.assertEqual(noise, expected_noise)
+        self.assertEqual(ast.dump(ast.parse(compiled)), ast.dump(ast.parse(expected_compiled)))
+        self.assertEqual(compiled, "if True:\n    if True:\n" + generation)
+        self.assertTrue(provenance["upstream_snapshot_byte_identical"])
+        self.assertFalse(provenance["excerpts_byte_identical_to_upstream"])
+        self.assertTrue(provenance["sampler_expressions_edited"])
+        self.assertFalse(provenance["original_variance_times_noise_preserved"])
+        self.assertFalse(provenance["random_draws_added_or_removed"])
+        self.assertTrue(provenance["original_guidance_minus_0_1_gradient_preserved"])
+        self.assertEqual(provenance["posterior_noise_scale"], "sqrt_posterior_variance")
+
     def test_sampler_exec_uses_local_cuda_context(self):
         tree = ast.parse(Path(evaluate_original_sampler.__file__).read_text(encoding="utf-8"))
         matches = []
@@ -64,10 +79,10 @@ class CudaEvaluatorPolicyTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA hardware unavailable; not a GPU execution result")
-    def test_exact_sampler_tensor_factories_execute_on_cuda(self):
+    def test_corrected_sampler_tensor_factories_execute_on_cuda(self):
         from cuda_runtime import require_cuda
         device = require_cuda()
-        noise, _, compiled, _ = evaluate_original_sampler.extract_original_pipeline()
+        noise, _, compiled, _ = evaluate_original_sampler.extract_corrected_pipeline()
         args = SimpleNamespace(window_size=6, stride=3)
         windows = torch.zeros(2, 6, 2, device=device)
         windows[:, :, 1] = 1

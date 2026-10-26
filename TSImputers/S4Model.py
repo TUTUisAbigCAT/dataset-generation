@@ -84,26 +84,70 @@ try:  # Try pykeops
         )
 
         v, z, w = _broadcast_dims(v, z, w)
-        v = _c2r(v)
-        z = _c2r(z)
-        w = _c2r(w)
+        v = _c2r(v.resolve_conj().contiguous())
+        z = _c2r(z.resolve_conj().contiguous())
+        w = _c2r(w.resolve_conj().contiguous())
 
-        r = 2 * cauchy_mult(v, z, w, backend='GPU')
+        backend = 'GPU' if v.device.type == 'cuda' else 'CPU'
+        r = 2 * cauchy_mult(v, z, w, backend=backend)
         return _r2c(r)
 
 except ImportError:
     has_pykeops = False
-    if not has_cauchy_extension:
-        print("Falling back on slow Cauchy kernel. Install at least one of pykeops or the CUDA extension for efficiency.")
 
-        def cauchy_slow(v, z, w):
-            """
-            v, w: (..., N)
-            z: (..., L)
-            returns: (..., L)
-            """
-            cauchy_matrix = v.unsqueeze(-1) / (z.unsqueeze(-2) - w.unsqueeze(-1))  # (... N L)
-            return torch.sum(cauchy_matrix, dim=-2)
+
+def cauchy_slow(v, z, w):
+    """Full conjugate-state resolvent in PyTorch, on the input device.
+
+    v, w: (..., N); z: (..., L); returns: (..., L).
+    S4 stores only half the states, so both conjugate terms are required.
+    This fallback is always available, including when accelerators are installed.
+    """
+    v = torch.cat([v, v.conj()], dim=-1)
+    w = torch.cat([w, w.conj()], dim=-1)
+    cauchy_matrix = v.unsqueeze(-1) / (z.unsqueeze(-2) - w.unsqueeze(-1))
+    return torch.sum(cauchy_matrix, dim=-2)
+
+
+def cauchy_resolvent(v, z, w):
+    """Select a compatible backend without changing precision or device."""
+    if not all(torch.is_tensor(t) for t in (v, z, w)):
+        raise TypeError("Cauchy inputs v, z and w must be tensors")
+    if v.dtype not in (torch.complex64, torch.complex128) or not (v.dtype == z.dtype == w.dtype):
+        raise TypeError("Cauchy inputs must have the same complex64 or complex128 dtype")
+    if not (v.device == z.device == w.device):
+        raise ValueError("Cauchy inputs must be on the same device")
+    if v.device.type not in ("cpu", "cuda"):
+        raise ValueError("Cauchy inputs must be on CPU or CUDA")
+    if any(t.ndim < 1 or t.shape[-1] == 0 for t in (v, z, w)):
+        raise ValueError("Cauchy state and frequency dimensions must be nonempty")
+    if v.shape[-1] != w.shape[-1]:
+        raise ValueError("Cauchy v and w must have the same state dimension")
+    try:
+        torch.broadcast_shapes(v.shape[:-1], z.shape[:-1], w.shape[:-1])
+    except RuntimeError as exc:
+        raise ValueError("Cauchy input batch dimensions must broadcast") from exc
+
+    if v.device.type == "cpu":
+        return cauchy_slow(v, z, w)
+
+    # The optional CUDA kernel supports float32 complex states, an unbatched z,
+    # and power-of-two state counts. Its backward does not provide a z gradient.
+    n = v.shape[-1]
+    extension_compatible = (
+        v.dtype == torch.complex64 and z.ndim == 1 and not z.requires_grad
+        and 2 <= n <= 1024 and n & (n - 1) == 0 and z.numel() <= 2**31
+    )
+    if has_cauchy_extension and extension_compatible:
+        with torch.cuda.device(v.device):
+            return cauchy_mult(v.resolve_conj().contiguous(), z.resolve_conj().contiguous(),
+                               w.resolve_conj().contiguous(), symmetric=True)
+    if has_pykeops:
+        with torch.cuda.device(v.device):
+            return cauchy_conj(v.resolve_conj().contiguous(), z.resolve_conj().contiguous(),
+                               w.resolve_conj().contiguous())
+    # CUDA tensors stay on CUDA here; no host copy or dtype conversion.
+    return cauchy_slow(v, z, w)
 
 
 def _broadcast_dims(*tensors):
@@ -686,12 +730,7 @@ class SSKernelNPLR(nn.Module):
         # z = z[None, None, None, ...]  # (1, 1, 1, L)
 
         # Calculate resolvent at omega
-        if has_cauchy_extension and z.dtype == torch.cfloat:
-            r = cauchy_mult(v, z, w, symmetric=True)
-        elif has_pykeops:
-            r = cauchy_conj(v, z, w)
-        else:
-            r = cauchy_slow(v, z, w)
+        r = cauchy_resolvent(v, z, w)
         r = r * dt[None, None, :, None]  # (S+1+R, C+R, H, L)
 
         # Low-rank Woodbury correction

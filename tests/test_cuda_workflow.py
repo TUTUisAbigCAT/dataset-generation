@@ -113,6 +113,9 @@ class CudaWorkflowTests(unittest.TestCase):
             report = json.loads((output / "cuda_smoke_report.json").read_text(encoding="utf-8"))
             self.assertEqual(report["status"], "cuda_workflow_passed")
             self.assertTrue(all(device.startswith("cuda:") for device in report["devices"].values()))
+            self.assertTrue(report["upstream_snapshot_byte_identical"])
+            self.assertTrue(report["posterior_variance_sqrt_corrected"])
+            self.assertIn("corrected_200_step_generation", report["stages"])
 
 if __name__ == "__main__":
     unittest.main()

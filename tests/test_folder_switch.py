@@ -123,6 +123,7 @@ class FolderSwitchTests(unittest.TestCase):
         checkpoint = run / "digest_fixture.bin"
         checkpoint.write_bytes(b"Data-only unit-test digest fixture; not model weights.")
         manifest = dict(training_args=dict(helpers.DEFAULT_TRAINING_ARGS, dataset="DREAMT", batch_size=2, epochs=1),
+                        source_sha256={"TSImputers/S4Model.py": hashlib.sha256((ROOT / "TSImputers/S4Model.py").read_bytes()).hexdigest()},
                         data_identity=processor.data_identity(), checkpoint=str(checkpoint),
                         checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
                         test_fixture_not_a_training_result=True)

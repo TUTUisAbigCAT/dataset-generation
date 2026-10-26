@@ -1,10 +1,11 @@
-"""Independent validation windows through the unchanged WaveStitch sampler.
+"""Independent validation windows through the corrected WaveStitch sampler.
 
 The adapter supplies clean conditions and an entirely unknown IBI channel to
-the verified upstream generation block. A full-window inference stride makes
+the verified upstream block with the posterior-variance square-root fix.
+A full-window inference stride makes
 the overlap slices empty, so unrelated validation windows are never stitched.
-Training arguments, schedules, model parameters, and the sampler algebra are
-unchanged. The caller owns the separate evaluation model and RNG isolation.
+Training arguments, schedules, model parameters and guidance stay unchanged.
+The caller owns the separate evaluation model and RNG isolation.
 """
 from __future__ import annotations
 
@@ -18,14 +19,15 @@ from types import SimpleNamespace
 import torch
 
 from window_config import EPOCH_SAMPLES
+from diffusion_schedule import validate_diffusion_config, diffusion_identity
 
 
 @lru_cache(maxsize=1)
-def _original_sampler():
-    """Verify and compile the byte-identical upstream source once per process."""
-    from scripts.evaluate_original_sampler import SOURCE, extract_original_pipeline
+def _corrected_sampler():
+    """Verify the upstream snapshot and compile the corrected runtime excerpt."""
+    from scripts.evaluate_original_sampler import SOURCE, extract_corrected_pipeline
 
-    noise, _, generation, provenance = extract_original_pipeline()
+    noise, _, generation, provenance = extract_corrected_pipeline()
     return (compile(noise, str(SOURCE), "exec"),
             compile(generation, str(SOURCE), "exec"), provenance)
 
@@ -60,6 +62,10 @@ def _validate_inputs(model, clean_windows, diffusion_config, training_args, devi
                 or value.dtype != torch.float32 or value.device != device
                 or not bool(torch.isfinite(value).all())):
             raise ValueError(f"Invalid training diffusion schedule tensor: {name}")
+    # Production arguments always carry both beta endpoints. Tiny test-only
+    # denoisers may supply a complete schedule directly without CLI metadata.
+    if hasattr(args, "beta_0") and hasattr(args, "beta_T"):
+        validate_diffusion_config(args, diffusion_config)
     if torch.is_inference_mode_enabled():
         raise RuntimeError("The original sampler requires autograd for its unchanged guidance expression")
     return args
@@ -78,7 +84,7 @@ def _sample_windows_from_original(model, clean_windows, diffusion_config, traini
     windows = clean_windows.detach().clone()
     windows[:, :, 0] = 0.0
     masks = torch.ones(windows.shape[:2], dtype=torch.bool, device=device)
-    noise_code, generation_code, provenance = _original_sampler()
+    noise_code, generation_code, provenance = _corrected_sampler()
     scope = dict(
         torch=torch, sqrt=torch.sqrt, args=args, device=device, model=model,
         diffusion_config=diffusion_config,
@@ -107,7 +113,7 @@ def _sample_windows_from_original(model, clean_windows, diffusion_config, traini
             raise RuntimeError("Original validation sampler did not execute every training diffusion step")
         metadata = {
             "source_provenance": deepcopy(provenance),
-            "sampler": "byte_identical_upstream_pipeline",
+            "sampler": "upstream_pipeline_posterior_std_corrected",
             "diffusion_steps": diffusion_config["T"],
             "denoiser_calls": int(scope["num_ops"]),
             "windows": len(windows),
@@ -124,6 +130,8 @@ def _sample_windows_from_original(model, clean_windows, diffusion_config, traini
             "clipping_applied": False,
             "device": str(device),
         }
+        if hasattr(args, "beta_0") and hasattr(args, "beta_T"):
+            metadata["diffusion_identity"] = diffusion_identity(args, diffusion_config)
         return generated[:, :, 0], metadata
     finally:
         # The exec-defined function refers to this scope; break that cycle so
@@ -135,7 +143,7 @@ def sample_validation_windows(model, clean_windows, diffusion_config, training_a
     """Return (standardized IBI [B, window_epochs * 750], provenance) using CUDA only.
 
     clean_windows contains the real validation IBI and nine clean condition
-    columns. Its IBI values are removed before the original sampler sees the
+    columns. Its IBI values are removed before the corrected sampler sees the
     input. Supply the *training* diffusion_config without rescheduling it.
     """
     from cuda_runtime import assert_cuda_model, require_cuda
