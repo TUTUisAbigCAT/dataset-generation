@@ -251,7 +251,7 @@ python scripts/evaluate_original_sampler.py \
 
 ## CUDA 执行范围
 
-生产计算入口强制检查 CUDA；没有可用 GPU、安装了 CPU 版 Torch 或设备初始化失败，会直接报错，不会回退 CPU。模型参数、buffer、训练随机数、条件 mask、时间步、前向/反向、损失、去噪重建、采样及评估张量运算在同一 CUDA 设备上。运行报告记录实际设备、GPU 名称和 Torch / CUDA / cuDNN 版本。
+生产计算入口强制检查 CUDA；没有可用 GPU、安装了 CPU 版 Torch 或设备初始化失败，会直接报错，不会回退 CPU。模型参数、buffer、条件 mask、时间步、前向/反向、损失、去噪状态及评估张量运算在同一 CUDA 设备上。原采样器的 torch.normal 工厂存在例外：已检查的 PyTorch 版本中，它不会被 torch.device 上下文迁移，仍先在 CPU 生成噪声，再转入 CUDA。诊断会记录实际设备，保留这一路径以控制随机数对照。运行报告记录实际设备、GPU 名称和 Torch / CUDA / cuDNN 版本。
 
 主机负责文件读写、WatchSleepNet 数据预处理、标签和索引元数据、原 seed42 模型初始化、NumPy 扩散表初始化及最终序列化；模型和扩散表在计算前整体转入 GPU。原 Adam 控制计数器允许留在主机，以保留原优化器配置。
 
@@ -286,7 +286,7 @@ python -B scripts/audit_watchsleep_chain.py --output-dir runs/chain_audit
 
 原数据链路回归检查覆盖 25 Hz 与 100 Hz 输入的 epoch 信号和标签、四段拼接的九个条件通道及反归一化。新增测试覆盖旧线性日程逐bit兼容、新日程端点与身份核对、逐窗口均值/总体方差及配对 KL、短 batch 按窗口数汇总、最后一轮验证、固定窗口、随机状态恢复、模型副本，以及后验方差平方根和重叠窗口独立存储修正后的完整 200 步采样。缺少 CUDA 时，真实 GPU 测试会显式跳过，不能视为通过。
 
-12 份 WaveStitch 上游快照逐字未改；5 个导入核心文件中，4 个逐字未改，`TSImputers/S4Model.py` 仅允许上述共轭回退与设备/精度分派的三块精确替换。移除允许的数据适配、外部日程导入/配置、设备适配、epoch 验证/日志和早停分支后，训练循环与上游相同。源码检查器还独立比较原始与运行时采样片段，仅允许给完整后验方差项加一次 `torch.sqrt`，以及在噪声函数返回前使用 `.clone()` 分离重叠窗口的可写存储；噪声的重叠数值和随机数调用保持一致。直接在 CUDA 上创建的 `unfold` 视图不会被 `.to(device)` 复制，若不显式复制，窗口更新会互相覆盖并导致 stitching loss 错误归零；日程数组由明确记录的外部适配器提供。该检查不执行采样。检查器可重新生成详细报告；本机历史运行日志和机器路径未纳入公共仓库。
+12 份 WaveStitch 上游快照逐字未改；5 个导入核心文件中，4 个逐字未改，`TSImputers/S4Model.py` 仅允许上述共轭回退与设备/精度分派的三块精确替换。移除允许的数据适配、外部日程导入/配置、设备适配、epoch 验证/日志和早停分支后，训练循环与上游相同。源码检查器还独立比较原始与运行时采样片段，仅允许给完整后验方差项加一次 `torch.sqrt`，以及在噪声函数返回前使用 `.clone()` 分离重叠窗口的可写存储；噪声的重叠数值和随机数调用保持一致。同设备、不发生复制时，`unfold` 视图的重叠存储会互相覆盖；CPU 小模型实验验证了这一问题。但现有 CUDA 路径中的 `torch.normal` 先在 CPU 生成噪声，再通过 `.to(cuda)` 复制，已分离可写存储，因此额外 `.clone()` 可以保持输出逐位相同。不能据此断言旧集群输出受该共享存储问题影响。日程数组由明确记录的外部适配器提供。该检查不执行采样。检查器可重新生成详细报告；本机历史运行日志和机器路径未纳入公共仓库。
 
 目前尚未完成 Fir GPU 实测，也未用真实 DREAMT 数据验证生成质量。人工短记录和接口测试不能证明收敛，跳过的 GPU 测试不能视为通过。请在已分配的 GPU 计算节点上执行上述 `check_cuda.py` 和 `smoke_cuda.py` 后再进行正式训练。
 
@@ -346,3 +346,42 @@ sbatch submit_inference.sh
 脚本沿用 `def-plago`、1 张 GPU、4 核 CPU、10 小时及现有 modules/`.venv`，固定工作目录为 `/project/def-plago/yxtao/dataset-generation`。权重直接使用 `/home/yxtao/links/scratch/dataset-generation/runs/dreamt_20261026T234653_562786Z/training/best_kl_model.pth`，配置使用项目中的 `dataset_config.json`。更换权重或配置时直接修改脚本中的路径。
 
 结果保存到 `/home/yxtao/links/scratch/dataset-generation/runs/S092_generated_<job_id>`，日志为 `/home/yxtao/links/scratch/dataset-generation/logs/inference_s092_<job_id>.txt`。CLI 会按生成组打印进度。
+
+## S092 生成诊断：按顺序排查
+
+`scripts/diagnose_generation.py` 固定 checkpoint，依次检查配置、同条件多次采样、条件响应和整晚续接。训练网络、日程和生产采样器不做改动。
+
+1. **训练与推理身份核对**：比较模型结构、实际扩散表、训练集 NPZ/metadata 内容、split、scaler、输入通道及核心源码；用 `validation/summary.json` 或训练记录中的 best-KL 摘要核对实际权重字节。证据缺失为 `incomplete`，不一致为 `mismatch`，两者均停止后续采样。路径搬迁、训练 batch size 等非推理设置单独记录；最终模型 hash 不作为 best 权重的替代证明。
+2. **同条件独立窗口**：依据标签为每个存在的阶段选一个代表窗口；每个窗口固定条件，以 8 个 seed 独立生成，记录每次均值、方差、KL，以及多次采样均值的波动。也可用 `--window-start-epochs` 指定窗口起点（从 0 开始）。
+3. **固定噪声替换条件**：固定整个采样过程的 CPU/CUDA 随机流，分别替换四类 stage、AHI/BMI/AGE 的 ±1 个训练集标准差、以及性别。先重复 baseline 检验确定性，再记录生成响应和固定 x_t 下的噪声预测响应。超出基本合法范围的条件跳过并报告，不裁剪。响应存在只说明模型使用了条件，不能证明响应正确；反事实条件也没有对应的真实信号作为质量真值。
+4. **独立窗口与整晚续接**：同一整晚条件分别执行独立窗口生成、当前重叠续接，各做 3 个 seed。使用完全相同的评估窗口计算均值、方差和逐窗口高斯 KL，保留全部原始输出。两分支的随机调用形状不同，因此不能把同 seed 称为完全配对的噪声轨迹，也不以逐点重建真实信号作为成功标准。
+
+诊断专用入口读取已有 `training/run_manifest.json`，只用于第一步核对；普通 `generate_night.py` 仍只需要 `.pth` 与数据配置，不要求 manifest。这里也不需要不存在的 `best_kl_manifest.json`。诊断默认不自动修正不一致配置、不重新训练、不改变噪声生成设备、不裁剪负 IBI。
+
+完整路径已写入 `submit_diagnostics.sh`，包括训练 `dreamt_20261026T234653_562786Z` 的 best 权重、现有训练记录及生成任务 `S092_generated_1179820` 的 summary：
+
+```bash
+cd /project/def-plago/yxtao/dataset-generation
+mkdir -p /home/yxtao/links/scratch/dataset-generation/logs
+sbatch submit_diagnostics.sh
+```
+
+结果目录为 `/home/yxtao/links/scratch/dataset-generation/runs/S092_diagnostics_<job_id>`。主要文件：
+
+- `config_audit.json`：每项配置证据、状态与差异；未通过时优先查看此文件。
+- `summary.json`：各阶段结论数据、随机数/设备记录、权重与源码摘要、原始输出位置；完成只表示诊断执行结束，不代表生成质量通过。
+- `same_conditions_rows.csv`、`same_conditions_between_draw_rows.csv`：固定条件多次生成及随机波动。
+- `changed_conditions_rows.csv`、`changed_conditions_epsilon_rows.csv`：条件干预的生成响应和去噪器响应。反事实行与原参考的 KL 只作数值记录，不作为该反事实的准确性评分。
+- `independent_vs_continued_rows.csv`、`independent_vs_continued_comparison_rows.csv`、`independent_vs_continued_window_rows.csv`：整夜、分支差异及时间窗口统计。
+- `diagnostics.npz`：秒单位的原始生成序列、条件和参考；跳过的条件槽位为 NaN，须结合 `condition_variant_valid` 使用。负值原样保留，不能直接当作通过生理校验的数据集导出。
+
+可先在登录节点执行身份核对，不构造模型或使用 GPU：
+
+```bash
+python scripts/diagnose_generation.py \
+  --checkpoint /absolute/path/to/training/best_kl_model.pth \
+  --config dataset_config.json --subject S092 \
+  --check-only --output-dir runs/S092_diagnostic_check
+```
+
+该命令默认从权重同目录读取 `run_manifest.json`、`validation/summary.json`；`--training-manifest`、`--validation-summary` 可显式指定，`--inference-summary` 可额外核对历史生成任务。每次使用新输出目录。实际采样强制 CUDA，本地 CPU 人工小模型测试仅验证诊断实现，不能代替真实 checkpoint 的集群实验。

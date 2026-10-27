@@ -44,11 +44,27 @@ class CudaEvaluatorPolicyTests(unittest.TestCase):
         compile(noise, "upstream_noise", "exec")
         compile(compiled, "upstream_generation", "exec")
 
-    def test_corrected_sampler_changes_only_the_posterior_noise_coefficient(self):
+    def test_corrected_sampler_has_only_the_two_authorized_corrections(self):
         noise, generation, compiled, provenance = evaluate_original_sampler.extract_corrected_pipeline()
         expected_noise, expected_compiled = independent_corrected_pipeline()
+        self.assertEqual(expected_noise.count("return sampled_noise"), 1)
+        expected_noise = expected_noise.replace("return sampled_noise", "return sampled_noise.clone()")
         self.assertEqual(noise, expected_noise)
-        self.assertEqual(ast.dump(ast.parse(compiled)), ast.dump(ast.parse(expected_compiled)))
+        self.assertTrue(provenance["pipelined_noise_windows_materialized"])
+        # The CPU numerical reference materializes three .to(cpu) transfers.
+        # Runtime materializes the noise inside its helper instead.
+        expected_tree = ast.parse(expected_compiled)
+        transfers = 0
+        for node in ast.walk(expected_tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "to" and isinstance(node.func.value, ast.Call)
+                    and isinstance(node.func.value.func, ast.Name)
+                    and node.func.value.func.id == "create_pipelined_noise"):
+                self.assertEqual([(k.arg, ast.literal_eval(k.value)) for k in node.keywords], [("copy", True)])
+                node.keywords = []
+                transfers += 1
+        self.assertEqual(transfers, 3)
+        self.assertEqual(ast.dump(ast.parse(compiled)), ast.dump(expected_tree))
         self.assertEqual(compiled, "if True:\n    if True:\n" + generation)
         self.assertTrue(provenance["upstream_snapshot_byte_identical"])
         self.assertFalse(provenance["excerpts_byte_identical_to_upstream"])
@@ -79,7 +95,7 @@ class CudaEvaluatorPolicyTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA hardware unavailable; not a GPU execution result")
-    def test_corrected_sampler_tensor_factories_execute_on_cuda(self):
+    def test_corrected_sampler_reverse_state_and_model_execute_on_cuda(self):
         from cuda_runtime import require_cuda
         device = require_cuda()
         noise, _, compiled, _ = evaluate_original_sampler.extract_corrected_pipeline()
