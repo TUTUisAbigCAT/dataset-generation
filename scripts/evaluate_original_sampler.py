@@ -109,13 +109,21 @@ def extract_original_pipeline():
 
 
 def extract_corrected_pipeline():
-    """Apply the single authorized posterior-standard-deviation correction.
+    """Correct posterior standard deviation and writable overlapping-window storage.
 
     Keep the vendored source and manifest intact for reproducibility. Every
     production sampling entry point uses this function; the raw extractor is
     retained only for source audits and regression comparisons.
     """
-    noise_source, original_generation, _, original_provenance = extract_original_pipeline()
+    original_noise, original_generation, _, original_provenance = extract_original_pipeline()
+    # unfold returns an overlapping view. The upstream CPU-to-CUDA transfer
+    # materialized its windows; direct CUDA factories make .to(device) a no-op.
+    # Retain shared overlap VALUES while giving each window independent writes.
+    noise_before = 'return sampled_noise'
+    noise_after = 'return sampled_noise.clone()'
+    if original_noise.count(noise_before) != 1:
+        raise RuntimeError('Expected exactly one pipelined-noise return')
+    noise_source = original_noise.replace(noise_before, noise_after, 1)
     before = 'vari = beta_t * ((1 - alpha_bar_t_1) / (1 - alpha_bar_t)) * torch.normal'
     after = 'vari = torch.sqrt(beta_t * ((1 - alpha_bar_t_1) / (1 - alpha_bar_t))) * torch.normal'
     if original_generation.count(before) != 1:
@@ -132,6 +140,9 @@ def extract_corrected_pipeline():
     provenance = dict(original_provenance)
     provenance.update(
         upstream_snapshot_byte_identical=True,
+        upstream_noise_function_sha256=original_provenance['noise_function_sha256'],
+        noise_function_sha256=digest(noise_source.encode('utf-8')),
+        pipelined_noise_windows_materialized=True,
         upstream_generation_block_sha256=original_provenance['generation_block_sha256'],
         upstream_ddpm_for_step_sha256=original_provenance['ddpm_for_step_sha256'],
         generation_block_sha256=digest(generation_source.encode('utf-8')),
@@ -141,7 +152,9 @@ def extract_corrected_pipeline():
         sampler_expressions_edited=True,
         original_variance_times_noise_preserved=False,
         posterior_noise_scale='sqrt_posterior_variance',
-        runtime_corrections=[dict(id='posterior_variance_to_std', before=before, after=after)],
+        runtime_corrections=[dict(id='posterior_variance_to_std', before=before, after=after),
+                            dict(id='pipelined_noise_independent_storage',
+                                 before=noise_before, after=noise_after)],
     )
     return noise_source, generation_source, compiled_source, provenance
 
@@ -232,7 +245,7 @@ def main():
     try:
         noise_source, generation_source, compiled_source, provenance = extract_corrected_pipeline()
         report['source_provenance'] = provenance
-        (cli.output_dir / 'original_create_pipelined_noise.py').write_bytes(noise_source.encode('utf-8'))
+        (cli.output_dir / 'corrected_create_pipelined_noise.py').write_bytes(noise_source.encode('utf-8'))
         (cli.output_dir / 'corrected_generation_block.py.txt').write_bytes(generation_source.encode('utf-8'))
         save_report()
         if cli.extract_only:

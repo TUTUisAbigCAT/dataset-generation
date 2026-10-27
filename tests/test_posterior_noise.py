@@ -23,7 +23,14 @@ def independent_corrected_pipeline():
     noise, _, compiled, _ = evaluate_original_sampler.extract_original_pipeline()
     tree = ast.parse(compiled)
     replacements = 0
+    transfers = 0
     for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "to" and isinstance(node.func.value, ast.Call)
+                and isinstance(node.func.value.func, ast.Name)
+                and node.func.value.func.id == "create_pipelined_noise"):
+            node.keywords.append(ast.keyword(arg="copy", value=ast.Constant(True)))
+            transfers += 1
         if (isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "vari"
                 and isinstance(node.value, ast.BinOp) and isinstance(node.value.op, ast.Mult)):
@@ -32,8 +39,8 @@ def independent_corrected_pipeline():
                                    attr="sqrt", ctx=ast.Load()),
                 args=[node.value.left], keywords=[])
             replacements += 1
-    if replacements != 1:
-        raise AssertionError("Expected exactly one posterior-noise coefficient")
+    if replacements != 1 or transfers != 3:
+        raise AssertionError("Expected one posterior coefficient and three materializing noise transfers")
     return noise, ast.unparse(ast.fix_missing_locations(tree))
 
 

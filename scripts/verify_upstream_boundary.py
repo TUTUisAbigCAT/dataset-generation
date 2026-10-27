@@ -243,7 +243,7 @@ def normalized_training_loop(tree):
 
 
 def audit_runtime_sampler():
-    """Allow only sqrt(posterior variance); do not execute the sampler."""
+    """Allow only posterior sqrt and independent noise-window storage; do not sample."""
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     from scripts.evaluate_original_sampler import extract_original_pipeline, extract_corrected_pipeline
@@ -254,7 +254,9 @@ def audit_runtime_sampler():
     after = "torch.sqrt(beta_t * ((1 - alpha_bar_t_1) / (1 - alpha_bar_t))) * torch.normal("
     assert original_generation.count(before) == 1, "Posterior-noise correction must have one upstream target"
     assert original_compiled.count(before) == 1, "Compiled sampler correction target is ambiguous"
-    assert noise == original_noise, "Sampler noise function or random draws changed"
+    noise_before, noise_after = "return sampled_noise", "return sampled_noise.clone()"
+    assert original_noise.count(noise_before) == 1, "Noise storage correction target is ambiguous"
+    assert noise == original_noise.replace(noise_before, noise_after, 1), "Noise changed beyond window storage materialization"
     assert generation == original_generation.replace(before, after, 1), "Sampler changed beyond the authorized posterior-variance square root"
     assert compiled == original_compiled.replace(before, after, 1), "Executable sampler differs from the authorized correction"
     compile(compiled, "<audited_corrected_sampler>", "exec")
@@ -267,16 +269,19 @@ def audit_runtime_sampler():
                           original_variance_times_noise_preserved=False,
                           upstream_snapshot_byte_identical=True,
                           posterior_noise_scale="sqrt_posterior_variance",
-                          random_draws_added_or_removed=False)
+                          random_draws_added_or_removed=False,
+                          pipelined_noise_windows_materialized=True)
     for key, expected in expected_flags.items():
         assert provenance[key] == expected, f"Incorrect corrected-sampler provenance: {key}"
     return dict(upstream_snapshot_byte_identical=True,
                 runtime_sampler_source_byte_identical=False,
-                runtime_sampler_single_sqrt_correction_verified=True,
+                runtime_sampler_corrections_verified=True,
+                pipelined_noise_windows_materialized=True,
                 posterior_variance_sqrt_corrected=True,
                 posterior_noise_scale="sqrt_posterior_variance",
                 random_draws_added_or_removed=False,
-                authorized_sampler_edit=dict(before=before, after=after),
+                authorized_sampler_edits=[dict(before=before, after=after),
+                                          dict(before=noise_before, after=noise_after)],
                 original_sampler_generation_sha256=hashlib.sha256(original_generation.encode("utf-8")).hexdigest(),
                 runtime_sampler_generation_sha256=hashlib.sha256(generation.encode("utf-8")).hexdigest())
 
@@ -358,7 +363,8 @@ def main():
         "imported_core_byte_identical", "training_loop_ast_identical",
         "training_loop_ast_identical_after_allowed_normalization",
         "optimizer_loss_diffusion_formulas_and_update_order_unchanged",
-        "runtime_sampler_single_sqrt_correction_verified",
+        "runtime_sampler_corrections_verified",
+        "pipelined_noise_windows_materialized",
         "upstream_snapshot_byte_identical")}, indent=2))
 
 
