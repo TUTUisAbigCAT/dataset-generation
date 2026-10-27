@@ -289,3 +289,46 @@ python -B scripts/audit_watchsleep_chain.py --output-dir runs/chain_audit
 12 份 WaveStitch 上游快照逐字未改；5 个导入核心文件中，4 个逐字未改，`TSImputers/S4Model.py` 仅允许上述共轭回退与设备/精度分派的三块精确替换。移除允许的数据适配、外部日程导入/配置、设备适配、epoch 验证/日志和早停分支后，训练循环与上游相同。源码检查器还独立比较原始与运行时采样片段，仅允许给完整后验方差项加一次 `torch.sqrt`，其余代码和随机数调用必须一致；日程数组由明确记录的外部适配器提供。该检查不执行采样。检查器可重新生成详细报告；本机历史运行日志和机器路径未纳入公共仓库。
 
 目前尚未完成 Fir GPU 实测，也未用真实 DREAMT 数据验证生成质量。人工短记录和接口测试不能证明收敛，跳过的 GPU 测试不能视为通过。请在已分配的 GPU 计算节点上执行上述 `check_cuda.py` 和 `smoke_cuda.py` 后再进行正式训练。
+
+## 使用 S092 条件生成整夜 IBI
+
+`scripts/generate_night.py` 使用已有训练权重，以指定受试者的整夜睡眠阶段和 AHI/BMI/AGE/GENDER 为条件生成 IBI。默认受试者为 `S092`，ID 不区分大小写。真实 IBI 不传入采样器；生成结果不表示对该受试者真实波形的重建，也尚未经过真实 DREAMT 整夜质量验证。
+
+先检查训练文件、checkpoint 哈希、数据身份、受试者条件及整夜生成计划；这一步不运行模型，无需 GPU：
+
+```bash
+python scripts/generate_night.py \
+  --run-manifest /path/to/run/training/best_kl_manifest.json \
+  --subject S092 \
+  --check-only \
+  --output-dir /path/to/S092_plan
+```
+
+然后在已分配 GPU 的计算节点执行：
+
+```bash
+python scripts/generate_night.py \
+  --run-manifest /path/to/run/training/best_kl_manifest.json \
+  --subject S092 \
+  --seed 42 \
+  --threads 4 \
+  --stride-epochs 1 \
+  --windows-per-group 4 \
+  --output-dir /path/to/S092_generated
+```
+
+每次命令必须使用新输出目录。`--training-args-json` 是 `--run-manifest` 的别名；最终权重使用 `run_manifest.json`，最佳 KL 权重使用配套 `best_kl_manifest.json`。`--checkpoint` 仅用于指定同一权重的另一文件位置，哈希必须与所选 manifest 相符。训练数据目录、metadata、split 和 scaler 由 manifest 恢复并核验，当前 `dataset_config.json` 不覆盖这些记录；原训练数据文件仍需可访问。历史 S4 实现与当前源码不同的 checkpoint 会明确拒绝，不能通过改 hash 强行加载。
+
+窗口长度 K、网络和扩散日程保持训练记录；默认每隔一个 30 秒 epoch 取窗，每组最多 4 个窗口。组内保留重叠指导，后组使用已生成的前缀作为上下文，按对应扩散时间步投影已知前缀。最后一组按实际剩余长度安排并仅追加新样本，不用真实 IBI 作锚点。这是独立的整夜续接采样入口，区别于原来的单组验证采样；分组续接本身不能保证接缝或生理质量。CLI 按组输出 JSON 进度，便于查看 Slurm 日志。
+
+模型以 seed42 和 manifest 中记录的线程数构造（旧记录缺失时用 2），严格核对固定 S4 buffers 后才应用 `--seed` 和采样线程数。正式推理强制 CUDA，不会回退 CPU；相同 seed 不保证不同 GPU、软件版本或 S4 后端之间逐位相同。
+
+这里“整夜”指文件内全部完整 30 秒 epoch，忽略训练时的 `max_epochs` 上限。尾部不足 30 秒的采样点不生成，数量记入 summary。已知时间缺口、未知或段内不一致的阶段标签会报错，不会跳过后拼接成伪连续记录；没有时间轴的文件只能按存储顺序续接。明确请求的受试者可以来自 test split，推理读取不改变划分，也不重新拟合归一化参数。
+
+成功后输出：
+
+- `S092.npz`：`data` 为 25 Hz、秒单位的生成 IBI；`stages` 保留源五类标签并逐点对齐；另含 `fs`、`ahi`、`synthetic=True` 和可用时间轴。Light 条件不区分 N1/N2，保留这两个源标签不代表模型独立生成了两类。
+- `participant_info.csv`：源 metadata 中该 SID 的一行，保留其他列。
+- `summary.json`：训练/数据/源码/日程/checkpoint 身份、初始化与采样 seed、窗口计划、覆盖范围、耗时及输出统计。
+
+读取生成 NPZ 时使用 `multiplier=1`、`downsample_rate=1`。采样器返回的生成序列导出检查失败时，例如存在非有限数、负值或不能表示为有限 float32 的数值，脚本保存未裁剪的 `diagnostic_generated.npz` 与失败 summary，不输出有效的受试者 NPZ。若采样过程中已因非有限中间值等错误中止，只保证保存失败 summary，不保证存在原始数值诊断文件。当前本机验证使用人工记录及模拟 CUDA 边界，不是 S092 实测结果。
