@@ -292,43 +292,60 @@ python -B scripts/audit_watchsleep_chain.py --output-dir runs/chain_audit
 
 ## 使用 S092 条件生成整夜 IBI
 
-`scripts/generate_night.py` 使用已有训练权重，以指定受试者的整夜睡眠阶段和 AHI/BMI/AGE/GENDER 为条件生成 IBI。默认受试者为 `S092`，ID 不区分大小写。真实 IBI 不传入采样器；生成结果不表示对该受试者真实波形的重建，也尚未经过真实 DREAMT 整夜质量验证。
+`scripts/generate_night.py` 直接读取模型 `state_dict` 格式的 `.pth` 权重，以 S092 整夜睡眠标签及 AHI/BMI/AGE/GENDER 为条件生成 IBI。无需 `run_manifest.json` 或 `best_kl_manifest.json`，也不会自动读取它们。受试者 ID 不区分大小写，真实 IBI 不作为生成种子。
 
-先检查训练文件、checkpoint 哈希、数据身份、受试者条件及整夜生成计划；这一步不运行模型，无需 GPU：
-
-```bash
-python scripts/generate_night.py \
-  --run-manifest /path/to/run/training/best_kl_manifest.json \
-  --subject S092 \
-  --check-only \
-  --output-dir /path/to/S092_plan
-```
-
-然后在已分配 GPU 的计算节点执行：
+在 GPU 计算节点、项目根目录运行：
 
 ```bash
 python scripts/generate_night.py \
-  --run-manifest /path/to/run/training/best_kl_manifest.json \
+  --checkpoint /absolute/path/to/best_kl_model.pth \
+  --config dataset_config.json \
   --subject S092 \
   --seed 42 \
   --threads 4 \
   --stride-epochs 1 \
   --windows-per-group 4 \
-  --output-dir /path/to/S092_generated
+  --output-dir runs/S092_generated
 ```
 
-每次命令必须使用新输出目录。`--training-args-json` 是 `--run-manifest` 的别名；最终权重使用 `run_manifest.json`，最佳 KL 权重使用配套 `best_kl_manifest.json`。`--checkpoint` 仅用于指定同一权重的另一文件位置，哈希必须与所选 manifest 相符。训练数据目录、metadata、split 和 scaler 由 manifest 恢复并核验，当前 `dataset_config.json` 不覆盖这些记录；原训练数据文件仍需可访问。历史 S4 实现与当前源码不同的 checkpoint 会明确拒绝，不能通过改 hash 强行加载。
+只需指定权重路径；`--config` 默认使用项目中的 `dataset_config.json`。窗口长度取 `window_epochs * 750`，扩散日程取 `diffusion_schedule` 和 `terminal_alpha_bar`，其余网络及 200 步参数沿用当前 S4 baseline。数据路径、multiplier、downsample_rate、max_epochs、split_path/split_seed 也从该 JSON 读取，相对路径以 JSON 所在目录为基准。已有的 `DREAMT_*` 环境变量不会覆盖显式配置。
 
-窗口长度 K、网络和扩散日程保持训练记录；默认每隔一个 30 秒 epoch 取窗，每组最多 4 个窗口。组内保留重叠指导，后组使用已生成的前缀作为上下文，按对应扩散时间步投影已知前缀。最后一组按实际剩余长度安排并仅追加新样本，不用真实 IBI 作锚点。这是独立的整夜续接采样入口，区别于原来的单组验证采样；分组续接本身不能保证接缝或生理质量。CLI 按组输出 JSON 进度，便于查看 Slurm 日志。
+**配置及训练数据需要与训练时一致。** `.pth` 不包含原始数据 scaler 或扩散日程，本入口按配置中的训练集重新拟合 IBI/AHI/BMI/AGE 的归一化参数，不利用 S092 的参考 IBI 单独拟合，也不能仅凭权重核实历史配置。若训练时改变过 `window_epochs`、数据目录/划分、`max_epochs` 或日程，应使用当时的配置。运行目录中保留的 `workspace/dataset_config.json` 也可以通过 `--config` 指定。
 
-模型以 seed42 和 manifest 中记录的线程数构造（旧记录缺失时用 2），严格核对固定 S4 buffers 后才应用 `--seed` 和采样线程数。正式推理强制 CUDA，不会回退 CPU；相同 seed 不保证不同 GPU、软件版本或 S4 后端之间逐位相同。
+模型完整恢复 checkpoint 中的参数和持久缓冲区；先校验 keys、shape、dtype、有限值，再执行 `load_state_dict(strict=True)` 并逐张量核对。S4 构造时带共享存储的缓冲区先复制成独立连续存储，以便精确恢复，复数分量保留。权重在一次读取后载入，summary 记录实际读取字节的 SHA256。该入口不会要求构造缓冲区与训练初始化逐位相同；训练代码和原有验证入口保持原行为。
 
-这里“整夜”指文件内全部完整 30 秒 epoch，忽略训练时的 `max_epochs` 上限。尾部不足 30 秒的采样点不生成，数量记入 summary。已知时间缺口、未知或段内不一致的阶段标签会报错，不会跳过后拼接成伪连续记录；没有时间轴的文件只能按存储顺序续接。明确请求的受试者可以来自 test split，推理读取不改变划分，也不重新拟合归一化参数。
+预检查可以在登录节点执行，不构造模型、无需 GPU；因此它只确认文件路径、数据、条件和生成计划，不验证权重的网络结构兼容性：
 
-成功后输出：
+```bash
+python scripts/generate_night.py \
+  --checkpoint /absolute/path/to/best_kl_model.pth \
+  --config dataset_config.json \
+  --subject S092 \
+  --check-only \
+  --output-dir runs/S092_plan
+```
 
-- `S092.npz`：`data` 为 25 Hz、秒单位的生成 IBI；`stages` 保留源五类标签并逐点对齐；另含 `fs`、`ahi`、`synthetic=True` 和可用时间轴。Light 条件不区分 N1/N2，保留这两个源标签不代表模型独立生成了两类。
-- `participant_info.csv`：源 metadata 中该 SID 的一行，保留其他列。
-- `summary.json`：训练/数据/源码/日程/checkpoint 身份、初始化与采样 seed、窗口计划、覆盖范围、耗时及输出统计。
+每次使用新输出目录。实际推理强制 CUDA。默认每隔 30 秒取窗，每组最多 4 个窗口；组内保留重叠指导，后组在每个去噪时间步固定已生成的前缀，再仅追加新样本。窗口长度由配置决定，`--windows-per-group` 是每组窗口数量。精确保留前缀不代表接缝或生理质量已得到保证。
 
-读取生成 NPZ 时使用 `multiplier=1`、`downsample_rate=1`。采样器返回的生成序列导出检查失败时，例如存在非有限数、负值或不能表示为有限 float32 的数值，脚本保存未裁剪的 `diagnostic_generated.npz` 与失败 summary，不输出有效的受试者 NPZ。若采样过程中已因非有限中间值等错误中止，只保证保存失败 summary，不保证存在原始数值诊断文件。当前本机验证使用人工记录及模拟 CUDA 边界，不是 S092 实测结果。
+“整夜”指文件内全部完整的 30 秒 epoch，忽略训练时 `max_epochs` 对目标夜晚长度的限制；不足 30 秒的尾部数量写入 summary。未知/段内不一致标签和已知时间缺口会报错。没有时间轴的文件按存储顺序生成。明确指定的受试者可以来自 test split；归一化仍仅按配置的训练集计算。
+
+成功后输出 `S092.npz`、该受试者的 `participant_info.csv` 和 `summary.json`。NPZ 的 `data` 为 25 Hz、秒单位的生成 IBI，`stages` 保留源五类标签并逐点对齐，另有 `fs`、`ahi`、`synthetic=True` 及可用时间轴。模型条件将 N1/N2 合并为 Light；保留原标签不表示模型独立区分这两类。读取生成文件时使用 `multiplier=1`、`downsample_rate=1`。
+
+采样器返回后若导出检查发现非有限值、负值或 float32 溢出，会保存未裁剪的 `diagnostic_generated.npz` 与失败 summary。若采样过程中已失败，则只保证失败 summary，不宣称存在完整诊断序列。本机测试使用人工记录和小型模型，真实 S092 整夜质量及 CUDA 运行仍需在集群上验证。
+
+### 使用 Slurm 提交推理
+
+从项目根目录提交。Slurm 打开日志文件早于脚本执行，因此先创建日志目录：
+
+```bash
+mkdir -p /home/yxtao/links/scratch/dataset-generation/logs
+sbatch submit_inference.sh /absolute/path/to/best_kl_model.pth
+```
+
+脚本沿用 `def-plago`、1 张 GPU、4 核 CPU、10 小时及现有 modules/`.venv`。第一个参数直接传 `.pth`；可选第二个参数为新的绝对输出目录，第三个参数为配置 JSON 的绝对路径：
+
+```bash
+sbatch submit_inference.sh /absolute/path/to/best_kl_model.pth /absolute/new/output /absolute/path/to/dataset_config.json
+```
+
+默认配置是提交目录的 `dataset_config.json`；默认结果为 `/home/yxtao/links/scratch/dataset-generation/runs/S092_generated_<job_id>`，日志为同一项目根路径下的 `logs/inference_s092_<job_id>.txt`。CLI 会按生成组打印进度。

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import hashlib
 import io
 import json
 import os
@@ -26,8 +27,11 @@ sys.path.insert(0, str(ROOT))
 
 from data_utils import Preprocessor
 from scripts import generate_night
-from scripts.evaluate_denoising import DEFAULT_TRAINING_ARGS, sha256
 from watchsleep_loader import SSDataset
+
+
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 class NightCommandTests(unittest.TestCase):
@@ -56,31 +60,30 @@ class NightCommandTests(unittest.TestCase):
             writer.writerows(rows)
         (self.records / "splits.json").write_text(json.dumps(
             dict(train=names[:1], val=names[1:2], test=names[2:])), encoding="utf-8")
-        self.checkpoint = self.directory / "digest_only_fixture.bin"
+        self.checkpoint = self.directory / "best_model.pth"
         self.checkpoint.write_bytes(b"Artificial checkpoint digest fixture, not model weights.")
-        self.manifest_path = self.directory / "run_manifest.json"
-        self.write_manifest()
+        self.config_path = self.directory / "dataset_config.json"
+        self.write_config()
 
-    def write_manifest(self, window_epochs=4, threads=2):
+    def write_config(self, window_epochs=4):
         self.processor = Preprocessor("DREAMT", data_config=dict(data_dir=str(self.records),
             window_epochs=window_epochs, max_epochs=4))
-        manifest = dict(training_args=dict(DEFAULT_TRAINING_ARGS, dataset="DREAMT",
-            window_size=750 * window_epochs, s4_lmax=max(3000, 750 * window_epochs), stride=750),
-            data_identity=self.processor.data_identity(), threads=threads,
-            source_sha256={"TSImputers/S4Model.py": sha256(ROOT / "TSImputers/S4Model.py")},
-            checkpoint=str(self.checkpoint), checkpoint_sha256=sha256(self.checkpoint),
-            test_fixture_not_a_training_result=True)
-        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        config = dict(data_dir="records", metadata_path="records/participant_info.csv",
+                      split_path="records/splits.json", window_epochs=window_epochs, max_epochs=4,
+                      diffusion_schedule="linear_power", terminal_alpha_bar=1e-8)
+        self.config_path.write_text(json.dumps(config), encoding="utf-8")
 
     def arguments(self, output="output", *, check_only=False):
-        argv = ["--run-manifest", str(self.manifest_path), "--output-dir", str(self.directory / output)]
+        argv = ["--checkpoint", str(self.checkpoint), "--config", str(self.config_path),
+                "--output-dir", str(self.directory / output)]
         return argv + (["--check-only"] if check_only else [])
 
     def invoke(self, argv):
         with contextlib.redirect_stdout(io.StringIO()):
             return generate_night.main(argv)
 
-    def fake_sample(self, args, manifest, checkpoint, conditions, scaler, device, **options):
+    def fake_sample(self, args, checkpoint, conditions, scaler, device, **options):
+        self.assertEqual(checkpoint, self.checkpoint.resolve())
         self.assertEqual(conditions.shape, (self.target_epochs * 750, 9))
         self.assertEqual(conditions.dtype, np.float32)
         self.assertTrue(np.isfinite(conditions).all())
@@ -92,20 +95,27 @@ class NightCommandTests(unittest.TestCase):
         options["progress"](dict(group=0, groups=3, fixture=True))
         generated = np.linspace(.6, .9, len(conditions), dtype=np.float64)
         standardized = (generated - scaler["signal_mean_seconds"]) / scaler["signal_std_seconds"]
-        return standardized, generated, {"test_fixture": True}, {"test_fixture": True}
+        return standardized, generated, {"test_fixture": True}, {
+            "test_fixture": True, "loaded_checkpoint_sha256": sha256(checkpoint),
+            "checkpoint_load": {"all_state_bitwise_equal": True,
+                                "parameters_and_buffers_restored": True,
+                                "training_source_identity_verified": False}}
 
-    def test_check_only_full_stored_night_uses_frozen_dimensions_without_cuda_or_model(self):
+    def test_check_only_full_stored_night_uses_configured_dimensions_without_cuda_or_model(self):
         for epochs in (1, 2, 4, 8):
             with self.subTest(window_epochs=epochs):
-                self.write_manifest(window_epochs=epochs)
+                self.write_config(window_epochs=epochs)
                 argv = self.arguments(f"checked_{epochs}", check_only=True)
-                argv[0] = "--training-args-json"
                 argv += ["--subject", "s092.NPZ"]
                 with mock.patch("cuda_runtime.require_cuda", side_effect=AssertionError("No GPU in check-only")), \
                      mock.patch.object(generate_night, "_sample", side_effect=AssertionError("No model in check-only")), \
+                     mock.patch("torch.load", side_effect=AssertionError("No weights loaded in check-only")), \
                      mock.patch.dict(os.environ, {"DREAMT_DATA_DIR": "missing-current-folder"}):
                     report = self.invoke(argv)
                 self.assertEqual(report["status"], "checked_only")
+                self.assertEqual(report["schema"], "dreamt_whole_night_generation_v2")
+                self.assertEqual(report["input_mode"], "direct_checkpoint")
+                self.assertFalse(report["training_manifest_required"])
                 self.assertEqual(report["subject_id"], "S092")
                 self.assertEqual(report["target_samples"], self.target_epochs * 750)
                 self.assertEqual(report["window_samples"], epochs * 750)
@@ -113,6 +123,8 @@ class NightCommandTests(unittest.TestCase):
                 self.assertIsNone(report["data"]["generation_max_epochs"])
                 self.assertEqual(report["data"]["subject_role"], "test")
                 self.assertFalse(report["model_constructed"])
+                self.assertFalse(report["model_state_validated"])
+                self.assertFalse(report["historical_training_identity_verified"])
                 self.assertFalse(report["sampling_performed"])
                 self.assertFalse(report["real_DREAMT_quality_verified"])
                 self.assertEqual(report["source_provenance"]["night_sampler"], "wavestitch_grouped_hard_prefix")
@@ -121,6 +133,37 @@ class NightCommandTests(unittest.TestCase):
                 self.assertEqual(len(report["source_provenance"]["night_sampler_sha256"]), 64)
                 self.assertEqual(sum(row["append_samples"] for row in report["generation_plan"]), self.target_epochs * 750)
                 self.assertFalse((self.directory / f"checked_{epochs}" / "S092.npz").exists())
+
+    def test_config_relative_paths_resolve_from_its_directory_not_process_cwd(self):
+        other = self.directory / "unrelated_cwd"
+        other.mkdir()
+        previous = Path.cwd()
+        try:
+            os.chdir(other)
+            report = self.invoke(self.arguments(check_only=True))
+        finally:
+            os.chdir(previous)
+        self.assertEqual(report["status"], "checked_only")
+        self.assertEqual(report["subject_id"], "S092")
+        self.assertEqual(report["target_samples"], 8250)
+
+    def test_corrupt_neighboring_manifests_are_completely_ignored(self):
+        for name in ("run_manifest.json", "best_kl_manifest.json"):
+            (self.directory / name).write_bytes(b"{deliberately corrupt manifest")
+        original_open = Path.open
+        opened = []
+
+        def forbid_manifest_open(path, *args, **kwargs):
+            opened.append(path)
+            if path.name in ("run_manifest.json", "best_kl_manifest.json"):
+                raise AssertionError("Direct checkpoint generation must not read a manifest")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", autospec=True, side_effect=forbid_manifest_open):
+            report = self.invoke(self.arguments(check_only=True))
+        self.assertEqual(report["status"], "checked_only")
+        self.assertTrue(opened)
+        self.assertFalse(report["historical_training_identity_verified"])
 
     def test_generation_writes_loader_compatible_night_and_exact_participant_row(self):
         argv = self.arguments() + ["--subject", "s092", "--seed", "123"]
@@ -152,6 +195,21 @@ class NightCommandTests(unittest.TestCase):
         self.assertEqual(report["output_npz_sha256"], sha256(output / "S092.npz"))
         self.assertFalse((output / "diagnostic_generated.npz").exists())
 
+    def test_report_identifies_loaded_snapshot_if_checkpoint_changes_during_sampling(self):
+        loaded_hash = sha256(self.checkpoint)
+
+        def sample_while_file_changes(*args, **kwargs):
+            result = self.fake_sample(*args, **kwargs)
+            self.checkpoint.write_bytes(b"New live checkpoint after the model was loaded")
+            return result
+
+        with mock.patch("cuda_runtime.require_cuda", return_value=torch.device("cuda:0")), \
+             mock.patch.object(generate_night, "_sample", side_effect=sample_while_file_changes):
+            report = self.invoke(self.arguments() + ["--seed", "123"])
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(report["checkpoint_identity"]["sha256"], loaded_hash)
+        self.assertNotEqual(report["checkpoint_identity"]["sha256"], sha256(self.checkpoint))
+
     def test_invalid_generated_values_are_preserved_as_failed_diagnostics(self):
         for name, value in (("negative", -.5), ("nonfinite", np.nan)):
             with self.subTest(value=name):
@@ -176,10 +234,10 @@ class NightCommandTests(unittest.TestCase):
                     else:
                         self.assertEqual(saved["generated_seconds"][7], value)
 
-    def test_no_cuda_fails_before_reading_manifest_and_never_falls_back(self):
+    def test_no_cuda_fails_before_loading_config_and_never_falls_back(self):
         argv = self.arguments("no_cuda")
         with mock.patch("cuda_runtime.require_cuda", side_effect=RuntimeError("CUDA required")), \
-             mock.patch.object(generate_night, "load_training_run") as load, \
+             mock.patch.object(generate_night, "load_inference_config") as load, \
              mock.patch.object(generate_night, "_sample") as sample:
             with self.assertRaisesRegex(RuntimeError, "CUDA required"):
                 self.invoke(argv)
@@ -188,10 +246,16 @@ class NightCommandTests(unittest.TestCase):
         report = json.loads((self.directory / "no_cuda" / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(report["status"], "failed")
 
-    def test_check_only_still_verifies_checkpoint_digest(self):
+    def test_check_only_requires_checkpoint_file_but_does_not_invent_a_historical_digest(self):
+        # A current file hash is provenance, not a match against a nonexistent
+        # training manifest. Check-only deliberately does not deserialize it.
         self.checkpoint.write_bytes(b"Changed fixture bytes")
+        report = self.invoke(self.arguments("current_hash", check_only=True))
+        self.assertEqual(report["checkpoint_identity"]["sha256"], sha256(self.checkpoint))
+        self.assertFalse(report["model_state_validated"])
+        self.checkpoint.unlink()
         with mock.patch.object(generate_night, "_sample") as sample:
-            with self.assertRaisesRegex(ValueError, "checkpoint digest"):
+            with self.assertRaises((FileNotFoundError, ValueError)):
                 self.invoke(self.arguments(check_only=True))
         sample.assert_not_called()
 
@@ -225,17 +289,19 @@ class NightCommandTests(unittest.TestCase):
             self.invoke(self.arguments(check_only=True))
         self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
 
-    def test_recorded_constructor_threads_are_validated_and_legacy_default_is_explicit(self):
-        self.assertEqual(generate_night.initialization_threads({}), 2)
-        self.assertEqual(generate_night.initialization_threads({"threads": 8}), 8)
-        for value in (0, -1, 2.0, True, None, "2"):
-            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Manifest threads"):
-                generate_night.initialization_threads({"threads": value})
+    def test_manifest_cli_aliases_are_removed_and_threads_must_be_positive(self):
+        for extra in (["--run-manifest", "unused.json"], ["--training-args-json", "unused.json"],
+                      ["--threads", "0"], ["--threads", "-1"], ["--threads", "2.0"]):
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    self.invoke(self.arguments(check_only=True) + extra)
+                self.assertEqual(error.exception.code, 2)
 
 
 class SamplingInitializationTests(unittest.TestCase):
-    def test_sampling_seed_is_separate_from_constructor_seed_and_fixed_buffers(self):
+    def test_full_checkpoint_state_is_restored_before_separately_seeded_sampling(self):
         from training_utils import fetchModel  # Import before patching its factory.
+        from night_checkpoint import DEFAULT_TRAINING_ARGS
 
         class TinyFixture(torch.nn.Module):
             def __init__(self):
@@ -250,9 +316,23 @@ class SamplingInitializationTests(unittest.TestCase):
         self.addCleanup(torch.random.set_rng_state, rng)
         self.addCleanup(np.random.set_state, numpy_rng)
         torch.set_num_threads(2)
-        torch.manual_seed(42)
+        # Deliberately unlike the seed42 constructor: strict restoration must
+        # replace both parameters and buffers, not reconstruct old buffers.
+        torch.manual_seed(7)
         saved = TinyFixture().state_dict()
+        saved["weight"].fill_(3.5)
+        saved["fixed"] = torch.linspace(0.2, 0.8, 7)
         constructed = []
+        temporary = tempfile.TemporaryDirectory(prefix="night_sample_", dir=ROOT)
+        self.addCleanup(temporary.cleanup)
+        checkpoint = Path(temporary.name) / "tiny_fixture.pth"
+        checkpoint.write_bytes(b"Mocked state_dict payload snapshot")
+        loaded_hash = sha256(checkpoint)
+
+        def load_snapshot(stream, **options):
+            self.assertEqual(stream.getvalue(), b"Mocked state_dict payload snapshot")
+            checkpoint.write_bytes(b"Concurrent replacement of the on-disk checkpoint")
+            return saved
 
         def construct(*_):
             constructed.append((torch.get_num_threads(), torch.initial_seed()))
@@ -263,29 +343,40 @@ class SamplingInitializationTests(unittest.TestCase):
             self.assertEqual(torch.get_num_threads(), 1)
             self.assertFalse(model.training)
             self.assertTrue(all(parameter.requires_grad for parameter in model.parameters()))
+            self.assertTrue(torch.equal(model.weight, saved["weight"]))
             self.assertTrue(torch.equal(model.fixed, saved["fixed"]))
             return torch.randn(750), {"test_fixture": True}
 
         outputs = []
         args = SimpleNamespace(**DEFAULT_TRAINING_ARGS)
         with mock.patch("training_utils.fetchModel", side_effect=construct), \
-             mock.patch("torch.load", return_value=saved), \
+             mock.patch("torch.load", side_effect=load_snapshot) as load, \
              mock.patch("cuda_runtime.assert_cuda_model"), \
              mock.patch("cuda_runtime.cuda_environment", return_value={"test_fixture_cpu": True}), \
              mock.patch("torch.cuda.synchronize"), \
              mock.patch("night_sampling.generate_night", side_effect=sample):
             for seed in (19, 19, 21):
-                values, seconds, metadata, execution = generate_night._sample(args, {"threads": 2},
-                    Path("tiny_fixture.pt"), np.ones((750, 9), dtype=np.float32),
+                checkpoint.write_bytes(b"Mocked state_dict payload snapshot")
+                values, seconds, metadata, execution = generate_night._sample(args,
+                    checkpoint, np.ones((750, 9), dtype=np.float32),
                     {"signal_mean_seconds": .8, "signal_std_seconds": .05}, torch.device("cpu"),
                     seed=seed, threads=1, stride=750, windows_per_group=4, progress=lambda _: None)
                 outputs.append(values)
                 np.testing.assert_allclose(seconds, values.astype(np.float64) * .05 + .8)
                 self.assertEqual(execution["initialization_seed"], 42)
-                self.assertEqual(execution["initialization_threads"], 2)
+                self.assertEqual(execution["initialization_threads"], 1)
                 self.assertEqual(execution["sampling_seed"], seed)
-                self.assertTrue(execution["checkpoint_load"]["all_buffers_bitwise_equal"])
-        self.assertEqual(constructed, [(2, 42)] * 3)
+                self.assertTrue(execution["checkpoint_load"]["all_state_bitwise_equal"])
+                self.assertTrue(execution["checkpoint_load"]["parameters_and_buffers_restored"])
+                self.assertFalse(execution["checkpoint_load"]["training_source_identity_verified"])
+                self.assertEqual(execution["loaded_checkpoint_sha256"], loaded_hash)
+                self.assertNotEqual(execution["loaded_checkpoint_sha256"], sha256(checkpoint))
+        self.assertEqual(constructed, [(1, 42)] * 3)
+        self.assertEqual(load.call_count, 3)
+        for call in load.call_args_list:
+            self.assertIsInstance(call.args[0], io.BytesIO)
+            self.assertEqual(call.args[0].getvalue(), b"Mocked state_dict payload snapshot")
+            self.assertEqual(call.kwargs, {"weights_only": True, "map_location": torch.device("cpu")})
         np.testing.assert_array_equal(outputs[0], outputs[1])
         self.assertFalse(np.array_equal(outputs[0], outputs[2]))
 

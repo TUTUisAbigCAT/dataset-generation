@@ -58,7 +58,7 @@ def _check_stage_conditions(path, record, downsample_rate):
 def prepare_night(preprocessor, subject="S092"):
     """Prepare all complete stored epochs without applying training max_epochs.
 
-    Callers must first bind/verify the preprocessor against the run manifest.
+    Callers supply the selected training preprocessor and its fitted scaler.
     This function preserves that object's scaler, caches and data identity.
     Unknown/inconsistent stage labels or known source-time gaps are errors.
     Invalid reference IBI is reported but is not used to restrict conditions.
