@@ -335,17 +335,14 @@ python scripts/generate_night.py \
 
 ### 使用 Slurm 提交推理
 
-从项目根目录提交。Slurm 打开日志文件早于脚本执行，因此先创建日志目录：
+所有推理参数直接写在 `submit_inference.sh` 中，提交时无需传参。Slurm 打开日志文件早于脚本执行，因此先创建日志目录：
 
 ```bash
+cd /project/def-plago/yxtao/dataset-generation
 mkdir -p /home/yxtao/links/scratch/dataset-generation/logs
-sbatch submit_inference.sh /absolute/path/to/best_kl_model.pth
+sbatch submit_inference.sh
 ```
 
-脚本沿用 `def-plago`、1 张 GPU、4 核 CPU、10 小时及现有 modules/`.venv`。第一个参数直接传 `.pth`；可选第二个参数为新的绝对输出目录，第三个参数为配置 JSON 的绝对路径：
+脚本沿用 `def-plago`、1 张 GPU、4 核 CPU、10 小时及现有 modules/`.venv`，固定工作目录为 `/project/def-plago/yxtao/dataset-generation`。权重直接使用 `/home/yxtao/links/scratch/dataset-generation/runs/dreamt_20261026T234653_562786Z/training/best_kl_model.pth`，配置使用项目中的 `dataset_config.json`。更换权重或配置时直接修改脚本中的路径。
 
-```bash
-sbatch submit_inference.sh /absolute/path/to/best_kl_model.pth /absolute/new/output /absolute/path/to/dataset_config.json
-```
-
-默认配置是提交目录的 `dataset_config.json`；默认结果为 `/home/yxtao/links/scratch/dataset-generation/runs/S092_generated_<job_id>`，日志为同一项目根路径下的 `logs/inference_s092_<job_id>.txt`。CLI 会按生成组打印进度。
+结果保存到 `/home/yxtao/links/scratch/dataset-generation/runs/S092_generated_<job_id>`，日志为 `/home/yxtao/links/scratch/dataset-generation/logs/inference_s092_<job_id>.txt`。CLI 会按生成组打印进度。
