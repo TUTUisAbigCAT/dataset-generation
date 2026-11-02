@@ -362,6 +362,10 @@ sbatch submit_inference.sh
 
 `submit_missing_value_ablation_extended.sh` 先对已完成两组第 10 轮最终权重补导出相同 64 个验证窗口的波形、逐窗口均值/方差及 KL 分项并画图，再从头各训练 30 轮，严格核对两组更新次数一致。旧 `.pth` 不含优化器/RNG，因此这不是断点续训。每轮的 `waveforms.npz` 和 `per_window_metrics.csv` 均使用同一参考掩码；原始零值和生成负值保留。详细输出结构与执行方式见 [缺失值对照说明](docs/missing_value_ablation.md#固定验证波形诊断与-30-轮等步数对照)。
 
+## S092 四阶段评估：两组最终第 30 轮权重
+
+`submit_stage_evaluation.sh` 使用这次缺失值对照的两组 **final epoch-30** 权重，在相同 S092 原始阶段与人员条件下各生成 8 次。按原始 30 秒标签分别统计 W、Light、REM、Deep 的均值误差、方差误差、高斯 KL 和非正值比例；真实 IBI 不输入模型，混合阶段窗口不改成纯阶段条件。结果保留每次波形和分阶段图。执行前 `git pull`，创建日志目录，再 `sbatch submit_stage_evaluation.sh`。路径、身份核对、评分口径与输出说明见 [四阶段评估说明](docs/stage_evaluation.md)。
+
 ## S092 生成诊断：按顺序排查
 
 `scripts/diagnose_generation.py` 固定 checkpoint，依次检查配置、同条件多次采样、条件响应和整晚续接。训练网络、日程和生产采样器不做改动。
