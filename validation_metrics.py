@@ -61,6 +61,76 @@ def _masked_var_mean(values, observed_mask):
     return variance, mean
 
 
+def _validated_variance_floor(value):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value <= 0):
+        raise ValueError("kl_variance_floor_ms2 must be a finite positive number")
+    return float(value)
+
+
+@torch.no_grad()
+def window_statistics(generated_seconds, reference_seconds, *, kl_variance_floor_ms2=1.0,
+                      observed_mask=None):
+    """Return paired within-window moments and KL as device-resident [B] tensors.
+
+    Inputs have shape [B, L] in seconds. Means and signed differences use ms;
+    raw population variances and their differences use ms^2. Differences are
+    generated minus reference. The variance floor affects KL only, never the
+    returned raw variances. Each KL component already includes its factor 0.5
+    and their sum is KL(real || generated), in nats per window.
+
+    A supplied reference-defined bool mask selects the same positions for both
+    fits, with at least two observations per row. Unselected reference values
+    may be nonfinite, but every generated value must be finite. Negative
+    generated values are retained. Without a mask, all positions are observed.
+    The returned observed_counts is int64; every other tensor is float64.
+    All outputs stay on the input device without gradients or RNG changes.
+    """
+    floor = _validated_variance_floor(kl_variance_floor_ms2)
+    generated, reference = _prepare_pair(generated_seconds, reference_seconds, observed_mask)
+    if observed_mask is None:
+        # Keep the legacy unmasked reduction and arithmetic order unchanged.
+        gen_var, gen_mean = torch.var_mean(generated, dim=1, unbiased=False)
+        ref_var, ref_mean = torch.var_mean(reference, dim=1, unbiased=False)
+        observed_counts = torch.full((len(generated),), generated.shape[1],
+                                     dtype=torch.int64, device=generated.device)
+    else:
+        gen_var, gen_mean = _masked_var_mean(generated, observed_mask)
+        ref_var, ref_mean = _masked_var_mean(reference, observed_mask)
+        observed_counts = observed_mask.sum(dim=1)
+    if not bool(torch.isfinite(gen_var).all() & torch.isfinite(ref_var).all()
+                & torch.isfinite(gen_mean).all() & torch.isfinite(ref_mean).all()):
+        raise FloatingPointError("Nonfinite within-window moments")
+    # One KL(real || generated) per corresponding pair of windows. The
+    # lower bound regularizes the fitted variances, not the waveforms.
+    kl_gen_var = gen_var.clamp_min(floor)
+    kl_ref_var = ref_var.clamp_min(floor)
+    relative_change = (kl_ref_var - kl_gen_var) / kl_gen_var
+    # For small d, d - log1p(d) loses significant digits. Its expansion
+    # through d^5 has sub-float64 relative truncation error at |d| <= 1e-4.
+    # Clamp unused polynomial arguments because torch evaluates both branches.
+    small = relative_change.clamp(-1e-4, 1e-4)
+    near_equal = small.square() * (0.5 + small * (-1.0 / 3.0 + small * (0.25 - small / 5.0)))
+    log_ratio = kl_ref_var.log() - kl_gen_var.log()
+    general = kl_ref_var / kl_gen_var - 1.0 - log_ratio
+    variance_term = torch.where(relative_change.abs() <= 1e-4, near_equal, general).clamp_min(0.0)
+    mean_term = ((ref_mean - gen_mean) / kl_gen_var.sqrt()).square()
+    kl_variance_term = 0.5 * variance_term
+    kl_mean_term = 0.5 * mean_term
+    window_kl = kl_variance_term + kl_mean_term
+    if not bool(torch.isfinite(window_kl).all()):
+        raise FloatingPointError("Nonfinite paired-window Gaussian KL divergence")
+    mean_error = gen_mean - ref_mean
+    variance_error = gen_var - ref_var
+    return dict(
+        generated_mean_ms=gen_mean, reference_mean_ms=ref_mean,
+        generated_variance_ms2=gen_var, reference_variance_ms2=ref_var,
+        mean_error_ms=mean_error, mean_absolute_error_ms=mean_error.abs(),
+        variance_error_ms2=variance_error, variance_absolute_error_ms2=variance_error.abs(),
+        observed_counts=observed_counts, gaussian_kl_real_to_generated=window_kl,
+        kl_mean_term=kl_mean_term, kl_variance_term=kl_variance_term)
+
+
 class DistributionAccumulator:
     """Accumulate paired-window KL with equal weight per validation window.
 
@@ -70,56 +140,30 @@ class DistributionAccumulator:
     pair's amplitude moments, not its temporal ordering or joint distribution.
     """
     def __init__(self, *, kl_variance_floor_ms2=1.0):
-        if (isinstance(kl_variance_floor_ms2, bool)
-                or not isinstance(kl_variance_floor_ms2, (int, float))
-                or not math.isfinite(kl_variance_floor_ms2)
-                or kl_variance_floor_ms2 <= 0):
-            raise ValueError("kl_variance_floor_ms2 must be a finite positive number")
-        self.kl_variance_floor_ms2 = float(kl_variance_floor_ms2)
+        self.kl_variance_floor_ms2 = _validated_variance_floor(kl_variance_floor_ms2)
         self.count = 0
         self.window_size = self.device = None
         self.kl_sum = None
 
     @torch.no_grad()
     def update(self, generated_seconds, reference_seconds, observed_mask=None):
-        generated, reference = _prepare_pair(generated_seconds, reference_seconds, observed_mask)
-        if self.count and (generated.shape[1] != self.window_size
-                           or generated.device != self.device):
+        """Accumulate this batch and return its statistics without retaining them."""
+        statistics = window_statistics(
+            generated_seconds, reference_seconds, observed_mask=observed_mask,
+            kl_variance_floor_ms2=self.kl_variance_floor_ms2)
+        if self.count and (generated_seconds.shape[1] != self.window_size
+                           or generated_seconds.device != self.device):
             raise ValueError("Batches must have the same feature dimension and device")
-        batch_count = len(generated)
-        if observed_mask is None:
-            # Preserve the legacy reduction exactly when no mask was supplied.
-            gen_var, gen_mean = torch.var_mean(generated, dim=1, unbiased=False)
-            ref_var, ref_mean = torch.var_mean(reference, dim=1, unbiased=False)
-        else:
-            gen_var, gen_mean = _masked_var_mean(generated, observed_mask)
-            ref_var, ref_mean = _masked_var_mean(reference, observed_mask)
-        if not bool(torch.isfinite(gen_var).all() & torch.isfinite(ref_var).all()
-                    & torch.isfinite(gen_mean).all() & torch.isfinite(ref_mean).all()):
-            raise FloatingPointError("Nonfinite within-window moments")
-        # One KL(real || generated) per corresponding pair of windows. The
-        # lower bound regularizes the fitted variances, not the waveforms.
-        kl_gen_var = gen_var.clamp_min(self.kl_variance_floor_ms2)
-        kl_ref_var = ref_var.clamp_min(self.kl_variance_floor_ms2)
-        relative_change = (kl_ref_var - kl_gen_var) / kl_gen_var
-        # For small d, d - log1p(d) loses significant digits. Its expansion
-        # through d^5 has sub-float64 relative truncation error at |d| <= 1e-4.
-        # Clamp the unused polynomial arguments to avoid overflow from torch's
-        # eager evaluation of both where branches when variance ratios are huge.
-        small = relative_change.clamp(-1e-4, 1e-4)
-        near_equal = small.square() * (0.5 + small * (-1.0 / 3.0 + small * (0.25 - small / 5.0)))
-        log_ratio = kl_ref_var.log() - kl_gen_var.log()
-        general = kl_ref_var / kl_gen_var - 1.0 - log_ratio
-        variance_term = torch.where(relative_change.abs() <= 1e-4, near_equal, general).clamp_min(0.0)
-        mean_term = ((ref_mean - gen_mean) / kl_gen_var.sqrt()).square()
-        window_kl = 0.5 * variance_term + 0.5 * mean_term
+        batch_count = len(generated_seconds)
+        window_kl = statistics["gaussian_kl_real_to_generated"]
         batch_kl_sum = window_kl.sum()
         total_kl = batch_kl_sum if self.count == 0 else self.kl_sum + batch_kl_sum
         if not bool(torch.isfinite(window_kl).all() & torch.isfinite(total_kl)):
             raise FloatingPointError("Nonfinite paired-window Gaussian KL divergence")
         self.kl_sum = total_kl
-        self.window_size, self.device = generated.shape[1], generated.device
+        self.window_size, self.device = generated_seconds.shape[1], generated_seconds.device
         self.count += batch_count
+        return statistics
 
     @torch.no_grad()
     def finalize(self):

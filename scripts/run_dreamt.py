@@ -51,7 +51,7 @@ def resolve_output_directory(config_path, explicit_output=None):
 def snapshot_source(destination):
     destination.mkdir()
     for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "cuda_runtime.py",
-                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "window_config.py", "diffusion_schedule.py", "missing_data.py"):
+                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "validation_artifacts.py", "window_config.py", "diffusion_schedule.py", "missing_data.py"):
         shutil.copy2(ROOT / name, destination / name)
     for name in ("TSImputers", "utils", "third_party"):
         shutil.copytree(ROOT / name, destination / name,

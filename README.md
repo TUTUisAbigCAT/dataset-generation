@@ -358,6 +358,10 @@ sbatch submit_inference.sh
 
 结果保存到 `/home/yxtao/links/scratch/dataset-generation/runs/S092_generated_<job_id>`，日志为 `/home/yxtao/links/scratch/dataset-generation/logs/inference_s092_<job_id>.txt`。CLI 会按生成组打印进度。
 
+## 缺失值对照：固定验证波形与等步数长训
+
+`submit_missing_value_ablation_extended.sh` 先对已完成两组第 10 轮最终权重补导出相同 64 个验证窗口的波形、逐窗口均值/方差及 KL 分项并画图，再从头各训练 30 轮，严格核对两组更新次数一致。旧 `.pth` 不含优化器/RNG，因此这不是断点续训。每轮的 `waveforms.npz` 和 `per_window_metrics.csv` 均使用同一参考掩码；原始零值和生成负值保留。详细输出结构与执行方式见 [缺失值对照说明](docs/missing_value_ablation.md#固定验证波形诊断与-30-轮等步数对照)。
+
 ## S092 生成诊断：按顺序排查
 
 `scripts/diagnose_generation.py` 固定 checkpoint，依次检查配置、同条件多次采样、条件响应和整晚续接。训练网络、日程和生产采样器不做改动。

@@ -120,7 +120,7 @@ def validation_options(config):
     values = config.get("validation", {})
     if not isinstance(values, dict):
         raise ValueError("validation must be a JSON object")
-    unknown = set(values) - (set(DEFAULT_VALIDATION) | {"reference_mask_policy"})
+    unknown = set(values) - (set(DEFAULT_VALIDATION) | {"reference_mask_policy", "save_artifacts"})
     if unknown:
         raise ValueError(f"Unknown validation options: {sorted(unknown)}")
     result = {**DEFAULT_VALIDATION, **values}
@@ -143,6 +143,8 @@ def validation_options(config):
     # Omit the default to preserve the existing protocol and options payload.
     if mask_policy == "training":
         result.pop("reference_mask_policy", None)
+    if 'save_artifacts' in result and not isinstance(result['save_artifacts'], bool):
+        raise ValueError('validation.save_artifacts must be boolean')
     return result
 
 
@@ -241,6 +243,7 @@ class EpochValidator:
                  device, output_dir, config):
         self.device = _require_device(device, training_model)
         self.options = validation_options(config)
+        self.save_artifacts = self.options.get('save_artifacts', False)
         self.early_stopping = EarlyStopping(config)
         self.best_checkpoints = {}
         self.should_stop = False
@@ -357,6 +360,11 @@ class EpochValidator:
             self.protocol["limitations"] += (
                 " Masked KL does not assess generated values at unobserved reference positions, beyond requiring finiteness. "
                 "Scores from different reference masks or window sets are not directly comparable.")
+        if self.save_artifacts:
+            self.protocol['artifacts'] = dict(enabled=True, waveforms='waveforms.npz',
+                per_window_metrics='per_window_metrics.csv', waveform_unit='seconds',
+                moments='raw population moments in ms/ms^2 at the same scoring positions',
+                extra_sampling=False, directory='epoch_NNNN')
         _save_json(self.output / "protocol.json", self.protocol)
 
     def _generate(self, training_model):
@@ -375,6 +383,7 @@ class EpochValidator:
         generated_samples = 0
         generated_nonpositive = torch.zeros((), dtype=torch.int64, device=self.device)
         sampler_reports = []
+        artifact_waveforms, artifact_statistics = [], defaultdict(list)
         for start in range(0, len(self.windows), self.options["batch_size"]):
             clean = self.windows[start:start+self.options["batch_size"]].to(self.device)
             ibi, metadata = sample_validation_windows(model, clean, self.diffusion_config, self.args, self.device)
@@ -382,10 +391,17 @@ class EpochValidator:
             # Preserve the same frozen window order in both sides of each pair.
             reference_seconds = self.reference[start:start+self.options["batch_size"]].to(self.device)
             if self.reference_mask is None:
-                accumulator.update(generated_seconds, reference_seconds)
+                statistics = accumulator.update(generated_seconds, reference_seconds)
             else:
                 observed_mask = self.reference_mask[start:start+self.options["batch_size"]].to(self.device)
-                accumulator.update(generated_seconds, reference_seconds, observed_mask=observed_mask)
+                statistics = accumulator.update(generated_seconds, reference_seconds, observed_mask=observed_mask)
+            if self.save_artifacts:
+                # Copy only for file I/O; moments and KL remain CUDA operations.
+                artifact_waveforms.append(generated_seconds.detach().cpu().numpy())
+                for key, value in statistics.items():
+                    artifact_statistics[key].append(value.detach().cpu().numpy())
+                artifact_statistics['generated_nonpositive_samples_all'].append(
+                    (generated_seconds <= 0).sum(dim=1).detach().cpu().numpy())
             # Independent all-position diagnostics: a reference mask must not
             # hide nonpositive generated values. These do not select checkpoints.
             generated_samples += generated_seconds.numel()
@@ -397,7 +413,26 @@ class EpochValidator:
             generated_samples=generated_samples,
             generated_nonpositive_samples=nonpositive_samples,
             generated_nonpositive_fraction=nonpositive_samples/generated_samples)
+        if self.save_artifacts:
+            metrics['_artifact_payload'] = dict(
+                generated_seconds=np.concatenate(artifact_waveforms, axis=0),
+                statistics={key: np.concatenate(value) for key, value in artifact_statistics.items()})
         return metrics, copied, sampler_reports
+
+    def save_generation_artifacts(self, epoch_dir, metrics, epoch):
+        """Serialize this exact generation; also usable for checkpoint audits."""
+        if not self.save_artifacts:
+            return None
+        from validation_artifacts import write_validation_artifacts
+        payload = metrics.pop('_artifact_payload')
+        reference = self.reference.numpy()
+        mask = (np.ones(reference.shape, dtype=bool) if self.reference_mask is None
+                else self.reference_mask.numpy())
+        return write_validation_artifacts(epoch_dir, **payload,
+            reference_seconds=reference, scoring_mask=mask,
+            windows_metadata=self.windows_metadata, conditions=self.windows[:, :, 1:].numpy(),
+            condition_columns=self.protocol['condition_columns'],
+            protocol_path=self.output / 'protocol.json', epoch=epoch)
 
     def run(self, epoch, training_model, train_mean_loss):
         if self.should_stop or epoch != len(self.reports) + 1:
@@ -413,6 +448,7 @@ class EpochValidator:
         epoch_dir.mkdir(exist_ok=False)
         with preserve_random_state(self.device):
             metrics, copied, sampler_reports = self._generate(training_model)
+        artifacts = self.save_generation_artifacts(epoch_dir, metrics, epoch)
         aggregate = metrics["aggregate"]
         stopping = self.early_stopping.update(epoch, aggregate)
         self.should_stop = stopping["stopped_early"]
@@ -440,6 +476,8 @@ class EpochValidator:
                       validation_seconds=time.perf_counter()-started, device=str(self.device),
                       protocol=str(self.output / "protocol.json"), model_copy=copied,
                       sampling=sampler_reports, early_stopping=stopping)
+        if artifacts is not None:
+            report['artifacts'] = artifacts
         _save_json(epoch_dir / "metrics.json", report)
         self.reports.append(report)
         # Rewriting a short history avoids partial CSV rows after a failed append.

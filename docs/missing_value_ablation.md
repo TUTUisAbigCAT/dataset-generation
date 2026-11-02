@@ -63,3 +63,65 @@ python scripts/run_missing_value_ablation.py --config dataset_config.json --epoc
 ## 本地验证范围
 
 实现检查包括原始 mask、训练集统计隔离、无效点 loss 梯度、相同参考位置的 KL、权重/配置身份恢复、源码白名单和真实 S4 小规模前后向。生产训练和生成入口继续强制 CUDA。CPU 单元测试通过不表示 GPU 工作流或 DREAMT 训练质量已验证；实际对照结果以集群完成后的两个日志为准。
+
+## 固定验证波形诊断与 30 轮等步数对照
+
+`submit_missing_value_ablation_extended.sh` 将下列步骤串联在一个 GPU 作业中。脚本已填写这次参考运行的绝对路径 `missing_value_ablation_20261102T055527_103986Z`，原始 NPZ 和旧运行目录只读；新结果写到 `output_root` 下独立的 `missing_value_ablation_extended_<UTC时间>_<jobid>` 目录。
+
+1. `scripts/export_ablation_validation.py` 读取旧实验两组**最终第 10 轮**权重，在原来的 64 个验证窗口上重新采样一次，保存完整波形、逐窗口统计和与旧最终 KL 的差值。它不选 `best_kl_model.pth`：旧 preserve 的 best 来自第 7 轮，直接和 masked 第 10 轮相比会混淆训练预算。旧权重、冻结配置、训练数据、scaler、验证窗口/掩码、采样日程及网络/采样源码均先核对；核对失败会阻止后续长训。
+2. 对两组导出的同一批窗口画图，默认固定窗口编号 0、31、63。每张图上方是原始 IBI 与两组生成 IBI，下方是共享睡眠阶段条件；原始零值会显示出来，生成负值不裁剪。另有全部窗口均值、方差的散点图，以及 KL 两项贡献图。
+3. 两个模型各**从头训练 30 轮**，关闭早停；沿用每臂旧配置并核对训练窗口、batch size、学习率、模型、日程、种子相关设置及数据身份。当前 51,266 个训练窗口、batch size 8，对应每轮 6,409 次更新，每组共 **192,270 次更新**。预检不等量或结束时未完成预算会报错，不会把不等步数结果当作完成的对照。
+4. 每轮保存同一批 64 个验证窗口的波形与逐窗口统计，完成后绘制第 30 轮两组对比。
+
+旧 `.pth` 仅有模型参数/缓冲区，没有 Adam 状态、RNG 和恢复训练所需状态，因此这里**不是从第 10 轮继续训练 20 轮**。新运行的第 10 轮验证结果可与旧实验核对；CUDA 硬件或软件差异可能影响逐位复现，脚本会记录重导出的 KL 差异，不伪造相同结果。
+
+```bash
+mkdir -p /home/yxtao/links/scratch/dataset-generation/logs
+sbatch submit_missing_value_ablation_extended.sh
+```
+
+若只想先补导出已有权重的波形，在 GPU 节点执行：
+
+```bash
+python scripts/export_ablation_validation.py \
+  --reference-run /home/yxtao/links/scratch/dataset-generation/runs/missing_value_ablation_20261102T055527_103986Z \
+  --output-dir /home/yxtao/links/scratch/dataset-generation/runs/epoch10_validation_export \
+  --threads 4
+```
+
+输出目录必须尚不存在。该诊断恢复记录中的训练路径，数据搬迁时会明确失败，而不是用全局 JSON 的新数据悄悄替代。普通训练也可在 JSON 中设置 `"validation": {"save_artifacts": true}`（与既有验证选项合并）来逐轮导出。默认关闭，既有训练入口行为不变。
+
+新作业输出结构：
+
+```text
+missing_value_ablation_extended_<time>_<jobid>/
+  epoch10_diagnostics/summary.json
+  epoch10_diagnostics/{preserve,masked}/validation/epoch_0010/
+  epoch10_plots/
+  training_30epochs/summary.json
+  training_30epochs/comparison.csv
+  training_30epochs/{preserve,masked}/training/epoch_metrics.csv
+  training_30epochs/{preserve,masked}/training/validation/epoch_NNNN/
+  epoch30_plots/
+```
+
+每个 `epoch_NNNN` 保存：
+
+| 文件 | 内容 |
+|---|---|
+| `waveforms.npz` | `generated_ibi_seconds`、`reference_ibi_seconds`，形状 `[64,3000]`；对应 `scoring_mask`、原始正值掩码、窗口编号、被试、起点、阶段和标准化条件。均为普通数组，`allow_pickle=False` 可读。 |
+| `per_window_metrics.csv` | 每窗口真实/生成均值（ms）、未加 floor 的总体方差（ms²）、有符号差值和绝对差值、观测点数、单窗 KL、`kl_mean_term`、`kl_variance_term`、全部位置中的非正生成点数。 |
+| `artifacts.json` | 单位、形状、计算口径、关联协议及 NPZ/CSV SHA256。 |
+| `metrics.json` | 既有聚合 KL、非正值诊断和新产物索引。 |
+
+令 `vr=max(reference_variance_ms2, floor)`、`vg=max(generated_variance_ms2, floor)`：
+
+```text
+kl_mean_term     = (reference_mean_ms - generated_mean_ms)^2 / (2 * vg)
+kl_variance_term = 0.5 * (vr / vg - 1 - log(vr / vg))
+window_kl       = kl_mean_term + kl_variance_term
+```
+
+两项都基于**同一个真实窗口的观测位置**。均值项也受生成方差分母影响，因此须同时看原始均值差和方差，不能把分解当作两个独立因果来源。`scoring_mask` 不输入采样器；保存操作复用当轮已生成信号，不新增采样、不更改模型更新、不改变训练随机状态。统计和模型运算在 CUDA 上，落盘和画图使用主机。
+
+`epoch_metrics.csv` 继续保持现有简洁列；详细统计放在单独的逐窗口 CSV 中。best 选择继续采用 5 轮平均 KL，本次没有修改选择规则。生成是独立条件窗口，不是逐点重建或整晚 overlap 续接；S092 仍属于测试集，本实验不使用它挑选训练轮次。
