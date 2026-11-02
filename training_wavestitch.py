@@ -12,6 +12,7 @@ import os
 from torch.utils.data import DataLoader
 from cuda_runtime import require_cuda, assert_cuda_model
 from epoch_validation import create_epoch_validator
+from missing_data import masked_noise_mse
 
 if __name__ == "__main__":
     np.random.seed(42)
@@ -77,6 +78,10 @@ if __name__ == "__main__":
         total_loss = 0.0
         total_samples = 0
         for batch in dataloader:
+            observed_mask = None
+            if isinstance(batch, dict):
+                observed_mask = batch['observed_mask'].to(device)
+                batch = batch['data']
             batch = batch.to(device)
             timesteps = randint(diffusion_config['T'], size=(batch.shape[0],), device=device)
             sigmas = normal(0, 1, size=batch.shape, device=device)
@@ -95,10 +100,16 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             sigmas_permuted = sigmas[:, :, non_hier_cols].permute((0, 2, 1))
             sigmas_permuted = sigmas_permuted.to(device)
-            loss = criterion(sigmas_predicted, sigmas_permuted)
+            if observed_mask is None:
+                loss = criterion(sigmas_predicted, sigmas_permuted)
+                loss_weight = batch.shape[0]
+                loss_total = float(loss.detach()) * loss_weight
+            else:
+                loss, loss_sum, loss_weight = masked_noise_mse(sigmas_predicted, sigmas_permuted, observed_mask)
+                loss_total = float(loss_sum)
             loss.backward()
-            total_loss += float(loss.detach()) * batch.shape[0]
-            total_samples += batch.shape[0]
+            total_loss += loss_total
+            total_samples += loss_weight
             optimizer.step()
         mean_loss = total_loss / total_samples
         print(f"epoch: {epoch + 1}, mean_loss: {mean_loss}", flush=True)

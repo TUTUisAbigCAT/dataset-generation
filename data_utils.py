@@ -22,6 +22,7 @@ STAGE_NAMES = ("W", "Light", "REM", "Deep")
 CONTINUOUS = ("AHI", "BMI", "AGE")
 COLUMNS = ("IBI",) + tuple("stage_" + name for name in STAGE_NAMES) + CONTINUOUS + ("gender_F", "gender_M")
 ZERO_VALUE_POLICY = "preserve stored zero missing-value markers in scaler and unmodified MSE; no imputation"
+MASKED_ZERO_VALUE_POLICY = "raw IBI > 0 is observed; training signal scaler uses observed points only; missing signal inputs are standardized zero; observed mask is separate from the ten model channels"
 
 
 class CyclicEncoder:
@@ -69,7 +70,7 @@ class WindowDataset(Dataset):
         for filename in preprocessor.splits[split]:
             record = preprocessor.record(filename)
             for start in range(0, len(record["ibi"]) - window_size + 1, stride):
-                if _window_valid(record, start // EPOCH_SAMPLES, preprocessor.window_epochs):
+                if preprocessor._window_valid_for_policy(record, start // EPOCH_SAMPLES, preprocessor.window_epochs):
                     self.window_index.append((filename, start))
                 else:
                     self.excluded_windows += 1
@@ -81,13 +82,18 @@ class WindowDataset(Dataset):
 
     def __getitem__(self, index):
         filename, start = self.window_index[index]
-        return torch.from_numpy(self.preprocessor.window_array(filename, start, self.window_size))
+        data = torch.from_numpy(self.preprocessor.window_array(filename, start, self.window_size))
+        if self.preprocessor.missing_value_policy == "masked":
+            return dict(data=data, observed_mask=torch.from_numpy(
+                self.preprocessor.window_observed_mask(filename, start, self.window_size)))
+        return data
 
 
 class Preprocessor:
     def __init__(self, dataset, propCycEnc=False, *, data_dir=None, metadata_path=None,
                  split_path=None, multiplier=None, downsample_rate=None, max_epochs=None,
-                 split_seed=None, generate_splits=None, config_override=None, data_config=None, window_epochs=None):
+                 split_seed=None, generate_splits=None, config_override=None, data_config=None, window_epochs=None,
+                 missing_value_policy=None):
         if dataset not in datasets:
             raise ValueError("Expected dataset DREAMT or DREAMT_SIM")
         if propCycEnc:
@@ -119,6 +125,11 @@ class Preprocessor:
             return config.get(key, default), config_base
 
         self.dataset = dataset
+        policy = config.get("missing_value_policy", "preserve") if missing_value_policy is None else missing_value_policy
+        if not isinstance(policy, str) or policy not in ("preserve", "masked"):
+            raise ValueError("missing_value_policy must be 'preserve' or 'masked'")
+        self.missing_value_policy = policy
+        self.zero_value_policy = MASKED_ZERO_VALUE_POLICY if policy == "masked" else ZERO_VALUE_POLICY
         dimensions = window_settings(config if window_epochs is None else {"window_epochs": window_epochs})
         self.window_epochs = dimensions["window_epochs"]
         self.window_size = dimensions["window_size"]
@@ -222,14 +233,22 @@ class Preprocessor:
             signal = record["ibi"].reshape(-1, EPOCH_SAMPLES)[record["valid_epochs"]].astype(np.float64)
             if not signal.size:
                 continue
+            # Keep the original training-subject metadata weighting. The new
+            # missing-value policy changes only the signal fit and supervision.
+            values.append(record["continuous"])
+            self.scaler_subjects.append(record["subject_id"])
+            if self.missing_value_policy == "masked":
+                signal = signal[signal > 0]
+                if not signal.size:
+                    continue
             total += signal.size
             summed += float(signal.sum())
             squares += float(np.square(signal).sum())
             signal_minimum = min(signal_minimum, float(signal.min()))
             signal_maximum = max(signal_maximum, float(signal.max()))
-            values.append(record["continuous"])
-            self.scaler_subjects.append(record["subject_id"])
         if not total:
+            if self.missing_value_policy == "masked":
+                raise ValueError("Training subjects contain no observed positive IBI samples in structurally valid epochs")
             raise ValueError("Training subjects contain no valid IBI epochs")
         mean = summed / total
         std = float(np.sqrt(max(0., squares / total - mean * mean)))
@@ -248,6 +267,8 @@ class Preprocessor:
             metadata_fit_subjects=len(values), fit_split="train",
             continuous_transform="raw values, population z-score; no logarithm",
             signal_fit_policy="structurally valid training epochs, including stored zero missing-value markers; no interpolation or clipping")
+        if self.missing_value_policy == "masked":
+            self.scaler["signal_fit_policy"] = "positive observed IBI points in structurally valid training epochs only; no interpolation or clipping"
         self._meta_mean, self._meta_std = meta_mean, meta_std
 
     def record(self, filename):
@@ -273,15 +294,41 @@ class Preprocessor:
         self.accessed_files.append(filename)
         return record
 
-    def window_array(self, filename, start, length):
+    def _window_valid_for_policy(self, record, first, count):
+        if not _window_valid(record, first, count):
+            return False
+        if self.missing_value_policy == "masked":
+            raw = record["ibi"][first * EPOCH_SAMPLES:(first + count) * EPOCH_SAMPLES]
+            return np.count_nonzero(raw > 0) >= 2
+        return True
+
+    def _window_record(self, filename, start, length):
         record = self.record(filename)
         if start < 0 or length <= 0 or start % EPOCH_SAMPLES or length % EPOCH_SAMPLES or start + length > len(record["ibi"]):
             raise ValueError("Window must align with complete epochs within one subject")
         if not _window_valid(record, start // EPOCH_SAMPLES, length // EPOCH_SAMPLES):
             raise ValueError("Window crosses an invalid epoch or known time gap")
+        if not self._window_valid_for_policy(record, start // EPOCH_SAMPLES, length // EPOCH_SAMPLES):
+            raise ValueError("Masked window must contain at least two observed positive IBI samples")
+        return record
+
+    def window_observed_mask(self, filename, start, length):
+        """Return original-scale IBI > 0, never inferred from standardized zeros.
+
+        Preserve mode exposes the same observed mask for optional masked
+        evaluation, while retaining its original tensor-only training output.
+        The returned array is independent of the stored record.
+        """
+        record = self._window_record(filename, start, length)
+        return record["ibi"][start:start + length] > 0
+
+    def window_array(self, filename, start, length):
+        record = self._window_record(filename, start, length)
         end = start + length
         array = np.empty((length, len(COLUMNS)), dtype=np.float32)
         array[:, 0] = (record["ibi"][start:end].astype(np.float64) - self.scaler["signal_mean_seconds"]) / self.scaler["signal_std_seconds"]
+        if self.missing_value_policy == "masked":
+            array[record["ibi"][start:end] == 0, 0] = 0.
         array[:, 1:5] = np.eye(4, dtype=np.float32)[record["stages"][start:end]]
         array[:, 5:8] = (record["continuous"] - self._meta_mean) / self._meta_std
         array[:, 8] = float(record["gender"] == "F")
@@ -309,7 +356,7 @@ class Preprocessor:
         for filename in self.splits["val"]:
             record = self.record(filename)
             candidates = [start for start in range(0, len(record["ibi"]) - self.window_size + 1, stride)
-                          if _window_valid(record, start // EPOCH_SAMPLES, self.window_epochs)]
+                          if self._window_valid_for_policy(record, start // EPOCH_SAMPLES, self.window_epochs)]
             if not candidates:
                 excluded.append(dict(filename=filename, subject_id=Path(filename).stem,
                                      reason="no complete valid configured-length window"))
@@ -338,7 +385,7 @@ class Preprocessor:
     def data_identity(self):
         """Frozen training inputs; opening validation records cannot change it."""
         train_hashes = {name: self._records[name]["file_sha256"] for name in self.splits["train"]}
-        return _json_copy(dict(schema="dreamt_data_identity_v1", schema_version=1,
+        identity = dict(schema="dreamt_data_identity_v1", schema_version=1,
             dataset=self.dataset, data_directory=str(self.data_dir),
             metadata_path=str(self.metadata_path), metadata_file_sha256=self.metadata_file_sha256,
             split_path=str(self.split_path) if self.split_path is not None else None,
@@ -347,10 +394,16 @@ class Preprocessor:
             sample_rate_hz=FS, epoch_samples=EPOCH_SAMPLES, window_epochs=self.window_epochs,
             multiplier=self.multiplier, downsample_rate=self.downsample_rate, max_epochs=self.max_epochs,
             columns=list(COLUMNS), stage_names=list(STAGE_NAMES),
-            zero_value_policy=ZERO_VALUE_POLICY,
+            zero_value_policy=self.zero_value_policy,
             raw_stage_mapping={"0": 0, "1": 1, "2": 1, "3": 3, "4": 2, "other": -1},
             scaler=self.scaler, scaler_subjects=self.scaler_subjects,
-            train_npz_sha256=train_hashes, training_npz_sha256=train_hashes))
+            train_npz_sha256=train_hashes, training_npz_sha256=train_hashes)
+        # Historical preserve identities remain byte-for-byte structurally
+        # compatible; the new mode is explicit and cannot be silently restored
+        # using preserve scaling or the current machine's configuration.
+        if self.missing_value_policy == "masked":
+            identity["missing_value_policy"] = self.missing_value_policy
+        return _json_copy(identity)
 
     @classmethod
     def from_identity(cls, identity, dataset="DREAMT"):
@@ -380,7 +433,8 @@ class Preprocessor:
             metadata_path=identity["metadata_path"], split_path=identity["split_path"],
             multiplier=identity["multiplier"], downsample_rate=identity["downsample_rate"],
             max_epochs=identity["max_epochs"], split_seed=identity["split_seed"],
-            generate_splits=generated, config_override={}, window_epochs=identity.get("window_epochs", 4))
+            generate_splits=generated, config_override={}, window_epochs=identity.get("window_epochs", 4),
+            missing_value_policy=identity.get("missing_value_policy", "preserve"))
         actual = processor.data_identity()
         expected = dict(identity)
         expected.setdefault("window_epochs", 4)  # Legacy manifests used four sleep epochs.
@@ -397,7 +451,7 @@ class Preprocessor:
             columns=list(COLUMNS), non_hierarchical_columns=["IBI"],
             hierarchical_columns=self.hierarchical_features_cyclic,
             sample_rate_hz=FS, epoch_samples=EPOCH_SAMPLES, window_epochs=self.window_epochs, window_size=self.window_size, stage_names=list(STAGE_NAMES),
-            zero_value_policy=ZERO_VALUE_POLICY,
+            zero_value_policy=self.zero_value_policy, missing_value_policy=self.missing_value_policy,
             raw_stage_mapping={"0": 0, "1": 1, "2": 1, "3": 3, "4": 2, "other": -1},
             multiplier=self.multiplier, downsample_rate=self.downsample_rate,
             max_epochs=self.max_epochs, scaler=self.scaler, scaler_subjects=self.scaler_subjects,

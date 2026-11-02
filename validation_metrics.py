@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 
-def _prepare_pair(generated_seconds, reference_seconds):
+def _prepare_pair(generated_seconds, reference_seconds, observed_mask=None):
     for name, value in (("generated", generated_seconds), ("reference", reference_seconds)):
         if not torch.is_tensor(value) or not value.is_floating_point():
             raise TypeError(f"{name} must be a real floating-point tensor")
@@ -26,11 +26,39 @@ def _prepare_pair(generated_seconds, reference_seconds):
         raise ValueError("Generated and reference shapes must match")
     if generated_seconds.device != reference_seconds.device:
         raise ValueError("Generated and reference tensors must use the same device")
+    if observed_mask is not None:
+        if not torch.is_tensor(observed_mask) or observed_mask.dtype != torch.bool:
+            raise TypeError("observed_mask must be a torch.bool tensor")
+        if observed_mask.shape != generated_seconds.shape:
+            raise ValueError("observed_mask must match the [windows, samples] shape")
+        if observed_mask.device != generated_seconds.device:
+            raise ValueError("observed_mask and IBI tensors must use the same device")
+        if not bool((observed_mask.sum(dim=1) >= 2).all()):
+            raise ValueError("Every window must contain at least two observed samples")
     generated = generated_seconds.detach().to(dtype=torch.float64) * 1000.0
     reference = reference_seconds.detach().to(dtype=torch.float64) * 1000.0
-    if not bool(torch.isfinite(generated).all() & torch.isfinite(reference).all()):
-        raise ValueError("Generated and reference IBI must be finite in milliseconds")
+    if observed_mask is None:
+        if not bool(torch.isfinite(generated).all() & torch.isfinite(reference).all()):
+            raise ValueError("Generated and reference IBI must be finite in milliseconds")
+    else:
+        # A reference mask never excuses a failed generated trajectory, even
+        # outside scored positions. Missing reference values may be nonfinite.
+        if not bool(torch.isfinite(generated).all()):
+            raise ValueError("Generated IBI must be finite in milliseconds at every position")
+        if not bool(torch.isfinite(reference[observed_mask]).all()):
+            raise ValueError("Reference IBI must be finite in milliseconds at observed positions")
     return generated, reference
+
+
+def _masked_var_mean(values, observed_mask):
+    """Population moments at a fixed reference-selected set of time samples."""
+    count = observed_mask.sum(dim=1).to(dtype=torch.float64)
+    # Do not multiply unknown NaN/Inf reference values by zero: 0*NaN is NaN.
+    selected = torch.where(observed_mask, values, 0.)
+    mean = selected.sum(dim=1) / count
+    centered = torch.where(observed_mask, selected - mean[:, None], 0.)
+    variance = centered.square().sum(dim=1) / count
+    return variance, mean
 
 
 class DistributionAccumulator:
@@ -53,14 +81,19 @@ class DistributionAccumulator:
         self.kl_sum = None
 
     @torch.no_grad()
-    def update(self, generated_seconds, reference_seconds):
-        generated, reference = _prepare_pair(generated_seconds, reference_seconds)
+    def update(self, generated_seconds, reference_seconds, observed_mask=None):
+        generated, reference = _prepare_pair(generated_seconds, reference_seconds, observed_mask)
         if self.count and (generated.shape[1] != self.window_size
                            or generated.device != self.device):
             raise ValueError("Batches must have the same feature dimension and device")
         batch_count = len(generated)
-        gen_var, gen_mean = torch.var_mean(generated, dim=1, unbiased=False)
-        ref_var, ref_mean = torch.var_mean(reference, dim=1, unbiased=False)
+        if observed_mask is None:
+            # Preserve the legacy reduction exactly when no mask was supplied.
+            gen_var, gen_mean = torch.var_mean(generated, dim=1, unbiased=False)
+            ref_var, ref_mean = torch.var_mean(reference, dim=1, unbiased=False)
+        else:
+            gen_var, gen_mean = _masked_var_mean(generated, observed_mask)
+            ref_var, ref_mean = _masked_var_mean(reference, observed_mask)
         if not bool(torch.isfinite(gen_var).all() & torch.isfinite(ref_var).all()
                     & torch.isfinite(gen_mean).all() & torch.isfinite(ref_mean).all()):
             raise FloatingPointError("Nonfinite within-window moments")
@@ -96,7 +129,8 @@ class DistributionAccumulator:
         return {"aggregate": {"gaussian_kl_real_to_generated": float(mean_window_kl)}}
 
 
-def summarize_distribution(generated_seconds, reference_seconds, *, kl_variance_floor_ms2=1.0):
+def summarize_distribution(generated_seconds, reference_seconds, *, kl_variance_floor_ms2=1.0,
+                           observed_mask=None):
     """Mean KL of same-index window pairs in [windows, time samples] tensors.
 
     Inputs are seconds. Each window's time samples determine its mean and
@@ -104,9 +138,13 @@ def summarize_distribution(generated_seconds, reference_seconds, *, kl_variance_
     KL(real || generated) is computed for each pair of fitted univariate
     Gaussians, then averaged equally over windows. Stored zeros and negative
     generated values are not clipped; the variance floor is in ms squared.
+    An optional bool mask selects the same reference-observed time positions
+    for both fits. Each row needs at least two selected samples. Missing
+    reference values outside that mask may be nonfinite; generated values must
+    always be finite everywhere. Masking never depends on generated amplitudes.
     """
     accumulator = DistributionAccumulator(kl_variance_floor_ms2=kl_variance_floor_ms2)
-    accumulator.update(generated_seconds, reference_seconds)
+    accumulator.update(generated_seconds, reference_seconds, observed_mask=observed_mask)
     return accumulator.finalize()
 
 

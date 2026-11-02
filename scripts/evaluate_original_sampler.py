@@ -344,8 +344,9 @@ def main():
         torch.cuda.synchronize(device)
         start = time.perf_counter()
         # Preserve draw count/order; only the posterior noise scale is corrected.
-        # A local device context places its normal/full/empty and model embedding
-        # factories directly on CUDA; it changes the RNG backend, not the schedule.
+        # A local device context routes supported factories and embeddings;
+        # legacy normal factories may still draw on CPU before .to(device).
+        # Tensor placement is checked after sampling, not inferred for every draw.
         with torch.device(device):
             exec(compile(compiled_source, str(SOURCE), 'exec'), scope)
         torch.cuda.synchronize(device)
@@ -357,21 +358,35 @@ def main():
                              + preprocessor.scaler['signal_mean_seconds'])
         reference_seconds = (reference_tensor[:, 0] * preprocessor.scaler['signal_std_seconds']
                              + preprocessor.scaler['signal_mean_seconds'])
+        observed_mask = torch.as_tensor(preprocessor.window_observed_mask(filename, start_sample, total_length),
+                                        dtype=torch.bool, device=device)
+        masked_reference = preprocessor.missing_value_policy == 'masked'
+        if masked_reference:
+            # The standardized placeholder is not a measured IBI target.
+            reference_seconds = torch.as_tensor(preprocessor.record(filename)['ibi'][start_sample:start_sample+total_length].copy(),
+                                                dtype=torch.float64, device=device)
+        evaluation_mask = observed_mask if masked_reference else torch.ones_like(observed_mask)
+        reference_evaluated = reference_seconds[evaluation_mask]
+        generated_evaluated = generated_seconds[evaluation_mask]
         finite = bool(torch.isfinite(generated).all())
         report['result'] = dict(all_finite=finite,
             condition_columns_bitwise_preserved=bool(torch.equal(generated[:, 1:], reference_tensor[:, 1:])),
             samples=len(generated), duration_seconds=len(generated) / FS,
             denoiser_calls=int(scope['num_ops']),
-            generated_mean_ms=float(generated_seconds.mean() * 1000) if finite else None,
-            reference_mean_ms=float(reference_seconds.mean() * 1000),
-            generated_std_ms=float(generated_seconds.std(unbiased=False) * 1000) if finite else None,
-            reference_std_ms=float(reference_seconds.std(unbiased=False) * 1000),
+            generated_mean_ms=float(generated_evaluated.mean() * 1000) if finite else None,
+            reference_mean_ms=float(reference_evaluated.mean() * 1000),
+            generated_std_ms=float(generated_evaluated.std(unbiased=False) * 1000) if finite else None,
+            reference_std_ms=float(reference_evaluated.std(unbiased=False) * 1000),
             generated_min_ms=float(generated_seconds.min() * 1000) if finite else None,
             generated_max_ms=float(generated_seconds.max() * 1000) if finite else None)
+        report['result'].update(reference_mask_policy='observed_only' if masked_reference else 'all_stored_samples',
+                                evaluated_samples=int(evaluation_mask.sum()),
+                                generated_full_mean_ms=float(generated_seconds.mean()*1000) if finite else None)
         report['cuda_execution'] = dict(device=str(device),
             sampler_source_byte_identical=False, upstream_snapshot_byte_identical=True,
             posterior_variance_sqrt_corrected=True, local_default_device_context=True,
-            random_draw_backend='CUDA', random_draw_count_unchanged=True,
+            random_draw_backend='legacy factory dependent; device context does not guarantee every draw uses CUDA',
+            random_draw_count_unchanged=True,
             schedule_matches_training=True,
             schedule_is_legacy_linear=report['diffusion_identity']['diffusion_schedule'] == 'linear',
             cpu_bitwise_random_stream_equivalence_claim=False)
@@ -379,7 +394,7 @@ def main():
         np.savez_compressed(cli.output_dir / 'generated_samples.npz',
             generated_standardized=generated[:, 0].cpu().numpy(),
             generated_seconds=generated_seconds.cpu().numpy(),
-            reference_seconds=reference_seconds.cpu().numpy(), clean_conditions=reference[:, 1:],
+            reference_seconds=reference_seconds.cpu().numpy(), observed_mask=observed_mask.cpu().numpy(), clean_conditions=reference[:, 1:],
             generated_conditions=generated[:, 1:].cpu().numpy(), sample_rate_hz=np.array(FS),
             subject=np.array(Path(filename).stem), start_sample=np.array(start_sample))
         report['status'] = 'completed' if finite else 'nonfinite_output'

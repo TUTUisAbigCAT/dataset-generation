@@ -96,7 +96,7 @@ def main():
                     ROOT / 'watchsleep_loader.py', ROOT / 'dataset_config.json', ROOT / 'cuda_runtime.py',
                     ROOT / 'third_party/WatchSleepNet/data_setup.py', ROOT / 'epoch_validation.py',
                     ROOT / 'validation_metrics.py', ROOT / 'validation_sampling.py', ROOT / 'window_config.py',
-                    ROOT / 'scripts/evaluate_original_sampler.py', ROOT / 'diffusion_schedule.py']
+                    ROOT / 'scripts/evaluate_original_sampler.py', ROOT / 'diffusion_schedule.py', ROOT / 'missing_data.py']
     hashes = {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
     command = [filename, '-d', args.dataset, '-window_size', str(dimensions['window_size']), '-s4_lmax', str(dimensions['window_size']),
                '-stride', str(EPOCH_SAMPLES), '-batch_size', str(args.batch_size), '-epochs', str(args.epochs),
@@ -122,7 +122,7 @@ def main():
     old_trace, old_argv, old_cwd = sys.gettrace(), sys.argv, Path.cwd()
     old_path = sys.path[:]
     with (output / 'metrics.csv').open('w', encoding='utf-8', newline='') as stream:
-        writer = csv.DictWriter(stream, fieldnames=['step', 'epoch', 'batch_samples', 'epsilon_mse', 'elapsed_seconds'])
+        writer = csv.DictWriter(stream, fieldnames=['step', 'epoch', 'batch_samples', 'loss_weight', 'epsilon_mse', 'elapsed_seconds'])
         writer.writeheader()
 
         def local_trace(frame, event, arg):
@@ -148,6 +148,7 @@ def main():
                                     expected_updates=len(state['dataloader']) * args.epochs,
                                     data=state['preprocessor'].provenance(),
                                     data_identity=state['preprocessor'].data_identity(),
+                                    missing_value_policy=state['preprocessor'].missing_value_policy,
                                     model_input_columns=state['preprocessor'].columns.tolist())
                     manifest['diffusion_identity'] = diffusion_identity(state['args'], state['diffusion_config'])
                     manifest['data_synthetic'] = manifest['data']['data_synthetic']
@@ -160,7 +161,7 @@ def main():
                     if not math.isfinite(value):
                         raise FloatingPointError('Observed nonfinite loss; stopped without changing the algorithm')
                     pending = dict(epoch=int(state['epoch'])+1, batch_samples=int(state['batch'].shape[0]),
-                                   epsilon_mse=value)
+                                   loss_weight=int(state['loss_weight']), epsilon_mse=value)
             return local_trace
 
         def trace(frame, event, arg):
@@ -197,7 +198,9 @@ def main():
                   train_windows=manifest['train_windows'], parameter_count=manifest['parameter_count'],
                   wall_seconds=time.perf_counter()-started, first_loss=losses[0], last_loss=losses[-1],
                   first_25_mean=weighted_loss(rows[:25]), last_25_mean=weighted_loss(rows[-25:]),
-                  mean_loss=weighted_loss(rows), loss_aggregation='sample_weighted_mean',
+                  mean_loss=weighted_loss(rows), loss_aggregation=('observed_point_weighted_mean'
+                      if manifest['missing_value_policy'] == 'masked' else 'sample_weighted_mean'),
+                  missing_value_policy=manifest['missing_value_policy'],
                   validation=validation, all_losses_finite=True, checkpoint_all_finite=True,
                   checkpoint=str(checkpoint_path), checkpoint_sha256=sha(checkpoint_path),
                   source_unchanged=True, mkldnn_enabled=torch.backends.mkldnn.enabled,

@@ -1,8 +1,9 @@
 """Read-only teacher-forced denoising audit of the recorded S4 implementation.
 
-This is an external observation: no sampling, training, loss modification,
-missing-value masking, output clipping, or state-dict loading repair. It uses
-the official conditional forward-noising expression and ordinary MSELoss.
+This is an external observation: no sampling, training, output clipping, or
+state-dict loading repair. It uses the official conditional forward-noising
+expression. Preserve-mode metrics retain ordinary MSELoss; masked runs score
+only the original observed IBI positions, never finite missing placeholders.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 from window_config import DEFAULT_WINDOW_EPOCHS, EPOCH_SAMPLES, FS, window_settings
 from diffusion_schedule import (build_diffusion_config, diffusion_settings,
                                 diffusion_identity, verify_diffusion_identity)
+from missing_data import masked_noise_mse
 
 DEFAULT_TRAINING_ARGS = dict(dataset="DREAMT_SIM", backbone="S4", beta_0=.0001, beta_T=.02,
     timesteps=200, hdim=64, lr=.0001, batch_size=1024, epochs=1000, layers=4,
@@ -148,7 +150,8 @@ def bind_training_data(model_args, manifest, manifest_path, preprocessor_class):
     config = dict(data_dir=str(data_dir), metadata_path=str(metadata_path), generate_splits=generated,
         split_path=None if generated else str(split_path), split_seed=expected.get("split_seed", 42),
         multiplier=expected.get("multiplier", 1.0), downsample_rate=expected.get("downsample_rate", 1),
-        max_epochs=expected.get("max_epochs"), window_epochs=settings["window_epochs"])
+        max_epochs=expected.get("max_epochs"), window_epochs=settings["window_epochs"],
+        missing_value_policy=expected.get("missing_value_policy", "preserve"))
     if "schema" in expected:
         if expected["schema"] != "dreamt_data_identity_v1":
             raise ValueError("Unsupported training data identity schema")
@@ -162,12 +165,14 @@ def bind_training_data(model_args, manifest, manifest_path, preprocessor_class):
     for key in ("dataset", "data_directory", "metadata_path", "split_source", "split_path", "split_seed",
                 "split_file_sha256", "split_fingerprint", "metadata_file_sha256", "splits", "scaler",
                 "scaler_subjects", "multiplier", "downsample_rate", "max_epochs", "sample_rate_hz",
-                "epoch_samples", "window_epochs", "columns", "stage_names", "raw_stage_mapping"):
+                "epoch_samples", "window_epochs", "columns", "stage_names", "raw_stage_mapping",
+                "zero_value_policy"):
         if key in expected:
             reference = expected[key]
             if key in ("data_directory", "metadata_path", "split_path") and reference is not None:
                 reference = str(_recorded_path(reference, manifest_path))
             checks[key] = actual.get(key) == reference
+    checks["missing_value_policy"] = actual.get("missing_value_policy", "preserve") == expected.get("missing_value_policy", "preserve")
     train_names = expected["splits"]["train"]
     stored_hashes = expected.get("train_npz_sha256", expected.get("training_npz_sha256", expected.get("opened_npz_sha256", {})))
     if not all(name in stored_hashes for name in train_names):
@@ -179,6 +184,53 @@ def bind_training_data(model_args, manifest, manifest_path, preprocessor_class):
         raise ValueError("Training data/scaler identity changed: " + ", ".join(failed))
     return preprocessor, dict(all_recorded_identity_fields_match=True, checks=checks,
         global_config_ignored=True, data_identity=actual)
+
+
+def _validation_observed_masks(preprocessor, selected_windows, window_size):
+    """Copy original-scale masks; preserve mode never requests or applies one."""
+    policy = getattr(preprocessor, "missing_value_policy", "preserve")
+    if policy == "preserve":
+        return None
+    if policy != "masked":
+        raise ValueError("Unknown frozen missing_value_policy")
+    import numpy as np
+    masks = []
+    for filename, start in selected_windows:
+        mask = np.asarray(preprocessor.window_observed_mask(filename, start, window_size))
+        if mask.dtype != np.bool_ or mask.shape != (window_size,):
+            raise ValueError("Original observed mask must be Boolean with shape [window_size]")
+        if not mask.any():
+            raise ValueError("Teacher-forced evaluation needs an observed sample in every selected window")
+        masks.append(mask.copy())
+    if not masks:
+        raise ValueError("No observed validation windows were selected")
+    return np.stack(masks)
+
+
+def _teacher_forced_window_metrics(predicted, target, truth_seconds, estimate_seconds, observed_mask, criterion):
+    """Use identical positions for all per-window epsilon and x0 statistics."""
+    if observed_mask is not None:
+        import torch
+        if (observed_mask.dtype != torch.bool or observed_mask.ndim != 1
+                or observed_mask.shape != truth_seconds.shape
+                or observed_mask.device != predicted.device
+                or target.device != predicted.device or estimate_seconds.device != predicted.device
+                or truth_seconds.device != predicted.device):
+            raise ValueError("Per-window observed mask must be Boolean [L] on the metric tensors' device")
+        if not bool(observed_mask.any().item()):
+            raise ValueError("Teacher-forced window has no observed samples")
+        predicted = predicted[:, observed_mask]
+        target = target[:, observed_mask]
+        truth_seconds = truth_seconds[observed_mask]
+        estimate_seconds = estimate_seconds[observed_mask]
+    delta_ms = (estimate_seconds.mean() - truth_seconds.mean()) * 1000
+    return dict(epsilon_mse=criterion(predicted, target),
+        predicted_epsilon_mean=predicted.double().mean(),
+        target_epsilon_mean=target.double().mean(),
+        epsilon_mean_error=(predicted.double() - target.double()).mean(),
+        reference_mean_ms=truth_seconds.mean() * 1000,
+        reconstructed_mean_ms=estimate_seconds.mean() * 1000,
+        x0_window_mean_absolute_error_ms=delta_ms.abs(), x0_window_mean_signed_bias_ms=delta_ms)
 
 
 def resolve_checkpoint(manifest_path, manifest, override=None):
@@ -276,15 +328,19 @@ def main():
 
     windows, identities = [], []
     selected_windows = preprocessor.select_validation_windows(windows_per_subject=2)
+    observed_mask_array = _validation_observed_masks(preprocessor, selected_windows, model_args.window_size)
     for filename, start in selected_windows:
         record = preprocessor.record(filename)
         windows.append(preprocessor.window_array(filename, start, model_args.window_size))
         identities.append(dict(subject_id=record["subject_id"], filename=filename,
             split="val", start_sample=start, start_epoch=start // EPOCH_SAMPLES,
             start_seconds=start / FS, samples=model_args.window_size))
+        if observed_mask_array is not None:
+            identities[-1]["observed_samples"] = int(observed_mask_array[len(identities)-1].sum())
     window_count = len(windows)
     subject_count = len({row["subject_id"] for row in identities})
     clean = from_numpy(np.stack(windows)).to(device=device, dtype=torch.float32)
+    observed_masks = None if observed_mask_array is None else from_numpy(observed_mask_array).to(device=device)
     hierarchy_gpu = torch.as_tensor(hierarchy, device=device, dtype=torch.long)
     non_hier_gpu = torch.as_tensor(non_hier_cols, device=device, dtype=torch.long)
     if clean.shape != (window_count, model_args.window_size, input_features) or not torch.isfinite(clean).all():
@@ -302,6 +358,8 @@ def main():
     # Keep predictions and metrics on CUDA until final file serialization.
     raw = {"clean_channels": clean, "sigma_all_channels": sigmas,
            "random_timesteps": random_timesteps}
+    if observed_masks is not None:
+        raw["observed_mask"] = observed_masks
     rows, load_checks = [], {}
 
     def evaluate(state_name):
@@ -325,7 +383,11 @@ def main():
                 with torch.no_grad(), torch.device(device):
                     predicted = model(batch_noised, timesteps.reshape((-1, 1)))
                 target = sigma[:, :, non_hier_gpu].permute((0, 2, 1))
-                batch_mse = criterion(predicted, target)
+                observed_batch = None if observed_masks is None else observed_masks[offset:offset + len(batch)]
+                if observed_batch is None:
+                    batch_mse = criterion(predicted, target)
+                else:
+                    batch_mse, _, _ = masked_noise_mse(predicted, target, observed_batch)
                 noisy_signal = batch_noised[:, :, non_hier_gpu].permute((0, 2, 1))
                 estimate = (noisy_signal - coeff_2 * predicted) / coeff_1
                 if not torch.isfinite(predicted).all() or not torch.isfinite(estimate).all() or not torch.isfinite(batch_mse):
@@ -337,16 +399,10 @@ def main():
                                      + preprocessor.scaler["signal_mean_seconds"])
                     estimate_seconds = (estimate[i, 0].double() * preprocessor.scaler["signal_std_seconds"]
                                         + preprocessor.scaler["signal_mean_seconds"])
-                    delta_ms = (estimate_seconds.mean() - truth_seconds.mean()) * 1000
                     rows.append(dict(model_state=state_name, scenario=scenario, **identities[offset + i],
                         timestep=int(timesteps[i]), alpha_bar=float(alpha_bars[timesteps[i]]),
-                        epsilon_mse=criterion(predicted[i], target[i]),
-                        predicted_epsilon_mean=predicted[i].double().mean(),
-                        target_epsilon_mean=target[i].double().mean(),
-                        epsilon_mean_error=(predicted[i].double() - target[i].double()).mean(),
-                        reference_mean_ms=truth_seconds.mean() * 1000,
-                        reconstructed_mean_ms=estimate_seconds.mean() * 1000,
-                        x0_window_mean_absolute_error_ms=delta_ms.abs(), x0_window_mean_signed_bias_ms=delta_ms))
+                        **_teacher_forced_window_metrics(predicted[i], target[i], truth_seconds, estimate_seconds,
+                            None if observed_batch is None else observed_batch[i], criterion)))
                 predictions.append(predicted)
             raw[f"epsilon_prediction_{state_name}_{scenario}"] = torch.cat(predictions)
             print(json.dumps(dict(model_state=state_name, scenario=scenario, windows=window_count)), flush=True)
@@ -385,7 +441,7 @@ def main():
             per_subject = [row for row in subjects if row["model_state"] == state and row["scenario"] == scenario]
             totals.append(dict(model_state=state, scenario=scenario, subjects=subject_count, windows=window_count,
                 **{key: torch.stack([row[key] for row in per_subject]).double().mean() for key in metric_keys}))
-    # Scalar transfer is solely the final JSON/CSV serialization boundary.
+    # Transfer accumulated metric tensors at the final JSON/CSV boundary.
     for table in (rows, subjects, totals):
         for row in table:
             for key, value in row.items():
@@ -393,6 +449,8 @@ def main():
                     row[key] = float(value)
     sources = {name: sha256(ROOT / name) for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "window_config.py", "diffusion_schedule.py",
         "TSImputers/SSSDS4Imputer.py", "TSImputers/S4Model.py", "utils/util.py", "scripts/evaluate_denoising.py")}
+    if observed_masks is not None:
+        sources["missing_data.py"] = sha256(ROOT / "missing_data.py")
     report = dict(status="passed", evaluation_type="teacher-forced conditional epsilon denoising; not free generation",
         protocol=dict(initialization_seed=42, evaluation_noise_seed=20261017, scenarios=list(scenarios),
             same_epsilon_across_scenarios=True, initial_and_trained_share_noised_inputs=True,
@@ -421,6 +479,13 @@ def main():
         checkpoint_loading="official named_parameter.copy_; no load_state_dict and no buffer copies",
         buffer_checks=buffer_checks, load_checks=load_checks, all_parameters_and_buffers_unchanged_after_evaluation=True,
         parameter_gradients_absent=True, checkpoint_unchanged=True, summaries=totals)
+    if observed_masks is not None:
+        report["protocol"].update(missing_value_policy="masked",
+            loss="Observed-position epsilon MSE; batch sum divided by valid sample count, not all-point MSE",
+            metric_positions="Original Preprocessor.window_observed_mask for each frozen validation window; same positions for epsilon MSE/means and reference/reconstructed means",
+            missing_placeholder_scored_as_truth=False, raw_observed_mask_exported=True,
+            summary_weighting="Per-window observed-position metrics; windows averaged within subject, then subjects equally weighted")
+        report["runtime"]["host_boundaries"].append("Masked-loss finite checks and observed-count scalar synchronization; no CPU tensor computation")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     table_files(args.output_dir, "per_window", rows)
     table_files(args.output_dir, "per_subject", subjects)
@@ -437,6 +502,9 @@ def main():
     for row in totals:
         lines.append(f"| {row['model_state']} | {row['scenario']} | {row['epsilon_mse']:.6g} | "
             f"{row['x0_window_mean_absolute_error_ms']:.4f} | {row['x0_window_mean_signed_bias_ms']:+.4f} |")
+    if observed_masks is not None:
+        lines += ["", "本次使用训练时冻结的 masked 缺失值策略：epsilon MSE、epsilon均值、真实与重建IBI均值均只统计原始有效mask的相同位置。"
+            "这不是全采样点MSE；标准化均值占位不作为真实IBI评分。raw_predictions.npz中的observed_mask保存该布尔mask。"]
     lines += ["", "先平均每人的已选窗口，再对实际参与验证的主体等权平均。x0 均值误差是辅助观测，不是新增训练损失；"
         "整体 epsilon MSE 与均值误差可以朝不同方向变化。零输出头重建使用带有真实目标信息的 x_t，不能将其均值表现解读为零模型能自由生成。", "",
         "模型由 np/torch seed42 和原 fetchModel 构造；加载前逐项验证固定 buffers 与保存值一致，"

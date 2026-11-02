@@ -4,6 +4,17 @@
 
 网络结构、优化器、epsilon MSE 损失和训练更新公式沿用固定上游版本；本地 S4 慢速 Cauchy 回退计算补齐遗漏的共轭项。新训练通过独立的 `diffusion_schedule.py` 将200步日程的终点累计 alpha 调整到约 `1e-8`，使训练末态更接近采样使用的标准高斯起点；训练与推理使用同一记录日程。采样运行时另修正一处后验噪声系数：使用后验方差的平方根作为标准差；固定上游源码及 `training_utils.py` 不改写。在 `de30ac2` 的数据与 CUDA 设备适配基础上，增加每轮生成验证、loss 数值平均及早停；本地改动纳入源码检查器的逐项白名单。上游来源和许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
+## 缺失零值训练对照
+
+新增可选 `missing_value_policy: "masked"`：在标准化前按原始 IBI `>0` 建立观测掩码，训练集 scaler 排除缺失零值，输入缺失位置使用标准化空间的 0 占位，epsilon MSE 仅对观测点求平均。S4 网络与输入通道不变。默认 `preserve` 保持下面描述的旧全点训练行为；零占位输入仍可能通过时序网络影响邻近预测，不能声称屏蔽损失就恢复了真实缺失值。
+
+配对实验会使用同一正值参考掩码评估两组 KL，并冻结相同的验证窗口。运行方式与限制见 [缺失值对照说明](docs/missing_value_ablation.md)。
+
+```bash
+python scripts/run_missing_value_ablation.py --config dataset_config.json --check-only
+sbatch submit_missing_value_ablation.sh
+```
+
 ## 安装
 
 ```bash

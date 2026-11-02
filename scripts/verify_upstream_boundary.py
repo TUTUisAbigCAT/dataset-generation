@@ -200,6 +200,30 @@ EARLY_STOPPING_EDITS = [(
     "        if validator.should_stop:\n            break",
 )]
 
+# Explicit opt-in missing-observation ablation. The legacy branch retains its
+# MSE and window weighting; the new branch supervises observed IBI points only.
+MISSING_DATA_EDITS = [
+    ("from epoch_validation import create_epoch_validator",
+     "from epoch_validation import create_epoch_validator\nfrom missing_data import masked_noise_mse"),
+    ("        for batch in dataloader:\n            batch = batch.to(device)",
+     "        for batch in dataloader:\n"
+     "            observed_mask = None\n"
+     "            if isinstance(batch, dict):\n"
+     "                observed_mask = batch['observed_mask'].to(device)\n"
+     "                batch = batch['data']\n"
+     "            batch = batch.to(device)"),
+    ("            loss = criterion(sigmas_predicted, sigmas_permuted)",
+     "            if observed_mask is None:\n"
+     "                loss = criterion(sigmas_predicted, sigmas_permuted)\n"
+     "                loss_weight = batch.shape[0]\n"
+     "                loss_total = float(loss.detach()) * loss_weight\n"
+     "            else:\n"
+     "                loss, loss_sum, loss_weight = masked_noise_mse(sigmas_predicted, sigmas_permuted, observed_mask)\n"
+     "                loss_total = float(loss_sum)"),
+    ("            total_loss += float(loss.detach()) * batch.shape[0]\n            total_samples += batch.shape[0]",
+     "            total_loss += loss_total\n            total_samples += loss_weight"),
+]
+
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -227,7 +251,7 @@ def expected_training_source(original):
     start = original.index(b"    df = preprocessor.df_cleaned")
     end = original.index(b"    model = fetchModel", start)
     result = original[:start] + REPLACEMENT.encode().replace(b"\n", newline) + original[end:]
-    for before, after in CUDA_DEVICE_EDITS + DIFFUSION_SCHEDULE_EDITS + EPOCH_REPORTING_EDITS + EARLY_STOPPING_EDITS:
+    for before, after in CUDA_DEVICE_EDITS + DIFFUSION_SCHEDULE_EDITS + EPOCH_REPORTING_EDITS + EARLY_STOPPING_EDITS + MISSING_DATA_EDITS:
         before_bytes = before.encode().replace(b"\n", newline)
         after_bytes = after.encode().replace(b"\n", newline)
         assert result.count(before_bytes) == 1, f"Training edit allowlist is ambiguous: {before}"
@@ -306,7 +330,7 @@ def main():
     # Reverse exactly the reviewed device/reporting edits to verify the unchanged training
     # algorithm. The removed mask conversion needs its original insertion point.
     normalized = actual.decode().replace("\r\n", "\n")
-    for before, after in reversed(CUDA_DEVICE_EDITS + DIFFUSION_SCHEDULE_EDITS + EPOCH_REPORTING_EDITS + EARLY_STOPPING_EDITS):
+    for before, after in reversed(CUDA_DEVICE_EDITS + DIFFUSION_SCHEDULE_EDITS + EPOCH_REPORTING_EDITS + EARLY_STOPPING_EDITS + MISSING_DATA_EDITS):
         if not after:
             anchor = "            conditional_mask[:, :, non_hier_cols] = 0\n"
             assert normalized.count(anchor) == 1
@@ -339,7 +363,9 @@ def main():
         window_configuration_sha256=sha(ROOT / "window_config.py"),
         diffusion_schedule_adapter_sha256=sha(ROOT / "diffusion_schedule.py"),
         cuda_runtime_sha256=sha(ROOT / "cuda_runtime.py"),
-        exact_training_edit="Data/window preparation, explicit schedule adapter import/configuration, enumerated CUDA-only device edits and epoch validation/reporting/early stopping",
+        exact_training_edit="Data/window preparation, schedule/device/reporting edits and explicit opt-in observed-point epsilon-MSE ablation; network unchanged",
+        missing_data_edits=[dict(before=before, after=after) for before, after in MISSING_DATA_EDITS],
+        missing_data_adapter_sha256=sha(ROOT / "missing_data.py"),
         diffusion_schedule_edits=[dict(before=before, after=after) for before, after in DIFFUSION_SCHEDULE_EDITS],
         early_stopping_edits=[dict(before=before, after=after) for before, after in EARLY_STOPPING_EDITS],
         epoch_reporting_edits=[dict(before=before, after=after) for before, after in EPOCH_REPORTING_EDITS],
@@ -348,7 +374,10 @@ def main():
         training_loop_ast_identical=(old_loop == new_loop),
         training_loop_ast_identical_after_allowed_normalization=True,
         training_suffix_byte_identical_after_allowed_normalization=True,
-        optimizer_loss_diffusion_formulas_and_update_order_unchanged=True,
+        optimizer_loss_diffusion_formulas_and_update_order_unchanged=False,
+        legacy_preserve_loss_unchanged=True,
+        optimizer_diffusion_formulas_and_update_order_unchanged=True,
+        optional_masked_loss="sum squared epsilon error over observed points / observed point count; standardized missing input=0",
         gpu_rng_note="Random draws now use the CUDA generator; distributions are unchanged but CPU seeded trajectories are not expected to match",
         official_sampler_snapshot_unchanged=True, sampler_execution_performed=False,
         **sampler_audit,

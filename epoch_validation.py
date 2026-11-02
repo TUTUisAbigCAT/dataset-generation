@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import math
+from numbers import Real
 import os
 from pathlib import Path
 import time
@@ -119,7 +120,7 @@ def validation_options(config):
     values = config.get("validation", {})
     if not isinstance(values, dict):
         raise ValueError("validation must be a JSON object")
-    unknown = set(values) - set(DEFAULT_VALIDATION)
+    unknown = set(values) - (set(DEFAULT_VALIDATION) | {"reference_mask_policy"})
     if unknown:
         raise ValueError(f"Unknown validation options: {sorted(unknown)}")
     result = {**DEFAULT_VALIDATION, **values}
@@ -136,7 +137,27 @@ def validation_options(config):
             or not math.isfinite(floor) or floor <= 0):
         raise ValueError("validation.kl_variance_floor_ms2 must be finite and positive")
     result["kl_variance_floor_ms2"] = float(floor)
+    mask_policy = result.get("reference_mask_policy", "training")
+    if not isinstance(mask_policy, str) or mask_policy not in ("training", "observed_only"):
+        raise ValueError("validation.reference_mask_policy must be training or observed_only")
+    # Omit the default to preserve the existing protocol and options payload.
+    if mask_policy == "training":
+        result.pop("reference_mask_policy", None)
     return result
+
+
+def _uses_reference_mask(preprocessor, options):
+    return (getattr(preprocessor, "missing_value_policy", "preserve") == "masked"
+            or options.get("reference_mask_policy", "training") == "observed_only")
+
+
+def _window_reference_mask(preprocessor, name, start, length):
+    observed = np.asarray(preprocessor.window_observed_mask(name, start, length))
+    if observed.dtype != np.bool_:
+        raise TypeError("window_observed_mask must return a boolean array")
+    if observed.shape != (length,):
+        raise ValueError("window_observed_mask must match the validation window length")
+    return observed.copy()
 
 
 def select_fixed_windows(preprocessor, options):
@@ -152,9 +173,16 @@ def select_fixed_windows(preprocessor, options):
     dataset = preprocessor.make_validation_dataset(window_size=window_size, stride=EPOCH_SAMPLES)
     groups = defaultdict(list)
     end_by_subject = {}
+    use_mask = _uses_reference_mask(preprocessor, options)
+    excluded_insufficient_observations = 0
     for name, start in dataset.window_index:
         if name not in preprocessor.splits["val"]:
             raise RuntimeError("Validation selection escaped the validation split")
+        if use_mask and int(_window_reference_mask(preprocessor, name, start, window_size).sum()) < 2:
+            # Filter before greedy nonoverlap: a rejected window must not block
+            # a later usable start, or participate in the seeded truncation.
+            excluded_insufficient_observations += 1
+            continue
         if start >= end_by_subject.get(name, 0):
             groups[name].append((name, start))
             end_by_subject[name] = start + window_size
@@ -176,7 +204,7 @@ def select_fixed_windows(preprocessor, options):
                 if len(selected) == count:
                     break
         position += 1
-    return sorted(selected), {
+    metadata = {
         "available_nonoverlapping_windows": available,
         "available_subjects": len(groups),
         "selected_windows": count,
@@ -185,6 +213,10 @@ def select_fixed_windows(preprocessor, options):
         "window_size_samples": window_size,
         "policy": "greedy nonoverlap per subject; seeded round-robin subjects and shuffled starts; sorted fixed output",
     }
+    if use_mask:
+        metadata["excluded_insufficient_observation_candidates"] = excluded_insufficient_observations
+        metadata["minimum_observed_samples_per_window"] = 2
+    return sorted(selected), metadata
 
 
 def _save_json(path, value):
@@ -216,6 +248,12 @@ class EpochValidator:
         self.window = window_settings(config)
         self.window_size = self.window["window_size"]
         self.window_epochs = self.window["window_epochs"]
+        self.missing_value_policy = getattr(preprocessor, "missing_value_policy", "preserve")
+        if self.missing_value_policy not in ("preserve", "masked"):
+            raise ValueError("Validation missing_value_policy must be preserve or masked")
+        self.reference_mask = None
+        self.reference_mask_policy = self.options.get("reference_mask_policy", "training")
+        use_reference_mask = _uses_reference_mask(preprocessor, self.options)
         if (training_args.window_size != self.window_size
                 or preprocessor.window_size != self.window_size
                 or preprocessor.window_epochs != self.window_epochs):
@@ -224,6 +262,9 @@ class EpochValidator:
             raise ValueError("Validation window_size must fit within the original S4 kernel length")
         self.metric_description = (f"Mean paired-window KL(real || generated) between univariate Gaussian fits "
                                    f"to the {self.window_size} time samples within each window; nats per window")
+        if use_reference_mask:
+            self.metric_description = (f"Mean paired-window KL(real || generated) between univariate Gaussian fits "
+                                       f"at the same reference-observed positions within each {self.window_size}-sample window; nats per window")
         self.diffusion_config = diffusion_config
         from diffusion_schedule import diffusion_identity
         self.diffusion_identity = diffusion_identity(training_args, diffusion_config)
@@ -240,6 +281,14 @@ class EpochValidator:
                 torch.from_numpy(np.asarray(preprocessor.record(name)["ibi"][start:start + self.window_size],
                                             dtype=np.float64).copy())
                 for name, start in selected])
+            if use_reference_mask:
+                masks = []
+                for name, start in selected:
+                    observed = _window_reference_mask(preprocessor, name, start, self.window_size)
+                    if int(observed.sum()) < 2:
+                        raise ValueError("Every masked validation window needs at least two observed samples")
+                    masks.append(torch.from_numpy(observed.copy()))
+                self.reference_mask = torch.stack(masks)
             self.scale = float(preprocessor.scaler["signal_std_seconds"])
             self.center = float(preprocessor.scaler["signal_mean_seconds"])
             if not math.isfinite(self.scale) or self.scale <= 0 or not math.isfinite(self.center):
@@ -250,6 +299,13 @@ class EpochValidator:
                      sleep_stages=preprocessor.record(name)["stages"][start:start+self.window_size:EPOCH_SAMPLES].tolist(),
                      file_sha256=preprocessor.record(name)["file_sha256"])
                 for index, (name, start) in enumerate(selected)]
+            if self.reference_mask is not None:
+                for metadata, observed in zip(self.windows_metadata, self.reference_mask):
+                    count = int(observed.sum())
+                    metadata["reference_mask"] = dict(
+                        observed_samples=count, missing_samples=self.window_size-count,
+                        observed_fraction=count/self.window_size,
+                        sha256=hashlib.sha256(observed.numpy().tobytes()).hexdigest())
         self.protocol = dict(
             schema="ibi_epoch_window_gaussian_kl_v4", metric=self.metric_description,
             window=self.window,
@@ -280,6 +336,27 @@ class EpochValidator:
             limitations="KL of paired moment-matched univariate Gaussian approximations, not the joint sequence distributions. "
                         "Invariant to temporal permutations within each window; does not assess temporal order, autocorrelation "
                         "or non-Gaussian structure and does not establish conditional fidelity.")
+        if self.reference_mask is not None:
+            self.protocol.update(
+                schema="ibi_epoch_masked_window_gaussian_kl_v5",
+                missing_value_policy=self.missing_value_policy,
+                reference_mask_policy=self.reference_mask_policy,
+                aggregation="paired-window population moments on reference-observed time positions; mean KL over windows; missing positions excluded from both fits; no clipping",
+                reference_mask=dict(
+                    source="preprocessor.window_observed_mask(filename, start_sample, window_size)",
+                    dtype="bool", shape=[len(self.reference), self.window_size],
+                    frozen=True, minimum_observed_samples_per_window=2,
+                    pairing="The same fixed real-data mask selects positions in real[i] and generated[i]",
+                    generation_dependency="None: the mask is used only for scoring, never supplied as an IBI observation to the sampler",
+                    generated_value_policy="All generated positions must be finite, including unobserved positions; negative values remain in the fit when selected",
+                    reference_value_policy="Only observed positions must be finite; missing zero/nonfinite placeholders do not enter reference moments",
+                    mask_sha256_encoding="Contiguous NumPy bool bytes in window sample order"))
+            self.protocol["gaussian_kl"].update(
+                moment_axis="reference-observed time positions within each window (dim=1)",
+                single_window_variance="Population variance over at least two reference-observed positions; no missing-value padding enters either fit")
+            self.protocol["limitations"] += (
+                " Masked KL does not assess generated values at unobserved reference positions, beyond requiring finiteness. "
+                "Scores from different reference masks or window sets are not directly comparable.")
         _save_json(self.output / "protocol.json", self.protocol)
 
     def _generate(self, training_model):
@@ -295,6 +372,8 @@ class EpochValidator:
         torch.manual_seed(self.options["seed"])
         np.random.seed(self.options["seed"])
         accumulator = DistributionAccumulator(kl_variance_floor_ms2=self.options["kl_variance_floor_ms2"])
+        generated_samples = 0
+        generated_nonpositive = torch.zeros((), dtype=torch.int64, device=self.device)
         sampler_reports = []
         for start in range(0, len(self.windows), self.options["batch_size"]):
             clean = self.windows[start:start+self.options["batch_size"]].to(self.device)
@@ -302,9 +381,23 @@ class EpochValidator:
             generated_seconds = ibi.to(dtype=torch.float64) * self.scale + self.center
             # Preserve the same frozen window order in both sides of each pair.
             reference_seconds = self.reference[start:start+self.options["batch_size"]].to(self.device)
-            accumulator.update(generated_seconds, reference_seconds)
+            if self.reference_mask is None:
+                accumulator.update(generated_seconds, reference_seconds)
+            else:
+                observed_mask = self.reference_mask[start:start+self.options["batch_size"]].to(self.device)
+                accumulator.update(generated_seconds, reference_seconds, observed_mask=observed_mask)
+            # Independent all-position diagnostics: a reference mask must not
+            # hide nonpositive generated values. These do not select checkpoints.
+            generated_samples += generated_seconds.numel()
+            generated_nonpositive += (generated_seconds <= 0).sum()
             sampler_reports.append(metadata)
-        return accumulator.finalize(), copied, sampler_reports
+        metrics = accumulator.finalize()
+        nonpositive_samples = int(generated_nonpositive)
+        metrics["diagnostics"] = dict(
+            generated_samples=generated_samples,
+            generated_nonpositive_samples=nonpositive_samples,
+            generated_nonpositive_fraction=nonpositive_samples/generated_samples)
+        return metrics, copied, sampler_reports
 
     def run(self, epoch, training_model, train_mean_loss):
         if self.should_stop or epoch != len(self.reports) + 1:
@@ -343,6 +436,7 @@ class EpochValidator:
                 checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest())
         report = dict(status="completed", epoch=epoch, train_mean_loss=float(train_mean_loss),
                       aggregate=aggregate,
+                      diagnostics=metrics.get("diagnostics", {}),
                       validation_seconds=time.perf_counter()-started, device=str(self.device),
                       protocol=str(self.output / "protocol.json"), model_copy=copied,
                       sampling=sampler_reports, early_stopping=stopping)
@@ -386,8 +480,17 @@ def create_epoch_validator(preprocessor, args, model, diffusion_config, device):
 
 
 def weighted_loss(rows):
-    """Average per-batch MSE by the number of equally sized training windows."""
-    count = sum(row["batch_samples"] for row in rows)
-    if count <= 0:
+    """Average batch losses by their actual reduction weight.
+
+    Masked runs supply observed-point counts as loss_weight. Existing rows
+    without it retain the original equally sized window-count weighting.
+    """
+    rows = list(rows)
+    weights = [row.get("loss_weight", row["batch_samples"]) for row in rows]
+    if any(isinstance(weight, (bool, np.bool_)) or not isinstance(weight, Real)
+           or not math.isfinite(weight) or weight <= 0 for weight in weights):
+        raise ValueError("Loss weights must be finite positive numbers, not bool")
+    count = sum(weights)
+    if not math.isfinite(count) or count <= 0:
         raise ValueError("Cannot average an empty training run")
-    return math.fsum(row["epsilon_mse"] * row["batch_samples"] for row in rows) / count
+    return math.fsum(row["epsilon_mse"] * weight for row, weight in zip(rows, weights)) / count
