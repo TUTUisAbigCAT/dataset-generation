@@ -98,7 +98,8 @@ sbatch submit_all88_s092_sweep.sh
 ```
 
 The script uses the current `.venv`, the existing modules/account, one GPU and
-four CPU threads per task, and `--array=0-11%4` (at most four concurrent tasks).
+four CPU threads per task, and `--array=0-11` (all 12 tasks eligible to run concurrently).
+Actual start times depend on GPU availability and cluster/account limits.
 The time limit is 10 hours per task. CUDA is required for model execution.
 The earlier `submit_dropout_sweep.sh` is the separate historical 16-job setup;
 use `submit_all88_s092_sweep.sh` for this protocol.

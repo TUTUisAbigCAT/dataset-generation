@@ -3,7 +3,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --gpus-per-node=1
 #SBATCH --time=10:00:00
-#SBATCH --array=0-11%4
+#SBATCH --array=0-11
 #SBATCH --job-name=all88-s092
 #SBATCH --output=/home/yxtao/links/scratch/dataset-generation/logs/all88_s092_%A_%a.txt
 
