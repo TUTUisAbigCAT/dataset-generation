@@ -21,6 +21,10 @@ import traceback
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from host_runtime import configure_host_threads
+if __name__ == '__main__':
+    configure_host_threads()
+
 from cuda_runtime import require_cuda, cuda_environment
 from epoch_validation import weighted_loss
 from window_config import EPOCH_SAMPLES, window_settings
@@ -100,7 +104,7 @@ def main():
                     ROOT / 'watchsleep_loader.py', ROOT / 'dataset_config.json', ROOT / 'cuda_runtime.py',
                     ROOT / 'third_party/WatchSleepNet/data_setup.py', ROOT / 'epoch_validation.py',
                     ROOT / 'validation_metrics.py', ROOT / 'validation_sampling.py', ROOT / 'validation_artifacts.py', ROOT / 'window_config.py',
-                    ROOT / 'scripts/evaluate_original_sampler.py', ROOT / 'diffusion_schedule.py', ROOT / 'missing_data.py', ROOT / 'signal_normalization.py', ROOT / 'training_input_dropout.py', ROOT / 's4_dropout_config.py']
+                    ROOT / 'scripts/evaluate_original_sampler.py', ROOT / 'diffusion_schedule.py', ROOT / 'missing_data.py', ROOT / 'signal_normalization.py', ROOT / 'training_input_dropout.py', ROOT / 's4_dropout_config.py', ROOT / 'host_runtime.py']
     hashes = {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
     command = [filename, '-d', args.dataset, '-window_size', str(dimensions['window_size']), '-s4_lmax', str(dimensions['window_size']),
                '-stride', str(EPOCH_SAMPLES), '-batch_size', str(args.batch_size), '-epochs', str(args.epochs),
@@ -113,6 +117,7 @@ def main():
                     mkldnn_enabled=torch.backends.mkldnn.enabled, threads=torch.get_num_threads(),
                     process_id=os.getpid(), command=command, source_sha256=hashes,
                     device=str(device), cuda_environment=cuda_environment(device), window_settings=dimensions,
+                    host_thread_runtime=configure_host_threads(),
                     diffusion_settings=schedule_settings, training_input_dropout=dict(options=dropout_options),
                     s4_dropout=s4_probability,
                     observer='sys.settrace reads current loss and completed updates only; no training hooks or replacements',

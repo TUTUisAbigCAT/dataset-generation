@@ -18,6 +18,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from host_runtime import configure_host_threads
+if __name__ == '__main__':
+    configure_host_threads()
+
 from scripts.run_missing_value_ablation import (
     _read_json, _epoch_rows, _check_training_args, compare_reference_preflights,
     expected_training_args, save_json, validate_training_budget,
@@ -37,7 +41,7 @@ PROTOCOL = dict(mode='all_subjects_train_single_subject_eval', subject='S092', e
 SNAPSHOT_SOURCES = ('training_wavestitch.py', 'training_utils.py', 'TSImputers/SSSDS4Imputer.py',
     'TSImputers/S4Model.py', 'data_utils.py', 'epoch_validation.py', 'validation_sampling.py',
     'validation_metrics.py', 'diffusion_schedule.py', 'signal_normalization.py',
-    'training_input_dropout.py', 's4_dropout_config.py', 'scripts/evaluate_original_sampler.py')
+    'training_input_dropout.py', 's4_dropout_config.py', 'host_runtime.py', 'scripts/evaluate_original_sampler.py')
 
 
 def validate_configuration(row):
@@ -214,6 +218,7 @@ def main(argv=None):
         evaluation_protocol=deepcopy(PROTOCOL), evaluation_is_held_out=False,
         checkpoint_selection='minimum current epoch S092 Gaussian KL; no smoothing',
         duplicate_zero_baseline=row['input_probability'] == row['s4_probability'] == 0,
+        host_thread_runtime=configure_host_threads(cli.threads),
         grid_sha256=sha256(cli.grid), source_sha256=hashes,
         limitation='S092 is training data; this measures fitting, not held-out generalization. Native S4 dropout consumes the training RNG.')
     save_json(output / 'summary.json', status)

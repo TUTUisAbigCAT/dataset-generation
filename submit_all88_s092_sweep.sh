@@ -14,6 +14,15 @@ module load opencv/4.9.0
 module load python/3.11
 source ./.venv/bin/activate
 
+# Set before Python imports NumPy/PyTorch. BLIS manual loop controls override
+# its total count, so reset all of them as well as the modern dispatcher.
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+export MKL_NUM_THREADS="$OMP_NUM_THREADS"
+export OMP_DYNAMIC=FALSE MKL_DYNAMIC=FALSE
+export BLIS_THREAD_IMPL=single BLIS_NUM_THREADS=1
+export BLIS_JC_NT=1 BLIS_PC_NT=1 BLIS_IC_NT=1 BLIS_JR_NT=1 BLIS_IR_NT=1
+export PYTHONFAULTHANDLER=1
+
 CONFIG=dataset_config.json
 SWEEP_ROOT="/home/yxtao/links/scratch/dataset-generation/runs/all88_s092_sweep_${SLURM_ARRAY_JOB_ID}"
 

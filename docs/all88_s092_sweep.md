@@ -137,3 +137,29 @@ Slurm logs are `logs/all88_s092_<array_job_id>_<id>.txt`. A failed or interrupte
 task is not labeled completed. After training, the launcher verifies that the
 best epoch is the first minimum of the raw KL column, its saved weight hash
 matches, and the full requested update budget was completed.
+
+## BLIS thread initialization
+
+The Slurm launcher sets the host thread policy before the first Python process
+starts. BLIS runs single-threaded, including its manual loop controls for older
+versions; OpenMP and MKL retain the requested four threads with dynamic team
+sizing disabled. Python entry points also apply the policy before numerical
+imports, and child processes inherit it. Model training and sampling still
+require CUDA; the GPU allocation and 12-task array are unchanged.
+
+This addresses the native abort `A different number of threads was created than
+was requested`. BLIS can abort when OpenMP creates a team whose size differs from
+the requested size. A native abort produces exit code `-6` without a Python
+exception, so `training/failure.json` may not exist. The optional Cauchy CUDA
+extension warning is separate from this failure.
+
+The effective environment is recorded as `host_thread_runtime` in the sweep
+`summary.json`, `run/status.json`, and training `run_manifest.json`. The frozen
+workspace includes `host_runtime.py` and records its hash. `PYTHONFAULTHANDLER=1`
+is inherited at child startup to help diagnose any subsequent native failure.
+Update the checkout and submit a new job; existing processes and frozen run
+workspaces do not receive this fix. Local startup/inheritance tests do not
+replace verification with the cluster's installed BLIS/OpenMP libraries.
+
+References: [BLIS OpenMP team-size check](https://github.com/flame/blis/blob/0.9.0/frame/thread/bli_l3_decor_openmp.c#L202-L245)
+and [BLIS threading controls](https://github.com/flame/blis/blob/master/docs/Multithreading.md).

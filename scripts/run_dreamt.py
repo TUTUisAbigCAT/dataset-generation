@@ -19,10 +19,20 @@ import traceback
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from cuda_runtime import require_cuda, cuda_environment
-from diffusion_schedule import diffusion_settings, diffusion_identity
+from host_runtime import configure_host_threads
 from training_input_dropout import input_dropout_options
 from s4_dropout_config import s4_dropout_options
+
+
+def require_cuda():
+    # Keep numerical imports after the CLI's host threading policy is applied.
+    from cuda_runtime import require_cuda as implementation
+    return implementation()
+
+
+def cuda_environment(device):
+    from cuda_runtime import cuda_environment as implementation
+    return implementation(device)
 
 
 def save_json(path, value):
@@ -53,7 +63,7 @@ def resolve_output_directory(config_path, explicit_output=None):
 def snapshot_source(destination):
     destination.mkdir()
     for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "cuda_runtime.py",
-                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "validation_artifacts.py", "window_config.py", "diffusion_schedule.py", "missing_data.py", "signal_normalization.py", "training_input_dropout.py", "s4_dropout_config.py"):
+                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "validation_artifacts.py", "window_config.py", "diffusion_schedule.py", "missing_data.py", "signal_normalization.py", "training_input_dropout.py", "s4_dropout_config.py", "host_runtime.py"):
         shutil.copy2(ROOT / name, destination / name)
     for name in ("TSImputers", "utils", "third_party"):
         shutil.copytree(ROOT / name, destination / name,
@@ -91,8 +101,9 @@ def main():
             if key.startswith("DREAMT_"):
                 del os.environ[key]
         os.environ["DREAMT_CONFIG_PATH"] = str(cli.config.resolve())
-        os.environ["OMP_NUM_THREADS"] = str(cli.threads)
-        os.environ["MKL_NUM_THREADS"] = str(cli.threads)
+        status['host_thread_runtime'] = configure_host_threads(cli.threads)
+        save_json(output / 'status.json', status)
+        from diffusion_schedule import diffusion_settings, diffusion_identity
         # Data-only validation does not execute a model. All compute stages require CUDA.
         if not cli.check_only:
             device = require_cuda()
