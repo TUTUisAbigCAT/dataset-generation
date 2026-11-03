@@ -251,7 +251,7 @@ class ZeroFillWorkflowTests(unittest.TestCase):
                 namespace = dict(torch=torch, np=np, model=model, optimizer=optimizer, criterion=criterion,
                     device=torch.device("cpu"), args=args, dataloader=[batch], diffusion_config=build_diffusion_config(args),
                     non_hier_cols=torch.tensor([0]), randint=torch.randint, normal=torch.normal, sqrt=torch.sqrt,
-                    masked_noise_mse=forbidden, validator=SimpleNamespace(should_stop=False,
+                    masked_noise_mse=forbidden, training_input_dropout=lambda batch: batch, validator=SimpleNamespace(should_stop=False,
                     run=lambda epoch, live_model, loss: reports.append(loss)))
                 execute_node(loop, namespace)
             forbidden.assert_not_called()

@@ -77,6 +77,8 @@ def main():
     config = json.loads(config_path.read_text(encoding="utf-8-sig")) if config_path.is_file() else {}
     dimensions = window_settings(config)
     schedule_settings = diffusion_settings(config, default_schedule="linear_power")
+    from training_input_dropout import input_dropout_options
+    dropout_options = input_dropout_options(config)
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
     checkpoint_path = ROOT / 'saved_models' / args.dataset / 'model.pth'
@@ -96,7 +98,7 @@ def main():
                     ROOT / 'watchsleep_loader.py', ROOT / 'dataset_config.json', ROOT / 'cuda_runtime.py',
                     ROOT / 'third_party/WatchSleepNet/data_setup.py', ROOT / 'epoch_validation.py',
                     ROOT / 'validation_metrics.py', ROOT / 'validation_sampling.py', ROOT / 'validation_artifacts.py', ROOT / 'window_config.py',
-                    ROOT / 'scripts/evaluate_original_sampler.py', ROOT / 'diffusion_schedule.py', ROOT / 'missing_data.py', ROOT / 'signal_normalization.py']
+                    ROOT / 'scripts/evaluate_original_sampler.py', ROOT / 'diffusion_schedule.py', ROOT / 'missing_data.py', ROOT / 'signal_normalization.py', ROOT / 'training_input_dropout.py']
     hashes = {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
     command = [filename, '-d', args.dataset, '-window_size', str(dimensions['window_size']), '-s4_lmax', str(dimensions['window_size']),
                '-stride', str(EPOCH_SAMPLES), '-batch_size', str(args.batch_size), '-epochs', str(args.epochs),
@@ -108,7 +110,7 @@ def main():
                     mkldnn_enabled=torch.backends.mkldnn.enabled, threads=torch.get_num_threads(),
                     process_id=os.getpid(), command=command, source_sha256=hashes,
                     device=str(device), cuda_environment=cuda_environment(device), window_settings=dimensions,
-                    diffusion_settings=schedule_settings,
+                    diffusion_settings=schedule_settings, training_input_dropout=dict(options=dropout_options),
                     observer='sys.settrace reads current loss and completed updates only; no training hooks or replacements',
                     observer_sha256=sha(Path(__file__)), training_args=None,
                     checkpoint=str(checkpoint_path), data_synthetic=None)
@@ -184,6 +186,7 @@ def main():
             os.chdir(old_cwd)
     assert pending is None
     validation = training_state['validator'].summary()
+    dropout_report = training_state['training_input_dropout'].report()
     del training_state  # Release the training model/optimizer before loading the checkpoint audit.
     completion = validate_completion(validation, steps, manifest['batches_per_epoch'], args.epochs)
     assert hashes == {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
@@ -200,7 +203,7 @@ def main():
                   first_25_mean=weighted_loss(rows[:25]), last_25_mean=weighted_loss(rows[-25:]),
                   mean_loss=weighted_loss(rows), loss_aggregation=('observed_point_weighted_mean'
                       if manifest['missing_value_policy'] == 'masked' else 'sample_weighted_mean'),
-                  missing_value_policy=manifest['missing_value_policy'],
+                  missing_value_policy=manifest['missing_value_policy'], training_input_dropout=dropout_report,
                   validation=validation, all_losses_finite=True, checkpoint_all_finite=True,
                   checkpoint=str(checkpoint_path), checkpoint_sha256=sha(checkpoint_path),
                   source_unchanged=True, mkldnn_enabled=torch.backends.mkldnn.enabled,
@@ -209,6 +212,7 @@ def main():
     save_json(output / 'progress.json', dict(status='completed', updates=steps, **completion))
     manifest.update(completion, updates=steps, checkpoint_epoch=completion['completed_epochs'])
     manifest['validation'] = validation
+    manifest['training_input_dropout'] = dropout_report
     manifest['status'] = 'completed'
     manifest['checkpoint_sha256'] = report['checkpoint_sha256']
     save_json(output / 'run_manifest.json', manifest)

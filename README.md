@@ -368,6 +368,12 @@ sbatch submit_inference.sh
 
 两个脚本均复用已完成 30 轮对照中的配置与固定验证窗口，核对原始数据、训练预算和未变的网络/采样代码，验证继续只对原始正值位置评分。详见 [独立预处理实验说明](docs/preprocessing_experiments.md)。
 
+## min-max 后续对照：[0,1] 与输入 dropout
+
+`submit_minmax01.sh` 将干净 IBI 的 `[0,2]` 秒映射到 `[0,1]`，推理后乘 2 恢复秒。`submit_minmax_dropout.sh` 保持 `[-1,1]`，训练时将加噪后的 IBI 输入按 10% 概率逐点置为归一化空间 0；条件、epsilon 目标和全点 MSE 保持原规则，验证与推理关闭该操作。
+
+两组各自从头训练 30 轮，与已完成的 `minmax_20261103T003905Z_1223635` 使用相同训练预算和验证窗口。配置、计数、输出和提交方式见 [min-max 后续实验说明](docs/minmax_followup_experiments.md)。
+
 ## S092 四阶段评估：两组最终第 30 轮权重
 
 `submit_stage_evaluation.sh` 使用这次缺失值对照的两组 **final epoch-30** 权重，在相同 S092 原始阶段与人员条件下各生成 8 次。按原始 30 秒标签分别统计 W、Light、REM、Deep 的均值误差、方差误差、高斯 KL 和非正值比例；真实 IBI 不输入模型，混合阶段窗口不改成纯阶段条件。结果保留每次波形和分阶段图。执行前 `git pull`，创建日志目录，再 `sbatch submit_stage_evaluation.sh`。路径、身份核对、评分口径与输出说明见 [四阶段评估说明](docs/stage_evaluation.md)。

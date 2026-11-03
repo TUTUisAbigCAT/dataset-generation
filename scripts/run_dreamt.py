@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 
 from cuda_runtime import require_cuda, cuda_environment
 from diffusion_schedule import diffusion_settings, diffusion_identity
+from training_input_dropout import input_dropout_options
 
 
 def save_json(path, value):
@@ -51,7 +52,7 @@ def resolve_output_directory(config_path, explicit_output=None):
 def snapshot_source(destination):
     destination.mkdir()
     for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "cuda_runtime.py",
-                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "validation_artifacts.py", "window_config.py", "diffusion_schedule.py", "missing_data.py", "signal_normalization.py"):
+                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "validation_artifacts.py", "window_config.py", "diffusion_schedule.py", "missing_data.py", "signal_normalization.py", "training_input_dropout.py"):
         shutil.copy2(ROOT / name, destination / name)
     for name in ("TSImputers", "utils", "third_party"):
         shutil.copytree(ROOT / name, destination / name,
@@ -104,6 +105,7 @@ def main():
             raise ValueError("No valid configured-length training windows in the selected folder")
         from epoch_validation import select_fixed_windows, validation_options, early_stopping_options
         selected_config = json.loads(cli.config.read_text(encoding="utf-8-sig"))
+        dropout_config = input_dropout_options(selected_config)
         schedule_config = diffusion_settings(selected_config, default_schedule="linear_power")
         schedule_identity = diffusion_identity(dict(schedule_config, beta_0=.0001, beta_T=.02, timesteps=200))
         validation_config = validation_options(selected_config)
@@ -118,7 +120,7 @@ def main():
             window_epochs=preprocessor.window_epochs, window_size=preprocessor.window_size,
             validation_windows=[dict(filename=name, start_sample=start) for name, start in validation],
             validation_selection=selection, validation_options=validation_config,
-            early_stopping=stopping_config,
+            early_stopping=stopping_config, training_input_dropout=dropout_config,
             diffusion_settings=schedule_config,
             diffusion_identity=schedule_identity,
             provenance=preprocessor.provenance(), test_npz_opened=False,
@@ -139,6 +141,7 @@ def main():
         frozen_config["missing_value_policy"] = preprocessor.missing_value_policy
         if preprocessor.signal_normalization is not None:
             frozen_config["signal_normalization"] = preprocessor.signal_normalization
+        frozen_config["training_input_dropout"] = dropout_config
         frozen_config["validation"] = validation_config
         frozen_config["early_stopping"] = stopping_config
         frozen_config.update(schedule_config)

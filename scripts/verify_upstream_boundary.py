@@ -225,6 +225,20 @@ MISSING_DATA_EDITS = [
 ]
 
 
+# Three exact opt-in training-input augmentation edits. No model, target,
+# forward-noising expression, loss reduction or optimizer operation is changed.
+TRAINING_INPUT_DROPOUT_EDITS = [
+    ("from missing_data import masked_noise_mse",
+     "from missing_data import masked_noise_mse\nfrom training_input_dropout import create_training_input_dropout"),
+    ("    validator = create_epoch_validator(preprocessor, args, model, diffusion_config, device)",
+     "    training_input_dropout = create_training_input_dropout(device)\n"
+     "    validator = create_epoch_validator(preprocessor, args, model, diffusion_config, device)"),
+    ("            batch_noised = batch_noised.to(device)",
+     "            batch_noised = batch_noised.to(device)\n"
+     "            batch_noised = training_input_dropout(batch_noised)"),
+]
+
+
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -246,16 +260,47 @@ def expected_core_source(name, original):
     return result
 
 
-def expected_training_source(original):
+def expected_training_source(original, *, include_input_dropout=True):
     newline = b"\r\n" if b"\r\n" in original else b"\n"
     start = original.index(b"    df = preprocessor.df_cleaned")
     end = original.index(b"    model = fetchModel", start)
     result = original[:start] + REPLACEMENT.encode().replace(b"\n", newline) + original[end:]
-    for before, after in CUDA_DEVICE_EDITS + DIFFUSION_SCHEDULE_EDITS + EPOCH_REPORTING_EDITS + EARLY_STOPPING_EDITS + MISSING_DATA_EDITS:
+    edits = CUDA_DEVICE_EDITS + DIFFUSION_SCHEDULE_EDITS + EPOCH_REPORTING_EDITS + EARLY_STOPPING_EDITS + MISSING_DATA_EDITS
+    if include_input_dropout:
+        edits = edits + TRAINING_INPUT_DROPOUT_EDITS
+    for before, after in edits:
         before_bytes = before.encode().replace(b"\n", newline)
         after_bytes = after.encode().replace(b"\n", newline)
         assert result.count(before_bytes) == 1, f"Training edit allowlist is ambiguous: {before}"
         result = result.replace(before_bytes, after_bytes, 1)
+    return result
+
+
+def remove_training_input_dropout_edits(source):
+    """Reverse only the three exact additions, with full-source identity checks.
+
+    The previous exact adapter source is also accepted unchanged. Partial,
+    duplicated, rewritten or unrelated modifications are rejected, even if
+    stripping an augmentation-looking line would otherwise produce a match.
+    """
+    if not isinstance(source, bytes):
+        raise TypeError("Training source must be bytes")
+    original = (UPSTREAM / "training_wavestitch.py").read_bytes()
+    without_dropout = expected_training_source(original, include_input_dropout=False)
+    if source == without_dropout:
+        return source
+    if source != expected_training_source(original):
+        raise ValueError("Training source differs beyond the three exact input-dropout additions")
+    newline = b"\r\n" if b"\r\n" in original else b"\n"
+    result = source
+    for before, after in reversed(TRAINING_INPUT_DROPOUT_EDITS):
+        before_bytes = before.encode().replace(b"\n", newline)
+        after_bytes = after.encode().replace(b"\n", newline)
+        if result.count(after_bytes) != 1:
+            raise ValueError("Training input-dropout reversal is ambiguous")
+        result = result.replace(after_bytes, before_bytes, 1)
+    if result != without_dropout:
+        raise ValueError("Training source changed beyond the authorized input augmentation")
     return result
 
 
@@ -325,12 +370,12 @@ def main():
         assert (ROOT / name).read_bytes() == expected_core_source(name, (UPSTREAM / name).read_bytes()), f"Imported core exceeds exact correction allowlist: {name}"
     original = (UPSTREAM / "training_wavestitch.py").read_bytes()
     actual = (ROOT / "training_wavestitch.py").read_bytes()
-    assert actual == expected_training_source(original), "Training modifications exceeded the exact data/device/epoch-reporting allowlist"
+    assert actual == expected_training_source(original), "Training modifications exceeded the exact data/device/reporting/input-augmentation allowlist"
 
     # Reverse exactly the reviewed device/reporting edits to verify the unchanged training
     # algorithm. The removed mask conversion needs its original insertion point.
     normalized = actual.decode().replace("\r\n", "\n")
-    for before, after in reversed(CUDA_DEVICE_EDITS + DIFFUSION_SCHEDULE_EDITS + EPOCH_REPORTING_EDITS + EARLY_STOPPING_EDITS + MISSING_DATA_EDITS):
+    for before, after in reversed(CUDA_DEVICE_EDITS + DIFFUSION_SCHEDULE_EDITS + EPOCH_REPORTING_EDITS + EARLY_STOPPING_EDITS + MISSING_DATA_EDITS + TRAINING_INPUT_DROPOUT_EDITS):
         if not after:
             anchor = "            conditional_mask[:, :, non_hier_cols] = 0\n"
             assert normalized.count(anchor) == 1
@@ -363,9 +408,15 @@ def main():
         window_configuration_sha256=sha(ROOT / "window_config.py"),
         diffusion_schedule_adapter_sha256=sha(ROOT / "diffusion_schedule.py"),
         cuda_runtime_sha256=sha(ROOT / "cuda_runtime.py"),
-        exact_training_edit="Data/window preparation, schedule/device/reporting edits and explicit opt-in observed-point epsilon-MSE ablation; network unchanged",
+        exact_training_edit="Data/window preparation, schedule/device/reporting edits, opt-in observed-point epsilon-MSE and opt-in post-noising IBI input dropout; network unchanged",
         missing_data_edits=[dict(before=before, after=after) for before, after in MISSING_DATA_EDITS],
         missing_data_adapter_sha256=sha(ROOT / "missing_data.py"),
+        training_input_dropout_edits=[dict(before=before, after=after) for before, after in TRAINING_INPUT_DROPOUT_EDITS],
+        training_input_dropout_adapter_sha256=sha(ROOT / "training_input_dropout.py"),
+        training_input_dropout_supported=True,
+        training_input_dropout_activation="Explicit training_input_dropout.probability in frozen JSON; source audit does not run training",
+        optional_training_input_dropout="Post-noising IBI channel only, normalized zero fill, no kept-value scaling; independent device generator; targets/loss unchanged; p=0 exact identity with no random draws",
+        model_input_distribution_changes_when_dropout_enabled=True,
         diffusion_schedule_edits=[dict(before=before, after=after) for before, after in DIFFUSION_SCHEDULE_EDITS],
         early_stopping_edits=[dict(before=before, after=after) for before, after in EARLY_STOPPING_EDITS],
         epoch_reporting_edits=[dict(before=before, after=after) for before, after in EPOCH_REPORTING_EDITS],

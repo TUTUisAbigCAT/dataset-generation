@@ -16,9 +16,11 @@ import torch
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from data_utils import Preprocessor
-from signal_normalization import normalization_spec, signal_affine_parameters, validate_signal_bounds
+from signal_normalization import (normalization_spec, normalization_affine_parameters,
+                                  signal_affine_parameters, validate_signal_bounds)
 
 MINMAX=dict(method='minmax',min_seconds=0.,max_seconds=2.)
+MINMAX01=dict(MINMAX,output_range=[0.,1.])
 
 
 class AffineHelperTests(unittest.TestCase):
@@ -71,6 +73,51 @@ class AffineHelperTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_signal_bounds(invalid,MINMAX,context='fixture')
             np.testing.assert_array_equal(invalid,before)
+
+    def test_output_range_canonicalization_preserves_legacy_and_does_not_mutate_config(self):
+        explicit=dict(MINMAX,output_range=[-1,1])
+        self.assertEqual(normalization_spec({'signal_normalization':explicit}),MINMAX)
+        self.assertEqual(normalization_affine_parameters(explicit),(1.,1.))
+        source={'signal_normalization':dict(MINMAX,output_range=[0,1])}
+        canonical=normalization_spec(source)
+        self.assertEqual(canonical,MINMAX01)
+        self.assertEqual(normalization_affine_parameters(canonical),(0.,2.))
+        canonical['output_range'][0]=.5
+        self.assertEqual(source['signal_normalization']['output_range'],[0,1])
+        self.assertEqual(explicit['output_range'],[-1,1])
+        # The affine formula also applies to a nonzero physical lower bound.
+        self.assertEqual(normalization_affine_parameters(dict(MINMAX01,min_seconds=.5,max_seconds=2.5)),(.5,2.))
+        with self.assertRaises(ValueError):
+            normalization_affine_parameters({'method':'zscore'})
+
+    def test_output_range_strict_validation_and_frozen_affine_crosscheck(self):
+        for value in (None,True,'[0,1]',(0,1),[],[0],[0,1,2],[False,1],
+                      [0,'1'],[0,float('nan')],[0,float('inf')],[1,0],[0,2],[-1,0]):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                normalization_spec({'signal_normalization':dict(MINMAX,output_range=value)})
+        scaler=dict(signal_mean_seconds=.8,signal_std_seconds=.2,
+                    signal_normalization=copy.deepcopy(MINMAX01),
+                    signal_center_seconds=0.,signal_scale_seconds=2.)
+        self.assertEqual(signal_affine_parameters(scaler),(0.,2.))
+        for center,scale in ((1.,1.),(0.,1.),(1.,2.)):
+            changed=dict(scaler,signal_center_seconds=center,signal_scale_seconds=scale)
+            with self.subTest(center=center,scale=scale),self.assertRaisesRegex(ValueError,'disagree'):
+                signal_affine_parameters(changed)
+        changed=copy.deepcopy(scaler);del changed['signal_normalization']['output_range']
+        with self.assertRaisesRegex(ValueError,'disagree'):
+            signal_affine_parameters(changed)
+
+    def test_output_range_zero_one_leaves_clean_bounds_and_unbounded_inverse_semantics(self):
+        values=np.array([0.,1.,2.])
+        center,scale=normalization_affine_parameters(MINMAX01)
+        validate_signal_bounds(values,MINMAX01)
+        np.testing.assert_array_equal((values-center)/scale,[0.,.5,1.])
+        # Production downstream code applies this same affine to device tensors.
+        normalized=torch.tensor([-1.,0.,.5,1.,2.],dtype=torch.float64)
+        np.testing.assert_array_equal((normalized*scale+center).numpy(),[-2.,0.,1.,2.,4.])
+        for invalid in (np.array([-1e-12]),np.array([2.+1e-12])):
+            with self.assertRaises(ValueError):
+                validate_signal_bounds(invalid,MINMAX01)
 
 
 class SignalNormalizationDataTests(unittest.TestCase):
@@ -137,6 +184,58 @@ class SignalNormalizationDataTests(unittest.TestCase):
         np.testing.assert_array_equal(processor.window_observed_mask('A.npz',0,3000),self.signals['A'][:3000]>0)
         self.assertTrue(torch.is_tensor(processor.make_training_dataset(3000,750)[0]))
         self.assertEqual(processor.provenance()['signal_normalization'],MINMAX)
+
+    def test_explicit_legacy_output_range_keeps_identity_and_arrays_for_all_policies(self):
+        for policy in ('preserve','masked','zero_fill_one'):
+            implicit=self.processor(policy=policy,spec=MINMAX)
+            explicit=self.processor(policy=policy,spec=dict(MINMAX,output_range=[-1.,1.]))
+            with self.subTest(policy=policy):
+                self.assertEqual(explicit.data_identity(),implicit.data_identity())
+                self.assertEqual(explicit.signal_normalization,MINMAX)
+                self.assertNotIn('output_range',explicit.scaler['signal_normalization'])
+                np.testing.assert_array_equal(explicit.window_array('A.npz',0,3000),
+                                              implicit.window_array('A.npz',0,3000))
+
+    def test_minmax_zero_one_endpoints_true_statistics_conditions_and_masks_are_unchanged(self):
+        self.signals['V'][:3]=[0.,1.,2.]
+        self.write_record('V')
+        before=(self.directory/'V.npz').read_bytes()
+        baseline=self.processor(spec=MINMAX)
+        processor=self.processor(spec=MINMAX01)
+        for key in baseline.scaler:
+            if key not in ('signal_normalization','signal_center_seconds','signal_scale_seconds'):
+                self.assertEqual(processor.scaler[key],baseline.scaler[key])
+        self.assertEqual(processor.scaler['signal_mean_seconds'],.75)
+        self.assertAlmostEqual(processor.scaler['signal_std_seconds'],np.sqrt(.3125))
+        self.assertEqual(signal_affine_parameters(processor.scaler),(0.,2.))
+        data=processor.window_array('V.npz',0,3000)
+        np.testing.assert_array_equal(data[:3,0],[0.,.5,1.])
+        np.testing.assert_array_equal(processor.inverse_signal(data[:,0]),self.signals['V'][:3000])
+        np.testing.assert_array_equal(data[:,1:],baseline.window_array('V.npz',0,3000)[:,1:])
+        np.testing.assert_array_equal(processor.record('V.npz')['ibi'],self.signals['V'])
+        np.testing.assert_array_equal(processor.window_observed_mask('V.npz',0,3000),self.signals['V'][:3000]>0)
+        self.assertEqual((self.directory/'V.npz').read_bytes(),before)
+        np.testing.assert_array_equal(processor.inverse_signal(np.array([-1.,0.,.5,1.,2.])),[-2.,0.,1.,2.,4.])
+        self.assertTrue(torch.is_tensor(processor.make_training_dataset(3000,750)[0]))
+
+    def test_minmax_zero_one_identity_restores_frozen_range_and_rejects_changed_range(self):
+        processor=self.processor(spec=MINMAX01)
+        identity=processor.data_identity()
+        self.assertEqual(identity['signal_normalization'],MINMAX01)
+        self.assertEqual(identity['scaler']['signal_normalization'],MINMAX01)
+        live=self.directory/'live.json'
+        live.write_text(json.dumps(dict(data_dir='invalid',signal_normalization=MINMAX)),encoding='utf-8')
+        with mock.patch.dict(os.environ,{'DREAMT_CONFIG_PATH':str(live),'DREAMT_DATA_DIR':'invalid'}):
+            restored=Preprocessor.from_identity(identity)
+        self.assertEqual(restored.data_identity(),identity)
+        np.testing.assert_array_equal(restored.window_array('A.npz',0,3000),processor.window_array('A.npz',0,3000))
+        self.assertEqual(restored.provenance()['signal_normalization'],MINMAX01)
+        for owner in ('outer','scaler'):
+            changed=copy.deepcopy(identity)
+            target=changed if owner=='outer' else changed['scaler']
+            target['signal_normalization']['output_range']=[-1.,1.]
+            with self.subTest(owner=owner),self.assertRaisesRegex(ValueError,'identity mismatch'):
+                Preprocessor.from_identity(changed)
 
     def test_endpoint_two_seconds_maps_to_one_without_clipping_inverse_outputs(self):
         self.signals['V'][:4]=[0,2,.5,1]

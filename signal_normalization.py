@@ -22,7 +22,9 @@ def normalization_spec(config):
 
     config is the full dataset configuration. The optional nested object is
     either {method: zscore} or {method: minmax, min_seconds: lo, max_seconds: hi}.
-    Bounds are fixed configuration values, never fitted on held-out data.
+    Minmax optionally accepts output_range [0, 1]; omitted or explicit [-1, 1]
+    keeps the legacy canonical specification unchanged. Bounds are fixed
+    configuration values, never fitted on held-out data.
     """
     if not isinstance(config, dict):
         raise ValueError('Dataset configuration must be a dictionary')
@@ -35,15 +37,46 @@ def normalization_spec(config):
         if set(spec) != {'method'}:
             raise ValueError('zscore signal_normalization accepts only method')
         return None
-    if spec['method'] != 'minmax' or set(spec) != {'method', 'min_seconds', 'max_seconds'}:
-        raise ValueError('minmax signal_normalization requires exactly method, min_seconds and max_seconds')
+    required = {'method', 'min_seconds', 'max_seconds'}
+    if spec['method'] != 'minmax' or set(spec) not in (required, required | {'output_range'}):
+        raise ValueError('minmax signal_normalization requires method, min_seconds and max_seconds, '
+                         'with only output_range optional')
     low = _finite_number(spec['min_seconds'], 'min_seconds')
     high = _finite_number(spec['max_seconds'], 'max_seconds')
-    scale = (high-low)/2.
-    center = low+scale
+    output_range = spec.get('output_range', [-1., 1.])
+    if not isinstance(output_range, list) or len(output_range) != 2:
+        raise ValueError('minmax output_range must be [-1, 1] or [0, 1]')
+    lower = _finite_number(output_range[0], 'output_range lower bound')
+    upper = _finite_number(output_range[1], 'output_range upper bound')
+    if (lower, upper) not in ((-1., 1.), (0., 1.)):
+        raise ValueError('minmax output_range must be [-1, 1] or [0, 1]')
+    canonical = dict(method='minmax', min_seconds=low, max_seconds=high)
+    if lower == 0.:
+        canonical['output_range'] = [0., 1.]
+    _minmax_affine_parameters(canonical)
+    return canonical
+
+
+def _minmax_affine_parameters(spec):
+    low, high = spec['min_seconds'], spec['max_seconds']
+    lower, upper = spec.get('output_range', [-1., 1.])
+    scale = (high-low)/(upper-lower)
+    center = low-lower*scale
     if high <= low or not math.isfinite(center) or not math.isfinite(scale) or scale <= 0:
         raise ValueError('minmax bounds must define a finite positive-width interval')
-    return dict(method='minmax', min_seconds=low, max_seconds=high)
+    return center, scale
+
+
+def normalization_affine_parameters(spec):
+    """Return minmax (center, scale), with normalized=(seconds-center)/scale.
+
+    For physical bounds [lo, hi] and output [a, b], scale=(hi-lo)/(b-a)
+    and center=lo-a*scale. This does not clip input, diffusion noise, or output.
+    """
+    canonical = normalization_spec({'signal_normalization': spec})
+    if canonical is None:
+        raise ValueError('Fixed normalization affine parameters require a minmax specification')
+    return _minmax_affine_parameters(canonical)
 
 
 def signal_affine_parameters(scaler):
@@ -67,8 +100,7 @@ def signal_affine_parameters(scaler):
         if 'signal_center_seconds' in scaler or 'signal_scale_seconds' in scaler:
             raise ValueError('Separate affine parameters require an explicit minmax specification')
         return mean, std
-    expected_scale = (spec['max_seconds']-spec['min_seconds'])/2.
-    expected_center = spec['min_seconds']+expected_scale
+    expected_center, expected_scale = normalization_affine_parameters(spec)
     try:
         center = _finite_number(scaler['signal_center_seconds'], 'signal_center_seconds')
         scale = _finite_number(scaler['signal_scale_seconds'], 'signal_scale_seconds')

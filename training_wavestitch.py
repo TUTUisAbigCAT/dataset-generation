@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 from cuda_runtime import require_cuda, assert_cuda_model
 from epoch_validation import create_epoch_validator
 from missing_data import masked_noise_mse
+from training_input_dropout import create_training_input_dropout
 
 if __name__ == "__main__":
     np.random.seed(42)
@@ -72,6 +73,7 @@ if __name__ == "__main__":
     # Convert to an ndarray
     non_hier_cols = np.array(remaining_indices)
     non_hier_cols = torch.as_tensor(non_hier_cols, dtype=torch.long, device=device)
+    training_input_dropout = create_training_input_dropout(device)
     validator = create_epoch_validator(preprocessor, args, model, diffusion_config, device)
     """TRAINING"""
     for epoch in range(args.epochs):
@@ -93,6 +95,7 @@ if __name__ == "__main__":
             conditional_mask[:, :, non_hier_cols] = 0
             batch_noised = (1 - conditional_mask) * (coeff_1 * batch + coeff_2 * sigmas) + conditional_mask * batch
             batch_noised = batch_noised.to(device)
+            batch_noised = training_input_dropout(batch_noised)
             timesteps = timesteps.reshape((-1, 1))
             # timesteps = timesteps.to(device)
             with torch.device(device):

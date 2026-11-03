@@ -53,6 +53,9 @@ def experiment_config(base, config_path, experiment):
         raise ValueError("Unknown preprocessing experiment: " + experiment)
     if base.get("missing_value_policy", "preserve") != "preserve" or normalization_spec(base) is not None:
         raise ValueError("Common baseline must use preserve + z-score")
+    from training_input_dropout import input_dropout_options
+    if input_dropout_options(base)["probability"] != 0:
+        raise ValueError("Preprocessing-only experiments require disabled training input dropout")
     config = arm_config(base, Path(config_path),
                         "zero_fill_one" if experiment == "zero_fill_one" else "preserve",
                         base.get("validation", {}).get("max_windows"), True)
@@ -105,6 +108,8 @@ def compare_experiment_preflight(reference, current, experiment):
     checks["early_stopping_disabled"] = (reference.get("early_stopping", {}).get("enabled") is False and
                                            current.get("early_stopping", {}).get("enabled") is False)
     checks["test_not_opened"] = current.get("test_npz_opened") is False
+    from training_input_dropout import input_dropout_options
+    checks["input_dropout_disabled"] = input_dropout_options(current)["probability"] == 0
     if not all(checks.values()):
         raise ValueError("Preprocessing preflight mismatch: " + ", ".join(k for k, v in checks.items() if not v))
     return checks
@@ -142,6 +147,7 @@ def verify_reference_sources(reference):
         if not hashes or any(key not in hashes for key in INVARIANT_SOURCES):
             raise ValueError("Reference source evidence is incomplete: " + policy)
         changed_adapters = []
+        training_dropout_only_changes = False
         for name, expected in hashes.items():
             relative = PurePosixPath(name)
             if relative.is_absolute() or ".." in relative.parts or ":" in name:
@@ -151,6 +157,14 @@ def verify_reference_sources(reference):
                 raise ValueError("Reference frozen source hash mismatch: " + policy + "/" + name)
             current = ROOT / name
             same = current.is_file() and sha256(current) == expected
+            if name == "training_wavestitch.py" and not same and current.is_file():
+                # Compare full bytes after reversing only the three exact,
+                # opt-in training input-dropout additions. No model, objective
+                # or diffusion expression is omitted from the comparison.
+                from scripts.verify_upstream_boundary import remove_training_input_dropout_edits
+                same = (remove_training_input_dropout_edits(current.read_bytes()) ==
+                        remove_training_input_dropout_edits(frozen.read_bytes()))
+                training_dropout_only_changes = same
             if name in INVARIANT_SOURCES and not same:
                 raise ValueError("Model/training/sampler source changed: " + name)
             if name not in INVARIANT_SOURCES and not same:
@@ -160,7 +174,8 @@ def verify_reference_sources(reference):
         if not expected_checkpoint or not checkpoint.is_file() or sha256(checkpoint) != expected_checkpoint:
             raise ValueError("Reference final checkpoint hash mismatch: " + policy)
         result[policy] = dict(frozen_files_checked=len(hashes), invariant_files_checked=len(INVARIANT_SOURCES),
-                             final_checkpoint_sha256=expected_checkpoint, changed_adapter_sources=changed_adapters)
+                             final_checkpoint_sha256=expected_checkpoint, changed_adapter_sources=changed_adapters,
+                             training_dropout_only_changes=training_dropout_only_changes)
     return result
 
 

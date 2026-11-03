@@ -15,7 +15,8 @@ import torch
 from torch.utils.data import Dataset
 from watchsleep_loader import SSDataset
 from window_config import FS, EPOCH_SAMPLES, window_settings
-from signal_normalization import normalization_spec, signal_affine_parameters, validate_signal_bounds
+from signal_normalization import (normalization_spec, normalization_affine_parameters,
+                                  signal_affine_parameters, validate_signal_bounds)
 
 ROOT = Path(__file__).resolve().parent
 datasets = {"DREAMT_SIM": None, "DREAMT": None}
@@ -279,9 +280,9 @@ class Preprocessor:
         elif self.missing_value_policy == "zero_fill_one":
             self.scaler["signal_fit_policy"] = "all points in structurally valid training epochs after raw IBI == 0 is replaced by 1.0 second; each source point once; no interpolation or clipping of positive values"
         if self.signal_normalization is not None:
-            scale = (self.signal_normalization["max_seconds"] - self.signal_normalization["min_seconds"]) / 2.
+            center, scale = normalization_affine_parameters(self.signal_normalization)
             self.scaler.update(signal_normalization=dict(self.signal_normalization),
-                signal_center_seconds=self.signal_normalization["min_seconds"] + scale,
+                signal_center_seconds=center,
                 signal_scale_seconds=scale)
         self._meta_mean, self._meta_std = meta_mean, meta_std
 

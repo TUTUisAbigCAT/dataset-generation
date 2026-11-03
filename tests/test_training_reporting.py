@@ -53,7 +53,7 @@ class TrainingReportingTests(unittest.TestCase):
                      dataloader=[torch.ones(8, 6, 2), torch.full((3, 6, 2), 3.)],
                      diffusion_config={"T": 2, "alpha_bars": torch.tensor([[.9], [.8]])},
                      non_hier_cols=torch.tensor([0]), randint=torch.randint,
-                     normal=torch.normal, sqrt=torch.sqrt,
+                     normal=torch.normal, sqrt=torch.sqrt, training_input_dropout=lambda batch: batch,
                      validator=SimpleNamespace(run=validate, should_stop=False))
         with torch.random.fork_rng(), contextlib.redirect_stdout(io.StringIO()):
             exec(compile(module, "actual_epoch_loop", "exec"), scope)

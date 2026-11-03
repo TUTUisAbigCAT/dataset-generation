@@ -141,6 +141,7 @@ class MissingWorkflowTests(unittest.TestCase):
                         device=torch.device("cpu"), args=args, dataloader=batches,
                         diffusion_config=build_diffusion_config(args), non_hier_cols=torch.tensor([0]),
                         randint=torch.randint, normal=torch.normal, sqrt=torch.sqrt, masked_noise_mse=tracked,
+                        training_input_dropout=lambda batch: batch,
                         validator=SimpleNamespace(run=validate, should_stop=False))
                     exec(code, scope)
                 self.assertEqual(len(reports), 2)
