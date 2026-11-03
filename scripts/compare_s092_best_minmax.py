@@ -1,0 +1,407 @@
+"""Compare the recorded minmax best models on one S092 window, CUDA only.
+
+Separate workers import each run's frozen workspace. The new inference adapter
+reads only S092 and the hash-verified participant CSV; it never fits a scaler.
+--check-only verifies inputs and provenance without constructing a model.
+"""
+from __future__ import annotations
+
+import argparse
+from copy import deepcopy
+import hashlib
+import importlib
+import io
+import json
+import os
+from pathlib import Path
+import random
+import subprocess
+import sys
+import time
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parents[1]
+ARMS = ("minmax", "minmax01")
+S092_SHA256 = "f41e37bd921b39851e82c0075e8c2b4002b73db7329d9e3853f96516f36b08d2"
+REQUIRED_SOURCES = (
+    "training_utils.py", "TSImputers/SSSDS4Imputer.py", "TSImputers/S4Model.py",
+    "utils/util.py", "data_utils.py", "watchsleep_loader.py", "window_config.py",
+    "diffusion_schedule.py", "validation_sampling.py", "validation_metrics.py",
+    "scripts/evaluate_original_sampler.py", "signal_normalization.py", "cuda_runtime.py",
+)
+
+
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def read_json(path):
+    value = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(value, dict):
+        raise ValueError("Expected a JSON object: " + str(path))
+    return value
+
+
+def save_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False,
+                                   allow_nan=False) + "\n", encoding="utf-8")
+
+
+def load_arm(run_root, arm):
+    """Bind to best, never fall back to the final model or current config."""
+    if arm not in ARMS:
+        raise ValueError("Unknown comparison arm")
+    root = Path(run_root).expanduser().resolve()
+    training, workspace = root / "run/training", root / "run/workspace"
+    manifest_path = training / "best_kl_manifest.json"
+    manifest = read_json(manifest_path)
+    checkpoint = training / "best_kl_model.pth"
+    selection = manifest.get("checkpoint_selection", {})
+    epoch = manifest.get("checkpoint_epoch")
+    best = manifest.get("validation", {}).get("best_checkpoints", {}).get("kl", {})
+    if (manifest.get("status") != "completed" or not isinstance(epoch, int)
+            or isinstance(epoch, bool) or epoch < 1 or selection.get("epoch") != epoch
+            or best.get("epoch") != epoch or selection.get("selection_rule") != "smoothed_kl"
+            or selection.get("metric") != "gaussian_kl_real_to_generated"
+            or selection.get("value") != best.get("value")):
+        raise ValueError("Require a completed, consistently selected best KL manifest")
+    digest = sha256(checkpoint)
+    if digest != manifest.get("checkpoint_sha256") or digest != best.get("checkpoint_sha256"):
+        raise ValueError("Best checkpoint SHA256 differs from its manifest")
+    recorded = {}
+    for key, value in manifest["source_sha256"].items():
+        name = key.replace("\\", "/")
+        if name in recorded and recorded[name] != value:
+            raise ValueError("Conflicting frozen source hash aliases: " + name)
+        recorded[name] = value
+    if not set(REQUIRED_SOURCES).issubset(recorded):
+        raise ValueError("Missing required frozen source identity")
+    checks = {}
+    for name, expected in recorded.items():
+        path = (workspace / name).resolve()
+        if not path.is_relative_to(workspace) or not path.is_file():
+            raise ValueError("Missing or nonlocal frozen source: " + name)
+        actual = sha256(path)
+        if actual != expected:
+            raise ValueError("Frozen source SHA256 differs: " + name)
+        checks[name] = actual
+    identity = manifest["data_identity"]
+    dropout = manifest.get("training_input_dropout")
+    if dropout is not None and (
+            dropout.get("options", {}).get("probability") != 0.0
+            or dropout.get("active") is not False
+            or any(dropout.get(k) != 0 for k in
+                   ("application_calls", "eligible_values", "dropped_values", "observed_fraction"))):
+        raise ValueError("This comparison requires training input dropout to be inactive")
+    scaler = identity["scaler"]
+    norm = scaler.get("signal_normalization", {})
+    expected_range = [-1.0, 1.0] if arm == "minmax" else [0.0, 1.0]
+    if (norm.get("method") != "minmax" or norm.get("min_seconds") != 0.0
+            or norm.get("max_seconds") != 2.0
+            or norm.get("output_range", [-1.0, 1.0]) != expected_range
+            or identity.get("missing_value_policy", "preserve") != "preserve"):
+        raise ValueError("Expected the recorded zero-preserving minmax arm")
+    splits = identity["splits"]
+    flat = [n for names in splits.values() for n in names]
+    if (set(splits) != {"train", "val", "test"} or len(flat) != len(set(flat))
+            or "S092.npz" not in splits["test"] or "S092" in identity["scaler_subjects"]):
+        raise ValueError("S092 must be exclusively held out from training/scaler fitting")
+    return dict(arm=arm, root=str(root), workspace=str(workspace),
+                manifest_path=str(manifest_path), manifest=manifest, identity=identity,
+                epoch=epoch, checkpoint=str(checkpoint), checkpoint_sha256=digest,
+                best_manifest_sha256=sha256(manifest_path), source_checks=checks)
+
+
+def compare_arms(contexts):
+    a, b = (contexts[name] for name in ARMS)
+    checks = {}
+    for key in ("splits", "split_fingerprint", "metadata_file_sha256", "train_npz_sha256",
+                "columns", "window_epochs", "sample_rate_hz", "epoch_samples",
+                "multiplier", "downsample_rate", "max_epochs", "raw_stage_mapping"):
+        checks[key] = key in a["identity"] and a["identity"][key] == b["identity"].get(key)
+    for key in ("continuous_columns", "continuous_mean", "continuous_std"):
+        checks["scaler." + key] = a["identity"]["scaler"][key] == b["identity"]["scaler"][key]
+    checks["diffusion_identity"] = a["manifest"]["diffusion_identity"] == b["manifest"]["diffusion_identity"]
+    checks["no_training_input_dropout"] = all(
+        c["manifest"].get("training_input_dropout", {}).get("options", {}).get("probability", 0.0) == 0.0
+        for c in (a, b))
+    ignored_args = {"validation_output"}
+    checks["training_args"] = {
+        k: v for k, v in a["manifest"]["training_args"].items() if k not in ignored_args
+    } == {k: v for k, v in b["manifest"]["training_args"].items() if k not in ignored_args}
+    for key in REQUIRED_SOURCES:
+        if key not in ("data_utils.py", "signal_normalization.py"):
+            checks["source." + key] = a["source_checks"][key] == b["source_checks"][key]
+    failed = [k for k, passed in checks.items() if not passed]
+    if failed:
+        raise ValueError("The comparison changes more than normalization: " + ", ".join(failed))
+    return checks
+
+
+def frozen_imports(context):
+    """Only called in a fresh worker, preventing cross-arm module caching."""
+    workspace = Path(context["workspace"])
+    if any(name in sys.modules for name in ("training_utils", "data_utils", "validation_sampling")):
+        raise RuntimeError("Frozen imports require a fresh worker process")
+    sys.path[:0] = [str(workspace), str(ROOT)]
+    names = ("scripts.evaluate_denoising", "scripts.evaluate_original_sampler", "training_utils",
+             "diffusion_schedule", "signal_normalization", "validation_sampling",
+             "validation_metrics", "cuda_runtime")
+    modules = {name: importlib.import_module(name) for name in names}
+    imports = {}
+    for name in names + ("data_utils", "watchsleep_loader", "TSImputers.S4Model",
+                         "TSImputers.SSSDS4Imputer", "utils.util", "window_config"):
+        module = importlib.import_module(name)
+        path = Path(module.__file__).resolve()
+        if not path.is_relative_to(workspace):
+            raise RuntimeError("Imported outside the frozen workspace: " + name)
+        imports[name] = dict(path=str(path), sha256=sha256(path))
+    # This inference-only adapter was not part of the training snapshot.
+    # Its loader and normalizers above still resolve to the selected frozen run.
+    night = importlib.import_module("night_data")
+    if Path(night.__file__).resolve() != ROOT / "night_data.py":
+        raise RuntimeError("Unexpected night-data adapter path")
+    modules["night_data"] = night
+    imports["night_data"] = dict(path=str(ROOT / "night_data.py"), sha256=sha256(ROOT / "night_data.py"),
+                                 role="new inference adapter; not a recorded training source")
+    loader = modules["scripts.evaluate_denoising"]
+    args, manifest, provenance = loader.load_training_run(Path(context["manifest_path"]))
+    _, checkpoint = loader.resolve_checkpoint(Path(context["manifest_path"]), manifest,
+                                               Path(context["checkpoint"]))
+    return modules, args, dict(imported_sources=imports, configuration=provenance,
+                              checkpoint_identity=checkpoint)
+
+
+def worker_preflight(context, npz_path, metadata_path, start_second, output_dir):
+    import numpy as np
+    import pandas as pd
+    if start_second < 0 or start_second % 30:
+        raise ValueError("start-second must be a nonnegative multiple of 30")
+    modules, args, provenance = frozen_imports(context)
+    identity = context["identity"]
+    npz_path, metadata_path = Path(npz_path).resolve(), Path(metadata_path).resolve()
+    if npz_path.name != "S092.npz" or sha256(npz_path) != S092_SHA256:
+        raise ValueError("S092 NPZ differs from the previously audited record")
+    if sha256(metadata_path) != identity["metadata_file_sha256"]:
+        raise ValueError("Participant metadata SHA256 differs from training")
+    metadata = pd.read_csv(metadata_path, dtype={"SID": str})
+    if not {"SID", "AHI", "BMI", "AGE", "GENDER"}.issubset(metadata.columns):
+        raise ValueError("Participant metadata columns are incomplete")
+    metadata["SID"] = metadata["SID"].str.strip()
+    if metadata["SID"].isna().any() or metadata["SID"].eq("").any() or metadata["SID"].duplicated().any():
+        raise ValueError("Participant IDs must be nonempty and unique")
+    # A frozen inference view, NOT Preprocessor construction or scaler fitting.
+    view = SimpleNamespace(data_dir=npz_path.parent, metadata=metadata.set_index("SID"),
+        splits=deepcopy(identity["splits"]), scaler=deepcopy(identity["scaler"]),
+        scaler_subjects=list(identity["scaler_subjects"]), multiplier=identity["multiplier"],
+        downsample_rate=identity["downsample_rate"], max_epochs=identity["max_epochs"])
+    prepared = modules["night_data"].prepare_night(view, "S092")
+    fs = int(identity["sample_rate_hz"])
+    start, length = start_second * fs, args.window_size
+    if start + length > len(prepared["reference_seconds"]):
+        raise ValueError("Requested S092 window exceeds the record")
+    ref = prepared["reference_seconds"][start:start+length].copy()
+    stages = prepared["stage_epochs_four"][start//750:(start+length)//750].copy()
+    conditions = prepared["conditions"][start:start+length].copy()
+    mask = np.isfinite(ref) & (ref > 0)
+    if not np.isfinite(ref).all() or (ref < 0).any() or (mask.reshape(-1, 750).sum(1) < 2).any():
+        raise ValueError("Reference window has invalid IBI or insufficient observed points")
+    center, scale = modules["signal_normalization"].signal_affine_parameters(identity["scaler"])
+    expected_affine = (1.0, 1.0) if context["arm"] == "minmax" else (0.0, 2.0)
+    if (center, scale) != expected_affine:
+        raise ValueError("Frozen affine transform disagrees with the requested arm")
+    output = Path(output_dir)
+    with (output / "inputs.npz").open("xb") as stream:
+        np.savez_compressed(stream, reference_ibi_seconds=ref, conditions=conditions,
+            scoring_mask=mask, sleep_stages=stages, start_second=np.array(start_second),
+            sample_rate_hz=np.array(fs))
+    report = dict(status="checked", arm=context["arm"], epoch=context["epoch"],
+        checkpoint_sha256=context["checkpoint_sha256"], best_manifest_sha256=context["best_manifest_sha256"],
+        source_checks=context["source_checks"], **provenance, subject="S092", source_npz=str(npz_path),
+        source_npz_sha256=S092_SHA256, metadata_sha256=sha256(metadata_path),
+        subject_provenance=prepared["provenance"], scaler=identity["scaler"],
+        signal_center_seconds=center, signal_scale_seconds=scale,
+        start_second=start_second, window_seconds=length/fs, window_size=length,
+        stages=stages.tolist(), observed_samples=int(mask.sum()), raw_zero_samples=int((ref == 0).sum()),
+        inputs_sha256=sha256(output / "inputs.npz"), model_args=vars(args),
+        diffusion_identity=context["manifest"]["diffusion_identity"],
+        training_npz_reopened=False, scaler_refitted=False, sampling_performed=False,
+        generation=dict(independent_windows=True, overlap_samples=0, real_ibi_prefix_samples=0,
+            reference_ibi_used_as_model_input=False, stage_conditions_overridden=False, clipping_applied=False))
+    save_json(output / "preflight.json", report)
+    return report
+
+
+def require_sampling_device(runtime):
+    device = runtime.require_cuda()
+    if device.type != "cuda":
+        raise RuntimeError("CUDA is required; CPU fallback is disabled")
+    return device
+
+
+def worker_sample(context, output_dir, seed, threads):
+    import numpy as np
+    import torch
+    modules, args, provenance = frozen_imports(context)
+    device = require_sampling_device(modules["cuda_runtime"])
+    output = Path(output_dir)
+    preflight = read_json(output / "preflight.json")
+    if (sha256(output / "inputs.npz") != preflight["inputs_sha256"]
+            or context["checkpoint_sha256"] != preflight["checkpoint_sha256"]
+            or context["best_manifest_sha256"] != preflight["best_manifest_sha256"]
+            or provenance != {k: preflight[k] for k in provenance}):
+        raise ValueError("Inputs, checkpoint or runtime identity changed after preflight")
+    torch.set_num_threads(threads)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    model = modules["training_utils"].fetchModel(10, 1, args).to(device)
+    modules["cuda_runtime"].assert_cuda_model(model)
+    checkpoint_bytes = Path(context["checkpoint"]).read_bytes()
+    if hashlib.sha256(checkpoint_bytes).hexdigest() != context["checkpoint_sha256"]:
+        raise ValueError("Best checkpoint changed before loading")
+    saved = torch.load(io.BytesIO(checkpoint_bytes), map_location=device, weights_only=True)
+    loaded = modules["scripts.evaluate_original_sampler"].load_original_parameters(model, saved, torch)
+    model.eval()
+    schedule = {k: v.to(device) if torch.is_tensor(v) else v for k, v in
+                modules["diffusion_schedule"].build_diffusion_config(args).items()}
+    with np.load(output / "inputs.npz", allow_pickle=False) as arrays:
+        reference = torch.as_tensor(arrays["reference_ibi_seconds"][None], dtype=torch.float64, device=device)
+        mask = torch.as_tensor(arrays["scoring_mask"][None], dtype=torch.bool, device=device)
+        conditions = torch.as_tensor(arrays["conditions"][None], dtype=torch.float32, device=device)
+    inputs = torch.cat([torch.zeros((1, args.window_size, 1), device=device), conditions], dim=2)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Same fresh-process seed and same tensor shapes ensure paired random draws.
+    rng_before = hashlib.sha256(torch.cuda.get_rng_state(device).cpu().numpy().tobytes()).hexdigest()
+    started = time.perf_counter()
+    normalized, sampling = modules["validation_sampling"].sample_validation_windows(
+        model, inputs, schedule, args, device)
+    rng_after = hashlib.sha256(torch.cuda.get_rng_state(device).cpu().numpy().tobytes()).hexdigest()
+    generated = normalized.to(torch.float64) * preflight["signal_scale_seconds"] + preflight["signal_center_seconds"]
+    metrics = modules["validation_metrics"].window_statistics(generated, reference, observed_mask=mask)
+    metrics = {k: v.item() for k, v in metrics.items()}
+    nonpositive = int((generated <= 0).sum().item())
+    with (output / "waveforms.npz").open("xb") as stream:
+        np.savez_compressed(stream, generated_ibi_seconds=generated[0].detach().cpu().numpy(),
+                            generated_normalized=normalized[0].detach().cpu().numpy(), seed=np.array(seed))
+    report = dict(status="completed", epoch=context["epoch"], checkpoint_kind="best_kl",
+        checkpoint_sha256=context["checkpoint_sha256"], best_manifest_sha256=context["best_manifest_sha256"],
+        checkpoint_load=loaded, seed=seed, batch_size=1, sampling=sampling, metrics=metrics,
+        generated_nonpositive_samples=nonpositive, generated_nonpositive_fraction=nonpositive/args.window_size,
+        cuda_environment=modules["cuda_runtime"].cuda_environment(device),
+        cuda_rng_before=rng_before, cuda_rng_after=rng_after, elapsed_seconds=time.perf_counter()-started,
+        waveform_sha256=sha256(output / "waveforms.npz"), scaler=preflight["scaler"],
+        training_executed=False, device=str(device), runtime=provenance)
+    save_json(output / "summary.json", report)
+    return report
+
+
+def matching_inputs(output):
+    import numpy as np
+    arrays = []
+    for arm in ARMS:
+        with np.load(Path(output) / arm / "inputs.npz", allow_pickle=False) as saved:
+            arrays.append({k: saved[k].copy() for k in saved.files})
+    if set(arrays[0]) != set(arrays[1]):
+        raise ValueError("Reference input schemas differ")
+    checks = {k: np.array_equal(v, arrays[1][k]) for k, v in arrays[0].items()}
+    if not all(checks.values()):
+        raise ValueError("Paired S092 reference, conditions or stages differ")
+    with (Path(output) / "reference.npz").open("xb") as stream:
+        np.savez_compressed(stream, **arrays[0])
+    return checks
+
+
+def launch_worker(cli, context, phase, destination):
+    command = [sys.executable, "-B", "-u", str(Path(__file__).resolve()), "--worker", phase,
+        "--arm", context["arm"], "--run-root", context["root"], "--output-dir", str(destination),
+        "--start-second", str(cli.start_second), "--seed", str(cli.seed), "--threads", str(cli.threads)]
+    if phase == "preflight":
+        identity = context["identity"]
+        command += ["--npz", str(cli.npz or Path(identity["data_directory"]) / "S092.npz"),
+                    "--metadata", str(cli.metadata or identity["metadata_path"])]
+    environment = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    with (destination / (phase + ".log")).open("x", encoding="utf-8") as log:
+        result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, env=environment, cwd=ROOT)
+    if result.returncode:
+        raise RuntimeError(f"{context['arm']} {phase} failed. See {destination / (phase + '.log')}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--minmax-run", type=Path)
+    parser.add_argument("--minmax01-run", type=Path)
+    parser.add_argument("--npz", type=Path, help="Defaults to frozen data directory / S092.npz")
+    parser.add_argument("--metadata", type=Path, help="Defaults to frozen participant_info.csv")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--start-second", type=int, default=840)
+    parser.add_argument("--seed", type=int, default=20261103)
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--worker", choices=("preflight", "sample"), help=argparse.SUPPRESS)
+    parser.add_argument("--arm", choices=ARMS, help=argparse.SUPPRESS)
+    parser.add_argument("--run-root", type=Path, help=argparse.SUPPRESS)
+    cli = parser.parse_args(argv)
+    if cli.threads < 1 or cli.start_second < 0 or cli.start_second % 30 or not 0 <= cli.seed < 2**32:
+        parser.error("Require positive threads, unsigned seed and nonnegative 30s-aligned start")
+    if cli.worker:
+        context = load_arm(cli.run_root, cli.arm)
+        if cli.worker == "preflight":
+            worker_preflight(context, cli.npz, cli.metadata, cli.start_second, cli.output_dir)
+        else:
+            worker_sample(context, cli.output_dir, cli.seed, cli.threads)
+        return
+    if cli.minmax_run is None or cli.minmax01_run is None:
+        parser.error("Both --minmax-run and --minmax01-run are required")
+    output = cli.output_dir.expanduser().resolve()
+    roots = {arm: getattr(cli, arm + "_run").expanduser().resolve() for arm in ARMS}
+    if any(output == r or output.is_relative_to(r) for r in roots.values()):
+        raise ValueError("Output must be outside the read-only training runs")
+    output.mkdir(parents=True, exist_ok=False)
+    status = dict(status="checking", output_directory=str(output), arms={}, sampling_performed=False,
+        training_executed=False, independent_windows=True, real_ibi_used_as_input=False,
+        overlap_samples=0, seed=cli.seed, start_second=cli.start_second,
+        script_sha256=sha256(__file__), check_only=cli.check_only)
+    try:
+        save_json(output / "summary.json", status)
+        contexts = {arm: load_arm(roots[arm], arm) for arm in ARMS}
+        status["shared_training_checks"] = compare_arms(contexts)
+        for arm, context in contexts.items():
+            destination = output / arm
+            destination.mkdir()
+            print(json.dumps(dict(event="best_preflight_started", arm=arm, epoch=context["epoch"])), flush=True)
+            launch_worker(cli, context, "preflight", destination)
+            status["arms"][arm] = dict(epoch=context["epoch"], checkpoint=context["checkpoint"],
+                checkpoint_sha256=context["checkpoint_sha256"], preflight=str(destination / "preflight.json"))
+        status["shared_input_checks"] = matching_inputs(output)
+        if cli.check_only:
+            status["status"] = "checked"
+        else:
+            for arm, context in contexts.items():
+                print(json.dumps(dict(event="best_sampling_started", arm=arm, epoch=context["epoch"],
+                                      start_second=cli.start_second, seed=cli.seed)), flush=True)
+                launch_worker(cli, context, "sample", output / arm)
+                status["arms"][arm].update(read_json(output / arm / "summary.json"))
+                status["sampling_performed"] = True
+                save_json(output / "summary.json", status)
+            a, b = (status["arms"][arm] for arm in ARMS)
+            status["paired_cuda_rng_states_match"] = all(a[k] == b[k] for k in ("cuda_rng_before", "cuda_rng_after"))
+            if not status["paired_cuda_rng_states_match"]:
+                raise RuntimeError("CUDA random streams differ between the paired samples")
+            subprocess.run([sys.executable, str(ROOT / "scripts/plot_s092_best_minmax.py"),
+                            "--result-dir", str(output)], check=True)
+            status["status"] = "completed"
+            status["plots_directory"] = str(output / "plots")
+        save_json(output / "summary.json", status)
+        print(json.dumps(dict(event="s092_best_comparison_finished", status=status["status"],
+                              output_directory=str(output))), flush=True)
+    except BaseException as error:
+        status.update(status="failed", error_type=type(error).__name__, error=str(error))
+        save_json(output / "summary.json", status)
+        raise
+
+
+if __name__ == "__main__":
+    main()
