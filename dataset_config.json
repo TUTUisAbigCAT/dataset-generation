@@ -8,18 +8,37 @@
   "split_seed": 42,
   "output_root": "/home/yxtao/links/scratch/dataset-generation/runs",
   "early_stopping": {
-    "enabled": true,
+    "enabled": false,
     "patience": 10,
-    "smoothing_window": 5,
-    "min_delta_kl": 0.0
+    "smoothing_window": 1,
+    "min_delta_kl": 0.0,
+    "selection_mode": "current"
   },
   "validation": {
     "max_windows": null,
     "batch_size": 8,
     "seed": 20261020,
-    "kl_variance_floor_ms2": 1.0
+    "kl_variance_floor_ms2": 1.0,
+    "reference_mask_policy": "observed_only",
+    "save_artifacts": true
   },
   "window_epochs": 4,
   "diffusion_schedule": "linear_power",
-  "terminal_alpha_bar": 1e-8
+  "terminal_alpha_bar": 1e-08,
+  "evaluation_protocol": {
+    "mode": "all_subjects_train_single_subject_eval",
+    "subject": "S092",
+    "expected_subjects": 88
+  },
+  "missing_value_policy": "preserve",
+  "signal_normalization": {
+    "method": "minmax",
+    "min_seconds": 0.0,
+    "max_seconds": 2.0
+  },
+  "training_input_dropout": {
+    "probability": 0.0,
+    "seed": 42
+  },
+  "s4_dropout": 0.0
 }

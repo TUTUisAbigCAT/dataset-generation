@@ -32,6 +32,9 @@ EPOCH_METRIC_FIELDS = (
     "smoothed_gaussian_kl_real_to_generated", "validation_seconds",
     "smoothing_ready", "metric_improvement", "early_stopping_bad_epochs", "stopped_early",
 )
+CURRENT_EPOCH_METRIC_FIELDS = tuple(
+    field for field in EPOCH_METRIC_FIELDS
+    if field not in ("smoothed_gaussian_kl_real_to_generated", "smoothing_ready"))
 
 
 def early_stopping_options(config):
@@ -39,7 +42,7 @@ def early_stopping_options(config):
     # Zero-valued historical thresholds have an unambiguous migration. A
     # nonzero threshold in ms or ms^2 cannot be reused for dimensionless KL.
     legacy = {"min_delta_mean_ms", "min_delta_variance_ms2"}
-    if not isinstance(values, dict) or set(values) - (set(DEFAULT_EARLY_STOPPING) | legacy):
+    if not isinstance(values, dict) or set(values) - (set(DEFAULT_EARLY_STOPPING) | legacy | {"selection_mode"}):
         raise ValueError("early_stopping must be an object with only supported options")
     for key in legacy & values.keys():
         value = values[key]
@@ -52,6 +55,14 @@ def early_stopping_options(config):
         value = options[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"early_stopping.{key} must be a positive integer")
+    selection_mode = options.get("selection_mode", "smoothed")
+    if not isinstance(selection_mode, str) or selection_mode not in ("smoothed", "current"):
+        raise ValueError("early_stopping.selection_mode must be smoothed or current")
+    if selection_mode == "current" and options["smoothing_window"] != 1:
+        raise ValueError("early_stopping.selection_mode=current requires smoothing_window=1")
+    if selection_mode == "smoothed":
+        # Preserve historical serialized options and run identities.
+        options.pop("selection_mode", None)
     for key in ("min_delta_kl",):
         value = options[key]
         if (isinstance(value, bool) or not isinstance(value, (int, float))
@@ -62,17 +73,20 @@ def early_stopping_options(config):
 
 
 class EarlyStopping:
-    """Track full-window SMA of KL(real || generated), lower is better.
+    """Track KL(real || generated), lower is better.
 
-    The first complete smoothing window establishes the anchor. Only a
-    strict decrease exceeding min_delta_kl resets patience and selects the
-    current weights. Raw minima are diagnostics, not checkpoint triggers.
+    Legacy mode selects from a full-window SMA. Current mode uses each epoch's
+    KL directly, beginning at epoch one, without accumulating or averaging a
+    history. A strict decrease exceeding min_delta_kl selects current weights.
+    Disabling early termination leaves checkpoint selection active.
     """
     def __init__(self, config):
         self.options = early_stopping_options(config)
+        self.selection_mode = self.options.get("selection_mode", "smoothed")
         self.best, self.anchors = {}, {}
         self.history = deque(maxlen=self.options["smoothing_window"])
         self.smoothed = {name: None for name in EARLY_STOP_METRICS}
+        self.current = {name: None for name in EARLY_STOP_METRICS}
         self.completed_epochs = self.bad_epochs = 0
         self.stopped_epoch = None
 
@@ -82,11 +96,16 @@ class EarlyStopping:
         values = {name: float(aggregate[key]) for name, (key, _) in EARLY_STOP_METRICS.items()}
         if any(not math.isfinite(value) or value < 0 for value in values.values()):
             raise ValueError("Early-stopping KL must be finite and nonnegative")
-        self.history.append(values)
-        ready = len(self.history) == self.options["smoothing_window"]
-        if ready:
-            self.smoothed = {name: math.fsum(row[name] for row in self.history) / len(self.history)
-                             for name in EARLY_STOP_METRICS}
+        if self.selection_mode == "current":
+            self.current = values.copy()
+            ready, selection_values = True, values
+        else:
+            self.history.append(values)
+            ready = len(self.history) == self.options["smoothing_window"]
+            if ready:
+                self.smoothed = {name: math.fsum(row[name] for row in self.history) / len(self.history)
+                                 for name in EARLY_STOP_METRICS}
+            selection_values = self.smoothed
         improved, new_best = [], []
         for name, value in values.items():
             metric, delta_key = EARLY_STOP_METRICS[name]
@@ -94,8 +113,8 @@ class EarlyStopping:
                 self.best[name] = dict(epoch=epoch, metric=metric, value=value)
                 new_best.append(name)
             if ready and (name not in self.anchors
-                          or self.smoothed[name] < self.anchors[name] - self.options[delta_key]):
-                self.anchors[name] = self.smoothed[name]
+                          or selection_values[name] < self.anchors[name] - self.options[delta_key]):
+                self.anchors[name] = selection_values[name]
                 improved.append(name)
         metric_improvement = "kl" in improved
         if ready:
@@ -107,14 +126,19 @@ class EarlyStopping:
                     metric_improvement=metric_improvement)
 
     def summary(self):
-        return dict(options=self.options.copy(), improvement_rule="smoothed_kl",
-                    smoothing_method="simple_moving_average",
-                    smoothing_ready=len(self.history) == self.options["smoothing_window"],
-                    smoothed_metrics={EARLY_STOP_METRICS[name][0]: value for name, value in self.smoothed.items()},
-                    bad_epochs=self.bad_epochs,
-                    stopped_early=self.stopped_epoch is not None, stopped_epoch=self.stopped_epoch,
-                    completed_epochs=self.completed_epochs, threshold_anchors=self.anchors.copy(),
-                    best_metrics={name: value.copy() for name, value in self.best.items()})
+        summary = dict(options=self.options.copy(), bad_epochs=self.bad_epochs,
+                       stopped_early=self.stopped_epoch is not None, stopped_epoch=self.stopped_epoch,
+                       completed_epochs=self.completed_epochs, threshold_anchors=self.anchors.copy(),
+                       best_metrics={name: value.copy() for name, value in self.best.items()})
+        if self.selection_mode == "current":
+            summary.update(improvement_rule="current_kl", smoothing_method="none",
+                           selection_ready=self.completed_epochs > 0,
+                           current_metrics={EARLY_STOP_METRICS[name][0]: value for name, value in self.current.items()})
+        else:
+            summary.update(improvement_rule="smoothed_kl", smoothing_method="simple_moving_average",
+                           smoothing_ready=len(self.history) == self.options["smoothing_window"],
+                           smoothed_metrics={EARLY_STOP_METRICS[name][0]: value for name, value in self.smoothed.items()})
+        return summary
 
 
 def validation_options(config):
@@ -167,20 +191,22 @@ def select_fixed_windows(preprocessor, options):
     """Greedy nonoverlapping candidates, then seeded subject-round-robin sampling.
 
     Search at every 30-second boundary so a missing first epoch cannot discard
-    all legal windows in a short validation record. Selection never opens test.
+    all legal windows in a short evaluation record. Selection is restricted to
+    the preprocessor's explicit evaluation filenames (the legacy val split).
     """
     window_size = preprocessor.window_size
     if (isinstance(window_size, bool) or not isinstance(window_size, int)
             or window_size < EPOCH_SAMPLES or window_size % EPOCH_SAMPLES):
         raise ValueError("Validation requires a positive whole number of 30-second epochs")
     dataset = preprocessor.make_validation_dataset(window_size=window_size, stride=EPOCH_SAMPLES)
+    evaluation_filenames = getattr(preprocessor, "evaluation_filenames", preprocessor.splits["val"])
     groups = defaultdict(list)
     end_by_subject = {}
     use_mask = _uses_reference_mask(preprocessor, options)
     excluded_insufficient_observations = 0
     for name, start in dataset.window_index:
-        if name not in preprocessor.splits["val"]:
-            raise RuntimeError("Validation selection escaped the validation split")
+        if name not in evaluation_filenames:
+            raise RuntimeError("Validation selection escaped the configured evaluation filenames")
         if use_mask and int(_window_reference_mask(preprocessor, name, start, window_size).sum()) < 2:
             # Filter before greedy nonoverlap: a rejected window must not block
             # a later usable start, or participate in the seeded truncation.
@@ -314,8 +340,8 @@ class EpochValidator:
             window=self.window,
             options=self.options, selection=selection, windows=self.windows_metadata,
             early_stopping=self.early_stopping.options,
-            early_stopping_improvement_rule="smoothed_kl",
-            early_stopping_smoothing_method="simple_moving_average",
+            early_stopping_improvement_rule=self.early_stopping.summary()["improvement_rule"],
+            early_stopping_smoothing_method=self.early_stopping.summary()["smoothing_method"],
             scaler=preprocessor.scaler, split_fingerprint=preprocessor.split_fingerprint,
             data_synthetic=preprocessor.provenance()["data_synthetic"],
             condition_columns=preprocessor.columns.tolist()[1:],
@@ -339,6 +365,10 @@ class EpochValidator:
             limitations="KL of paired moment-matched univariate Gaussian approximations, not the joint sequence distributions. "
                         "Invariant to temporal permutations within each window; does not assess temporal order, autocorrelation "
                         "or non-Gaussian structure and does not establish conditional fidelity.")
+        evaluation_protocol = getattr(preprocessor, "evaluation_protocol", None)
+        if evaluation_protocol is not None:
+            self.protocol["evaluation_protocol"] = evaluation_protocol
+            self.protocol["evaluation_filenames"] = list(preprocessor.evaluation_filenames)
         if self.reference_mask is not None:
             self.protocol.update(
                 schema="ibi_epoch_masked_window_gaussian_kl_v5",
@@ -455,11 +485,14 @@ class EpochValidator:
         checkpoint_updates = {}
         if stopping["metric_improvement"]:
             checkpoint_updates["kl"] = dict(
-                epoch=epoch, metric="gaussian_kl_real_to_generated", selection_rule="smoothed_kl",
-                value=stopping["smoothed_metrics"]["gaussian_kl_real_to_generated"],
-                raw_metrics={key: aggregate[key] for key, _ in EARLY_STOP_METRICS.values()},
-                smoothing_window=self.early_stopping.options["smoothing_window"],
-                window_start_epoch=epoch-self.early_stopping.options["smoothing_window"]+1)
+                epoch=epoch, metric="gaussian_kl_real_to_generated",
+                selection_rule=stopping["improvement_rule"],
+                value=self.early_stopping.anchors["kl"],
+                raw_metrics={key: aggregate[key] for key, _ in EARLY_STOP_METRICS.values()})
+            if self.early_stopping.selection_mode == "smoothed":
+                checkpoint_updates["kl"].update(
+                    smoothing_window=self.early_stopping.options["smoothing_window"],
+                    window_start_epoch=epoch-self.early_stopping.options["smoothing_window"]+1)
         for name, checkpoint_metrics in checkpoint_updates.items():
             checkpoint = self.training_output / f"best_{name}_model.pth"
             # Save only state_dict, matching the baseline checkpoint format.
@@ -483,16 +516,20 @@ class EpochValidator:
         # Rewriting a short history avoids partial CSV rows after a failed append.
         csv_path = self.training_output / "epoch_metrics.csv"
         with csv_path.open("w", encoding="utf-8", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=EPOCH_METRIC_FIELDS)
+            current_mode = self.early_stopping.selection_mode == "current"
+            writer = csv.DictWriter(stream, fieldnames=CURRENT_EPOCH_METRIC_FIELDS if current_mode else EPOCH_METRIC_FIELDS)
             writer.writeheader()
             for row in self.reports:
-                writer.writerow(dict(epoch=row["epoch"], train_mean_loss=row["train_mean_loss"],
-                                     **row["aggregate"], validation_seconds=row["validation_seconds"],
-                                     **{"smoothed_" + key: value for key, value in row["early_stopping"]["smoothed_metrics"].items()},
-                                     smoothing_ready=row["early_stopping"]["smoothing_ready"],
-                                     metric_improvement=row["early_stopping"]["metric_improvement"],
-                                     early_stopping_bad_epochs=row["early_stopping"]["bad_epochs"],
-                                     stopped_early=row["early_stopping"]["stopped_early"]))
+                csv_row = dict(epoch=row["epoch"], train_mean_loss=row["train_mean_loss"],
+                               **row["aggregate"], validation_seconds=row["validation_seconds"],
+                               metric_improvement=row["early_stopping"]["metric_improvement"],
+                               early_stopping_bad_epochs=row["early_stopping"]["bad_epochs"],
+                               stopped_early=row["early_stopping"]["stopped_early"])
+                if not current_mode:
+                    csv_row.update(
+                        {"smoothed_" + key: value for key, value in row["early_stopping"]["smoothed_metrics"].items()},
+                        smoothing_ready=row["early_stopping"]["smoothing_ready"])
+                writer.writerow(csv_row)
         _save_json(self.output / "summary.json", self.summary())
         print(json.dumps(dict(status="epoch_validation_completed", epoch=epoch,
                               train_mean_loss=float(train_mean_loss), **aggregate,

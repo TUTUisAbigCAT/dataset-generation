@@ -2,6 +2,8 @@
 
 基于固定版本 WaveStitch，适配 WatchSleepNet 的 DREAMT IBI 数据接口。每个输入窗口为 `[B, 750 × K, 10]`，其中 `K=window_epochs` 是连续 30 秒睡眠 epoch 的数量，默认 4（25 Hz、120 秒、3000 点）；生成目标为 IBI。九个条件通道依次为 W / Light / REM / Deep、AHI、BMI、AGE、gender_F、gender_M。
 
+**当前实验配置：全部 88 条记录参与训练（含 S092），只在 S092 上逐轮生成评估，按当轮最低 KL 保存 best，不做滑动平均。** 提交 12 组任务使用 `sbatch submit_all88_s092_sweep.sh`，详见 [当前实验说明](docs/all88_s092_sweep.md)。下文保留历史划分、早停和诊断用法；旧运行的冻结配置不会被改写。
+
 网络结构、优化器、epsilon MSE 损失和训练更新公式沿用固定上游版本；本地 S4 慢速 Cauchy 回退计算补齐遗漏的共轭项。新训练通过独立的 `diffusion_schedule.py` 将200步日程的终点累计 alpha 调整到约 `1e-8`，使训练末态更接近采样使用的标准高斯起点；训练与推理使用同一记录日程。采样运行时另修正一处后验噪声系数：使用后验方差的平方根作为标准差；固定上游源码及 `training_utils.py` 不改写。在 `de30ac2` 的数据与 CUDA 设备适配基础上，增加每轮生成验证、loss 数值平均及早停；本地改动纳入源码检查器的逐项白名单。上游来源和许可证说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 缺失零值训练对照
@@ -66,7 +68,7 @@ python scripts/smoke_cuda.py --threads 4
 
 ## 数据目录与训练
 
-`dataset_config.json` 当前保留用户指定的集群数据路径；本地格式检查可通过 `--data-dir example_data` 使用随附样例。其中四个人的短记录是**人工格式样例**，仅用于检查安装和入口，不是 DREAMT 观测数据。真实数据需用户自行准备，仓库不包含真实受试者数据或训练 checkpoint。
+`dataset_config.json` 当前保留用户指定的集群数据路径，并要求恰好 88 条记录及 S092。随附 `example_data` 只有四个人的**人工格式样例**；测试它时需使用不含 `evaluation_protocol` 的独立配置，不能仅替换当前配置的目录。`scripts/smoke_cuda.py` 会自动创建独立样例配置。真实数据需用户自行准备，仓库不包含真实受试者数据或训练 checkpoint。
 
 训练真实数据时，只需将 `data_dir` 改成兼容的 IBI NPZ 文件夹；`metadata_path` 和 `split_path` 可以保持 null。配置中的相对路径以配置文件所在目录为基准。
 
@@ -83,7 +85,7 @@ DREAMT/
 - NPZ 使用原字段 `data, stages, fs, ahi`。不要求模拟器字段、时间索引或额外 subject_id。IBI 可以是向量或单列数组。
 - CSV 位于 NPZ 文件夹或其直接上一层，必须有 `SID, AHI, BMI, AGE, GENDER`；SID 对应 NPZ 文件名，GENDER 为 F/M。原四字段 NPZ 不足以提供全部个人条件。
 - 原始 stage 编码为 W=0、N1=1、N2=2、N3=3、REM=4；读取后合并为 W=0、Light=1、REM=2、Deep=3。不要传入已经合并的标签再映射一次。
-- `splits.json` 可选；未提供时按固定种子 42 按受试者划分，目标比例 75% / 12.5% / 其余，至少需要三个人，且训练集和验证集各有至少一个配置长度的合法窗口。已有 split 文件会严格校验。
+- 当前 `evaluation_protocol` 模式忽略 `splits.json`，所有 88 条记录参与训练，S092 另作训练内评估。只有不含 `evaluation_protocol` 的历史配置才读取 `splits.json`，或按固定种子 42 划分 75% / 12.5% / 其余。
 - 100 Hz 输入可设置 `downsample_rate=4`；其他单位通过 `multiplier` 明确换算。
 
 ```bash
@@ -93,7 +95,7 @@ python scripts/run_dreamt.py --epochs 50 --batch-size 8 --threads 4
 
 也可通过 `--data-dir /path/to/DREAMT_PIBI_SE_new` 覆盖 NPZ 目录，或把私人路径写进已忽略的 `dataset_config.local.json` 并传入 `--config dataset_config.local.json`。Windows 使用 `run.ps1` 时传入相同参数即可。
 
-默认每次训练创建独立的 `runs/dreamt_<UTC时间戳>`，保存源码、配置、按人划分、训练集统计、checkpoint 和日志。每个 epoch 结束执行生成验证，训练结束后再执行去噪评估及修正后的 200 步采样。`--skip-generation` 只跳过最后的独立采样任务，每轮 validation 仍执行。旧模型评估的数据、长度、日程和模型参数绑定原训练 manifest，不跟随后来修改的全局配置；使用当前评估入口时，采样器采用后验方差平方根修正。
+默认每次训练创建独立的 `runs/dreamt_<UTC时间戳>`，保存源码、配置、数据使用协议、训练数据统计、checkpoint 和日志。每个 epoch 结束执行生成验证，训练结束后再执行去噪评估及修正后的 200 步采样。`--skip-generation` 只跳过最后的独立采样任务，每轮 validation 仍执行。旧模型评估的数据、长度、日程和模型参数绑定原训练 manifest，不跟随后来修改的全局配置；使用当前评估入口时，采样器采用后验方差平方根修正。
 
 ## 扩散日程与历史 checkpoint
 
@@ -166,7 +168,7 @@ python scripts/check_s4_backends.py --device both
 }
 ```
 
-默认使用按受试者隔离的 val split 中全部互不重叠的配置长度合法窗口（`max_windows: null`）。不足一个窗口的尾段和含无效睡眠标签的窗口不参与；候选搜索对齐 30 秒边界。只有显式设置整数 `max_windows` 才执行固定种子的子集验证。所选窗口及数量记录在 `training/validation/protocol.json`，不读取 test split，不重新拟合标准化参数。训练期间窗口、顺序、采样种子不变；修改 batch_size 可能改变采样随机流，跨实验比较应保持整个 validation 配置一致。
+当前配置使用 S092 的全部互不重叠合法窗口（`max_windows: null`）；不含 `evaluation_protocol` 的历史配置仍使用 val split。不足一个窗口的尾段和含无效睡眠标签的窗口不参与；候选搜索对齐 30 秒边界。只有显式设置整数 `max_windows` 才执行固定种子的子集评估。所选窗口及数量记录在 `training/validation/protocol.json`，评估不重新拟合标准化参数。训练期间窗口、顺序、采样种子不变；修改 batch_size 可能改变采样随机流，跨实验比较应保持整个 validation 配置一致。
 
 唯一的生成验证指标是 `gaussian_kl_real_to_generated`：**每个真实窗口与对应生成窗口的一维高斯近似 KL，再对全部窗口取算术平均**，使用自然对数，单位为 nats，越小越好。全部窗口形成 `X_real, X_gen: [N, L]`；同索引的两个窗口配对，生成窗口使用该真实窗口的条件。只统计 IBI，反归一化到毫秒后以 float64 沿每个窗口内部的时间点轴 `dim=1` 分别计算均值和总体方差（`correction=0`）：
 
@@ -187,7 +189,7 @@ gaussian_kl_real_to_generated = sum_n(KL_window[n]) / N
 
 每个窗口分别形成一个真实高斯和一个生成高斯，计算的是 `KL(real || generated)`，不是把全部窗口混合后求一次 KL，也不对 L 个时间坐标的 KL 求和。每个窗口等权，**不是每个受试者等权**；提供更多合法验证窗口的受试者会获得更大权重。跨 batch 累加 KL 总和与窗口数，最后除以总窗口数，最后一个短 batch 不会被额外放大权重。
 
-两侧方差采用相同的固定下界，默认 `1.0 ms²`（对应 1 ms 标准差）；配置必须为正有限数，下界及方向写入验证协议并随运行冻结。下界只用于拟合高斯的方差，不裁剪 IBI 波形，不改变训练标准化；原存储零值（包括缺失标记）仍计入统计。常量窗口的方差为零，计算时使用下界。
+两侧方差采用相同的固定下界，默认 `1.0 ms²`（对应 1 ms 标准差）；配置必须为正有限数，下界及方向写入验证协议并随运行冻结。下界只用于拟合高斯的方差，不裁剪 IBI 波形，不改变训练标准化；当前 observed_only 配置仅在参考正值位置统计两侧矩；仅历史 training + preserve 模式包含原存储零值。常量窗口的方差为零，计算时使用下界。
 
 该指标只比较每个窗口内的幅值均值和方差，**对窗口内部的时间排序不敏感**：任意打乱一个窗口的采样点，均值、方差和对应 KL 都不变。它忽略自相关、频谱、非高斯结构和接缝连续性，不是 L 维序列联合分布的 KL，也不是整夜生成质量或条件利用能力的充分证明。只有一个验证窗口时也能用窗口内 L 个点计算该指标，但一个配对样本不足以评价生成分布或泛化能力；同条件生成本身的随机性也会影响配对得分。
 
@@ -197,25 +199,25 @@ gaussian_kl_real_to_generated = sum_n(KL_window[n]) / N
 
 训练 `train_mean_loss = Σ(batch_MSE × batch样本数) / Σ(batch样本数)`，最后一个短 batch 按实际样本数加权，输出普通数值。`training_report.json` 中的 `mean_loss` 为实际训练过程的同口径平均；反向传播仍使用原始 MSE，没有将训练 loss 改为 KL。
 
-`training/epoch_metrics.csv` 仅保留以下字段：
+`training/epoch_metrics.csv` 使用以下字段；当前 `selection_mode: current` 不写入表中的两个平滑专用字段：
 
 | 字段 | 含义 |
 |---|---|
 | `epoch` | 已完成的训练轮次 |
 | `train_mean_loss` | 当轮按样本数加权的平均训练 MSE |
 | `gaussian_kl_real_to_generated` | 当轮全验证集的配对窗口高斯 KL 算术平均，nats |
-| `smoothed_gaussian_kl_real_to_generated` | 最近完整滑动窗口的平均 KL；预热期为空 |
+| `smoothed_gaussian_kl_real_to_generated` | 仅历史平滑模式：最近完整滑动窗口的平均 KL |
 | `validation_seconds` | 当轮验证耗时，包含采样、KL 和最佳权重保存 |
-| `smoothing_ready` | 是否已达到滑动平均所需轮数 |
-| `metric_improvement` | 平滑 KL 是否达到本轮改善条件 |
+| `smoothing_ready` | 仅历史平滑模式：是否已达到滑动平均所需轮数 |
+| `metric_improvement` | 当前模式为当轮 KL 是否刷新最低值；历史模式比较平滑 KL |
 | `early_stopping_bad_epochs` | 连续没有达到改善条件的轮数 |
 | `stopped_early` | 是否在本轮触发早停 |
 
 旧整体／逐窗口均值方差误差、方差比、向量 L2、`joint_improvement` 及其相关计算已从每轮验证中移除。每轮 `training/validation/epoch_0001/metrics.json` 等文件保留平均 KL、采样信息、早停状态；逐窗口 KL 计算后汇总，不另输出逐窗列表。所选窗口元数据只在协议中保存。独立去噪评估、最终生成报告保持各自的输出用途。历史运行的 CSV 和冻结源码不改写，新配置对新启动的运行生效；读取相同名字的 KL 列时应同时检查协议版本。
 
-## 基于平滑 KL 的早停与 checkpoint
+## 当前 KL 选模与历史平滑早停
 
-`dataset_config.json` 默认启用：
+当前 `dataset_config.json` 设置 `selection_mode: current`、`smoothing_window: 1` 和 `enabled: false`，直接按每轮 KL 保存 best，关闭提前终止。以下是保留的历史平滑模式配置（省略 `selection_mode` 时使用）：
 
 ```json
 "early_stopping": {
@@ -374,7 +376,11 @@ sbatch submit_inference.sh
 
 两组各自从头训练 30 轮，与已完成的 `minmax_20261103T003905Z_1223635` 使用相同训练预算和验证窗口。配置、计数、输出和提交方式见 [min-max 后续实验说明](docs/minmax_followup_experiments.md)。
 
-## 16 组 dropout 与归一化对照
+## 当前实验：全部 88 条训练，S092 当轮 KL 选模
+
+`submit_all88_s092_sweep.sh` 提交 12 个独立 CUDA 训练任务：两种 min-max 范围 × 输入/S4 两种 dropout 位置 × `0 / 0.03 / 0.05`。全部 88 条记录（含 S092）参与训练，不留出验证或测试主体；每轮只对 S092 的全部有效不重叠窗口生成评估，以当轮 KL 的历史最低值保存 best，不使用滑动平均。每组 30 轮、batch size 8，最多并行 4 组。两个位置下的 `p=0` 是刻意保留的重复基线。当前 `dataset_config.json` 已设置此协议；完整配置、指标口径和提交方式见 [88 条训练 / S092 选模说明](docs/all88_s092_sweep.md)。
+
+## 历史实验：16 组 dropout 与归一化对照
 
 `submit_dropout_sweep.sh` 提交 16 个独立 CUDA 训练任务：`[-1,1]`、`[0,1]` 两种范围，各自分别测试输入 dropout 和原生 `s4_dropout` 的 `0.01 / 0.03 / 0.05 / 0.1`。每组只开启一种 dropout，另一种为 0。各组从头训练 30 轮、batch size 8，使用相同数据和固定验证窗口，最多同时运行 4 组。配置表为 `configs/dropout_sweep.json`；提交命令、机制和输出见 [16 组实验说明](docs/dropout_sweep.md)。
 

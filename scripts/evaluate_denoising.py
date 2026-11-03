@@ -179,17 +179,20 @@ def bind_training_data(model_args, manifest, manifest_path, preprocessor_class):
     data_dir = _recorded_path(expected["data_directory"], manifest_path)
     metadata_path = _recorded_path(expected.get("metadata_path") or data_dir / "participant_info.csv", manifest_path)
     generated = expected.get("split_source") == "generated_subject_split"
+    all_subjects = expected.get("split_source") == "all_subjects"
     if generated and "split_seed" not in expected:
         raise ValueError("Generated training split must record its split_seed")
     split_value = expected.get("split_path")
-    split_path = None if generated else _recorded_path(split_value or data_dir / "splits.json", manifest_path)
+    split_path = None if generated or all_subjects else _recorded_path(split_value or data_dir / "splits.json", manifest_path)
     config = dict(data_dir=str(data_dir), metadata_path=str(metadata_path), generate_splits=generated,
-        split_path=None if generated else str(split_path), split_seed=expected.get("split_seed", 42),
+        split_path=None if generated or all_subjects else str(split_path), split_seed=expected.get("split_seed", 42),
         multiplier=expected.get("multiplier", 1.0), downsample_rate=expected.get("downsample_rate", 1),
         max_epochs=expected.get("max_epochs"), window_epochs=settings["window_epochs"],
         missing_value_policy=expected.get("missing_value_policy", "preserve"))
     if "signal_normalization" in expected:
         config["signal_normalization"] = expected["signal_normalization"]
+    if "evaluation_protocol" in expected:
+        config["evaluation_protocol"] = expected["evaluation_protocol"]
     if "schema" in expected:
         if expected["schema"] != "dreamt_data_identity_v1":
             raise ValueError("Unsupported training data identity schema")
@@ -204,7 +207,7 @@ def bind_training_data(model_args, manifest, manifest_path, preprocessor_class):
                 "split_file_sha256", "split_fingerprint", "metadata_file_sha256", "splits", "scaler",
                 "scaler_subjects", "multiplier", "downsample_rate", "max_epochs", "sample_rate_hz",
                 "epoch_samples", "window_epochs", "columns", "stage_names", "raw_stage_mapping",
-                "zero_value_policy", "signal_normalization"):
+                "zero_value_policy", "signal_normalization", "evaluation_protocol", "evaluation_filenames"):
         if key in expected:
             reference = expected[key]
             if key in ("data_directory", "metadata_path", "split_path") and reference is not None:
@@ -366,13 +369,15 @@ def main():
             raise ValueError(f"Fixed upstream buffer differs from the seed-42 constructor: {name}")
 
     windows, identities = [], []
+    in_sample_evaluation = getattr(preprocessor, 'evaluation_protocol', None) is not None
+    evaluation_split = 'train' if in_sample_evaluation else 'val'
     selected_windows = preprocessor.select_validation_windows(windows_per_subject=2)
     observed_mask_array = _validation_observed_masks(preprocessor, selected_windows, model_args.window_size)
     for filename, start in selected_windows:
         record = preprocessor.record(filename)
         windows.append(preprocessor.window_array(filename, start, model_args.window_size))
         identities.append(dict(subject_id=record["subject_id"], filename=filename,
-            split="val", start_sample=start, start_epoch=start // EPOCH_SAMPLES,
+            split=evaluation_split, start_sample=start, start_epoch=start // EPOCH_SAMPLES,
             start_seconds=start / FS, samples=model_args.window_size))
         if observed_mask_array is not None:
             identities[-1]["observed_samples"] = int(observed_mask_array[len(identities)-1].sum())
@@ -473,7 +478,7 @@ def main():
             selected = [row for row in rows if row["model_state"] == state and row["scenario"] == scenario]
             for sid in sorted({row["subject_id"] for row in selected}):
                 individual = [row for row in selected if row["subject_id"] == sid]
-                subjects.append(dict(model_state=state, scenario=scenario, subject_id=sid, split="val", windows=len(individual),
+                subjects.append(dict(model_state=state, scenario=scenario, subject_id=sid, split=evaluation_split, windows=len(individual),
                     **{key: torch.stack([row[key] for row in individual]).double().mean() for key in metric_keys}))
             per_subject = [row for row in subjects if row["model_state"] == state and row["scenario"] == scenario]
             totals.append(dict(model_state=state, scenario=scenario, subjects=subject_count, windows=window_count,
@@ -516,6 +521,10 @@ def main():
         checkpoint_loading="official named_parameter.copy_; no load_state_dict and no buffer copies",
         buffer_checks=buffer_checks, load_checks=load_checks, all_parameters_and_buffers_unchanged_after_evaluation=True,
         parameter_gradients_absent=True, checkpoint_unchanged=True, summaries=totals)
+    if in_sample_evaluation:
+        report['protocol'].update(evaluation_protocol=preprocessor.evaluation_protocol,
+            evaluation_is_held_out=False, evaluation_included_in_training=True,
+            scaler_cohort='all training subjects, including the evaluation subject')
     if observed_masks is not None:
         report["protocol"].update(missing_value_policy="masked",
             loss="Observed-position epsilon MSE; batch sum divided by valid sample count, not all-point MSE",
@@ -538,11 +547,14 @@ def main():
     np.savez_compressed(args.output_dir / "raw_predictions.npz",
                         **{key: value.detach().cpu().numpy() for key, value in raw.items()})
     save_json(args.output_dir / "evaluation_report.json", report)
+    cohort_description = ('训练内评估主体（也参与训练）' if in_sample_evaluation else 'val 主体')
+    scaler_description = ('全部训练主体的 scaler；评估主体也包含在其中，不存在留出测试集'
+                          if in_sample_evaluation else 'train-only scaler；test NPZ未打开')
     lines = ["# 固定验证窗口的一步去噪检查", "",
         "这是外部只读观测：对记录中的目标 x0 正向加噪后，比较原模型初始化零输出头与训练后 epsilon 预测。"
         "不运行反向采样，不修改训练算法；这些是 teacher-forced 去噪指标，不是自由生成质量、FID 或整夜评价。", "",
-        f"本次 {subject_count} 位 val 主体、{window_count} 个合法 {model_args.window_size / FS:g} 秒窗口；每人选择首个及最接近30分钟的不同合法窗口，只有一个时保留一个。"
-        f"使用训练manifest记录的数据和train-only scaler；test NPZ未打开。两种模型状态使用相同x_t/epsilon；B={args.batch_size}。", "",
+        f"本次 {subject_count} 位{cohort_description}、{window_count} 个合法 {model_args.window_size / FS:g} 秒窗口；每人选择首个及最接近30分钟的不同合法窗口，只有一个时保留一个。"
+        f"使用训练manifest记录的数据和{scaler_description}。两种模型状态使用相同x_t/epsilon；B={args.batch_size}。", "",
         "| 模型状态 | 情景 | epsilon MSE | x0 窗口均值 MAE (ms) | x0 均值有符号偏差 (ms) |", "| --- | --- | --- | --- | --- |"]
     for row in totals:
         lines.append(f"| {row['model_state']} | {row['scenario']} | {row['epsilon_mse']:.6g} | "

@@ -62,6 +62,8 @@ class CudaWorkflowTests(unittest.TestCase):
             caller.mkdir()
             config_path = config_dir / "dataset_config.json"
             config = json.loads((ROOT / "dataset_config.json").read_text(encoding="utf-8-sig"))
+            # This test checks output paths with the four-subject legacy fixture.
+            config.pop("evaluation_protocol", None)
             config["data_dir"] = str(ROOT / "example_data")
             command = [sys.executable, "-B", str(ROOT / "scripts/run_dreamt.py"),
                        "--config", str(config_path), "--check-only"]

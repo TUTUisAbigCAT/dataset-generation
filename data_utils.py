@@ -26,6 +26,28 @@ COLUMNS = ("IBI",) + tuple("stage_" + name for name in STAGE_NAMES) + CONTINUOUS
 ZERO_VALUE_POLICY = "preserve stored zero missing-value markers in scaler and unmodified MSE; no imputation"
 MASKED_ZERO_VALUE_POLICY = "raw IBI > 0 is observed; training signal scaler uses observed points only; missing signal inputs are standardized zero; observed mask is separate from the ten model channels"
 ZERO_FILL_ONE_VALUE_POLICY = "replace raw IBI == 0 with 1.0 second before training-only signal scaling and window standardization; ordinary MSE includes all filled points; original records and observed masks remain unchanged"
+ALL_SUBJECTS_EVALUATION_MODE = "all_subjects_train_single_subject_eval"
+
+
+def evaluation_protocol_options(config):
+    """Return the explicit in-sample protocol, or None for historical splits."""
+    if "evaluation_protocol" not in config:
+        return None
+    options = config["evaluation_protocol"]
+    required = {"mode", "subject", "expected_subjects"}
+    if not isinstance(options, dict) or set(options) != required:
+        raise ValueError("evaluation_protocol requires exactly mode, subject, and expected_subjects")
+    if options["mode"] != ALL_SUBJECTS_EVALUATION_MODE:
+        raise ValueError(f"evaluation_protocol.mode must be {ALL_SUBJECTS_EVALUATION_MODE!r}")
+    subject = options["subject"]
+    if (not isinstance(subject, str) or not subject or subject != subject.strip()
+            or subject in (".", "..") or "/" in subject or "\\" in subject
+            or Path(subject).name != subject or subject.lower().endswith(".npz")):
+        raise ValueError("evaluation_protocol.subject must be an exact local participant SID without .npz")
+    count = options["expected_subjects"]
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("evaluation_protocol.expected_subjects must be a positive integer")
+    return dict(options)
 
 
 class CyclicEncoder:
@@ -70,7 +92,8 @@ class WindowDataset(Dataset):
         self.preprocessor, self.split = preprocessor, split
         self.window_size, self.stride = int(window_size), int(stride)
         self.window_index, self.excluded_windows = [], 0
-        for filename in preprocessor.splits[split]:
+        filenames = preprocessor.splits["train"] if split == "train" else preprocessor.evaluation_filenames
+        for filename in filenames:
             record = preprocessor.record(filename)
             for start in range(0, len(record["ibi"]) - window_size + 1, stride):
                 if preprocessor._window_valid_for_policy(record, start // EPOCH_SAMPLES, preprocessor.window_epochs):
@@ -128,6 +151,7 @@ class Preprocessor:
             return config.get(key, default), config_base
 
         self.dataset = dataset
+        self.evaluation_protocol = evaluation_protocol_options(config)
         policy = config.get("missing_value_policy", "preserve") if missing_value_policy is None else missing_value_policy
         if not isinstance(policy, str) or policy not in ("preserve", "masked", "zero_fill_one"):
             raise ValueError("missing_value_policy must be 'preserve', 'masked', or 'zero_fill_one'")
@@ -173,7 +197,16 @@ class Preprocessor:
         candidate_split = (_resolve_path(split_value, split_base) if split_value
                            else self.data_dir / "splits.json")
         filenames = sorted(path.name for path in self.data_dir.glob("*.npz") if path.is_file())
-        if generate_splits is True or (generate_splits is None and not split_value and not candidate_split.exists()):
+        if self.evaluation_protocol is not None:
+            expected = self.evaluation_protocol["expected_subjects"]
+            if len(filenames) != expected:
+                raise ValueError(f"evaluation_protocol expected {expected} NPZ subjects, found {len(filenames)}")
+            evaluation_filename = self.evaluation_protocol["subject"] + ".npz"
+            if evaluation_filename not in filenames:
+                raise ValueError(f"evaluation_protocol requires exact local NPZ filename {evaluation_filename!r}")
+            self.splits = dict(train=filenames.copy(), val=[], test=[])
+            self.split_source, self.split_path, self.split_file_sha256 = "all_subjects", None, None
+        elif generate_splits is True or (generate_splits is None and not split_value and not candidate_split.exists()):
             if len(filenames) < 3:
                 raise ValueError("At least three subjects are required to generate train/val/test splits")
             permutation = np.random.default_rng(self.split_seed).permutation(filenames).tolist()
@@ -198,9 +231,14 @@ class Preprocessor:
             raise ValueError("Subject splits must assign each NPZ exactly once without overlap")
         if len({Path(name).stem for name in flat}) != len(flat):
             raise ValueError("Each NPZ must identify one unique participant SID")
-        self.split_fingerprint = _fingerprint(dict(filenames=filenames, seed=self.split_seed,
+        split_identity = dict(filenames=filenames, seed=self.split_seed,
             source=self.split_source, policy="subject_75_12.5_rest_minimum_one_v1" if self.split_source == "generated_subject_split" else "explicit_file",
-            splits=self.splits))
+            splits=self.splits)
+        if self.evaluation_protocol is not None:
+            split_identity.update(policy=ALL_SUBJECTS_EVALUATION_MODE + "_v1",
+                                  evaluation_protocol=self.evaluation_protocol,
+                                  evaluation_filenames=self.evaluation_filenames)
+        self.split_fingerprint = _fingerprint(split_identity)
         self.columns = pd.Index(COLUMNS)
         self.schema_frame = pd.DataFrame(columns=self.columns, dtype=np.float32)
         self.hierarchical_features_cyclic = list(COLUMNS[1:])
@@ -236,12 +274,14 @@ class Preprocessor:
         for filename in self.splits["train"]:
             record = self.record(filename)
             signal = record["ibi"].reshape(-1, EPOCH_SAMPLES)[record["valid_epochs"]].astype(np.float64)
+            # The explicit all-subject protocol fits metadata across the whole
+            # cohort, including a subject without structurally valid signal.
+            # Legacy metadata weighting and identities remain unchanged.
+            if signal.size or self.evaluation_protocol is not None:
+                values.append(record["continuous"])
+                self.scaler_subjects.append(record["subject_id"])
             if not signal.size:
                 continue
-            # Keep the original training-subject metadata weighting. The new
-            # missing-value policy changes only the signal fit and supervision.
-            values.append(record["continuous"])
-            self.scaler_subjects.append(record["subject_id"])
             if self.missing_value_policy == "zero_fill_one":
                 signal[signal == 0] = 1.0
             validate_signal_bounds(signal, self.signal_normalization, context=f"Training {filename}")
@@ -285,6 +325,13 @@ class Preprocessor:
                 signal_center_seconds=center,
                 signal_scale_seconds=scale)
         self._meta_mean, self._meta_std = meta_mean, meta_std
+
+    @property
+    def evaluation_filenames(self):
+        """Evaluation membership is separate from held-out split membership."""
+        if self.evaluation_protocol is not None:
+            return [self.evaluation_protocol["subject"] + ".npz"]
+        return self.splits["val"].copy()
 
     def record(self, filename):
         if filename not in self.splits["train"] + self.splits["val"]:
@@ -373,7 +420,7 @@ class Preprocessor:
         windows_per_subject = int(windows_per_subject)
         selected, excluded, subjects = [], [], []
         stride = min(2 * EPOCH_SAMPLES, self.window_size)
-        for filename in self.splits["val"]:
+        for filename in self.evaluation_filenames:
             record = self.record(filename)
             candidates = [start for start in range(0, len(record["ibi"]) - self.window_size + 1, stride)
                           if self._window_valid_for_policy(record, start // EPOCH_SAMPLES, self.window_epochs)]
@@ -426,6 +473,9 @@ class Preprocessor:
             identity["missing_value_policy"] = self.missing_value_policy
         if self.signal_normalization is not None:
             identity["signal_normalization"] = dict(self.signal_normalization)
+        if self.evaluation_protocol is not None:
+            identity.update(evaluation_protocol=dict(self.evaluation_protocol),
+                            evaluation_filenames=self.evaluation_filenames)
         return _json_copy(identity)
 
     @classmethod
@@ -444,20 +494,29 @@ class Preprocessor:
         missing = [key for key in required if key not in identity]
         if missing:
             raise ValueError(f"Training data identity is missing fields: {missing}")
-        if identity["split_source"] not in ("generated_subject_split", "split_file"):
+        if identity["split_source"] not in ("generated_subject_split", "split_file", "all_subjects"):
             raise ValueError("Unknown training split source")
         generated = identity["split_source"] == "generated_subject_split"
-        if (generated and identity["split_path"] is not None) or (not generated and not identity["split_path"]):
+        all_subjects = identity["split_source"] == "all_subjects"
+        if all_subjects and ("evaluation_protocol" not in identity or "evaluation_filenames" not in identity):
+            raise ValueError("All-subject training identity requires evaluation_protocol and evaluation_filenames")
+        if not all_subjects and ("evaluation_protocol" in identity or "evaluation_filenames" in identity):
+            raise ValueError("Training split source and evaluation protocol disagree")
+        file_split = not (generated or all_subjects)
+        if (not file_split and identity["split_path"] is not None) or (file_split and not identity["split_path"]):
             raise ValueError("Training split source and split path disagree")
-        for key in ("data_directory", "metadata_path") + (() if generated else ("split_path",)):
+        for key in ("data_directory", "metadata_path") + (("split_path",) if file_split else ()):
             if not Path(identity[key]).is_absolute():
                 raise ValueError(f"Training data identity must record absolute {key}")
+        config = {"signal_normalization": identity.get("signal_normalization", {"method": "zscore"})}
+        if all_subjects:
+            config["evaluation_protocol"] = identity["evaluation_protocol"]
         processor = cls(identity.get("dataset", dataset), data_dir=identity["data_directory"],
             metadata_path=identity["metadata_path"], split_path=identity["split_path"],
             multiplier=identity["multiplier"], downsample_rate=identity["downsample_rate"],
             max_epochs=identity["max_epochs"], split_seed=identity["split_seed"],
             generate_splits=generated,
-            config_override={"signal_normalization": identity.get("signal_normalization", {"method": "zscore"})},
+            config_override=config,
             window_epochs=identity.get("window_epochs", 4),
             missing_value_policy=identity.get("missing_value_policy", "preserve"))
         actual = processor.data_identity()
@@ -467,6 +526,11 @@ class Preprocessor:
         if mismatches:
             raise ValueError(f"Training data identity mismatch: {', '.join(mismatches)}")
         return processor
+
+    @classmethod
+    def from_training_identity(cls, identity, dataset="DREAMT"):
+        """Explicitly named alias for restoring frozen training data inputs."""
+        return cls.from_identity(identity, dataset=dataset)
 
     def provenance(self):
         flags = [self._records[name].get("synthetic") for name in self.splits["train"]]
@@ -501,4 +565,10 @@ class Preprocessor:
             upstream_loader_sha256=file_sha256(ROOT / "third_party/WatchSleepNet/data_setup.py"))
         if self.signal_normalization is not None:
             provenance["signal_normalization"] = dict(self.signal_normalization)
+        if self.evaluation_protocol is not None:
+            provenance.update(evaluation_protocol=dict(self.evaluation_protocol),
+                              evaluation_filenames=self.evaluation_filenames,
+                              held_out_subjects=False,
+                              evaluation_is_held_out=False,
+                              evaluation_included_in_training=True)
         return provenance

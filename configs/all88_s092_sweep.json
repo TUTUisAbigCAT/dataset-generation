@@ -1,0 +1,137 @@
+{
+  "schema": "dreamt_all88_s092_sweep_v1",
+  "configurations": [
+    {
+      "id": 0,
+      "name": "minmax_m11_input_p0p0",
+      "normalization_range": [
+        -1.0,
+        1.0
+      ],
+      "dropout_location": "input",
+      "input_probability": 0.0,
+      "s4_probability": 0.0
+    },
+    {
+      "id": 1,
+      "name": "minmax_m11_input_p0p03",
+      "normalization_range": [
+        -1.0,
+        1.0
+      ],
+      "dropout_location": "input",
+      "input_probability": 0.03,
+      "s4_probability": 0.0
+    },
+    {
+      "id": 2,
+      "name": "minmax_m11_input_p0p05",
+      "normalization_range": [
+        -1.0,
+        1.0
+      ],
+      "dropout_location": "input",
+      "input_probability": 0.05,
+      "s4_probability": 0.0
+    },
+    {
+      "id": 3,
+      "name": "minmax_m11_s4_p0p0",
+      "normalization_range": [
+        -1.0,
+        1.0
+      ],
+      "dropout_location": "s4",
+      "input_probability": 0.0,
+      "s4_probability": 0.0
+    },
+    {
+      "id": 4,
+      "name": "minmax_m11_s4_p0p03",
+      "normalization_range": [
+        -1.0,
+        1.0
+      ],
+      "dropout_location": "s4",
+      "input_probability": 0.0,
+      "s4_probability": 0.03
+    },
+    {
+      "id": 5,
+      "name": "minmax_m11_s4_p0p05",
+      "normalization_range": [
+        -1.0,
+        1.0
+      ],
+      "dropout_location": "s4",
+      "input_probability": 0.0,
+      "s4_probability": 0.05
+    },
+    {
+      "id": 6,
+      "name": "minmax_01_input_p0p0",
+      "normalization_range": [
+        0.0,
+        1.0
+      ],
+      "dropout_location": "input",
+      "input_probability": 0.0,
+      "s4_probability": 0.0
+    },
+    {
+      "id": 7,
+      "name": "minmax_01_input_p0p03",
+      "normalization_range": [
+        0.0,
+        1.0
+      ],
+      "dropout_location": "input",
+      "input_probability": 0.03,
+      "s4_probability": 0.0
+    },
+    {
+      "id": 8,
+      "name": "minmax_01_input_p0p05",
+      "normalization_range": [
+        0.0,
+        1.0
+      ],
+      "dropout_location": "input",
+      "input_probability": 0.05,
+      "s4_probability": 0.0
+    },
+    {
+      "id": 9,
+      "name": "minmax_01_s4_p0p0",
+      "normalization_range": [
+        0.0,
+        1.0
+      ],
+      "dropout_location": "s4",
+      "input_probability": 0.0,
+      "s4_probability": 0.0
+    },
+    {
+      "id": 10,
+      "name": "minmax_01_s4_p0p03",
+      "normalization_range": [
+        0.0,
+        1.0
+      ],
+      "dropout_location": "s4",
+      "input_probability": 0.0,
+      "s4_probability": 0.03
+    },
+    {
+      "id": 11,
+      "name": "minmax_01_s4_p0p05",
+      "normalization_range": [
+        0.0,
+        1.0
+      ],
+      "dropout_location": "s4",
+      "input_probability": 0.0,
+      "s4_probability": 0.05
+    }
+  ]
+}

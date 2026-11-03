@@ -105,7 +105,8 @@ class ValidationOptionsAndSelectionTests(unittest.TestCase):
         index = [("a.npz", start) for start in range(750, 7501, 750)]
         index += [("b.npz", start) for start in range(0, 6001, 750)]
         index += [("c.npz", 1500)]
-        processor = mock.Mock(splits={"val": ["a.npz", "b.npz", "c.npz"]}, window_size=3000, window_epochs=4)
+        processor = mock.Mock(splits={"val": ["a.npz", "b.npz", "c.npz"]},
+                              evaluation_filenames=["a.npz", "b.npz", "c.npz"], window_size=3000, window_epochs=4)
         processor.make_validation_dataset.return_value = SimpleNamespace(window_index=index)
         options = {"max_windows": 5, "batch_size": 2, "seed": 42}
         before = rng_state()
@@ -130,7 +131,8 @@ class ValidationOptionsAndSelectionTests(unittest.TestCase):
         processor.make_validation_dataset.assert_called_with(window_size=3000, stride=750)
 
     def test_selection_rejects_training_records_and_empty_candidates(self):
-        processor = mock.Mock(splits={"val": ["val.npz"]}, window_size=3000, window_epochs=4)
+        processor = mock.Mock(splits={"val": ["val.npz"]}, evaluation_filenames=["val.npz"],
+                              window_size=3000, window_epochs=4)
         processor.make_validation_dataset.return_value = SimpleNamespace(window_index=[("train.npz", 0)])
         with self.assertRaisesRegex(RuntimeError, "escaped"):
             coordinator.select_fixed_windows(processor, coordinator.DEFAULT_VALIDATION)
@@ -140,7 +142,8 @@ class ValidationOptionsAndSelectionTests(unittest.TestCase):
 
     def test_default_selection_includes_all_windows_beyond_previous_sixty_four_cap(self):
         index = [("val.npz", start) for start in range(0, 80 * 3000, 750)]
-        processor = mock.Mock(splits={"val": ["val.npz"]}, window_size=3000, window_epochs=4)
+        processor = mock.Mock(splits={"val": ["val.npz"]}, evaluation_filenames=["val.npz"],
+                              window_size=3000, window_epochs=4)
         processor.make_validation_dataset.return_value = SimpleNamespace(window_index=index)
         options = coordinator.validation_options({})
         self.assertIsNone(options["max_windows"])
@@ -154,7 +157,7 @@ class ValidationOptionsAndSelectionTests(unittest.TestCase):
             with self.subTest(window_epochs=epochs):
                 length = epochs * 750
                 processor = mock.Mock(splits={"val": ["val.npz"]},
-                                      window_size=length, window_epochs=epochs)
+                                      evaluation_filenames=["val.npz"], window_size=length, window_epochs=epochs)
                 index = [("val.npz", start) for start in range(750, 750 + 3 * length, 750)]
                 processor.make_validation_dataset.return_value = SimpleNamespace(window_index=index)
                 selected, metadata = coordinator.select_fixed_windows(processor, coordinator.validation_options({}))

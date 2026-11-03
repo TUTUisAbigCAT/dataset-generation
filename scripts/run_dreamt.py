@@ -127,6 +127,12 @@ def main():
             diffusion_identity=schedule_identity,
             provenance=preprocessor.provenance(), test_npz_opened=False,
             scope="Original WatchSleepNet preprocessed IBI NPZ interface; no real-data or convergence claim")
+        if preprocessor.evaluation_protocol is not None:
+            from collections import Counter
+            counts = Counter(name for name, _ in training.window_index)
+            preflight.update(evaluation_protocol=preprocessor.evaluation_protocol,
+                training_subject_window_counts={name: counts[name] for name in identity['splits']['train']},
+                evaluation_is_held_out=False, evaluation_included_in_training=True)
         save_json(output / "preflight.json", preflight)
         print(json.dumps(dict(status="data_check_passed", training_windows=len(training),
             validation_windows=len(validation), input_shape=input_shape,
@@ -150,6 +156,8 @@ def main():
         frozen_config.update(schedule_config)
         frozen_config["data_dir"] = identity["data_directory"]
         frozen_config["generate_splits"] = identity["split_source"] == "generated_subject_split"
+        if "evaluation_protocol" in identity:
+            frozen_config["evaluation_protocol"] = identity["evaluation_protocol"]
         save_json(workspace / "dataset_config.json", frozen_config)
         env = os.environ.copy()
         env["DREAMT_CONFIG_PATH"] = str(workspace / "dataset_config.json")
