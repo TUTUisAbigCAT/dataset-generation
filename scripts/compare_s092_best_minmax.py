@@ -1,4 +1,4 @@
-"""Compare the recorded minmax best models on one S092 window, CUDA only.
+"""Compare minmax best models on a consecutive S092 segment, CUDA only.
 
 Separate workers import each run's frozen workspace. The new inference adapter
 reads only S092 and the hash-verified participant CSV; it never fits a scaler.
@@ -172,11 +172,14 @@ def frozen_imports(context):
                               checkpoint_identity=checkpoint)
 
 
-def worker_preflight(context, npz_path, metadata_path, start_second, output_dir):
+def worker_preflight(context, npz_path, metadata_path, start_second, output_dir,
+                     windows=1, require_all_stages=False):
     import numpy as np
     import pandas as pd
     if start_second < 0 or start_second % 30:
         raise ValueError("start-second must be a nonnegative multiple of 30")
+    if type(windows) is not int or windows < 1:
+        raise ValueError("windows must be a positive integer")
     modules, args, provenance = frozen_imports(context)
     identity = context["identity"]
     npz_path, metadata_path = Path(npz_path).resolve(), Path(metadata_path).resolve()
@@ -197,11 +200,13 @@ def worker_preflight(context, npz_path, metadata_path, start_second, output_dir)
         downsample_rate=identity["downsample_rate"], max_epochs=identity["max_epochs"])
     prepared = modules["night_data"].prepare_night(view, "S092")
     fs = int(identity["sample_rate_hz"])
-    start, length = start_second * fs, args.window_size
+    start, length = start_second * fs, args.window_size * windows
     if start + length > len(prepared["reference_seconds"]):
         raise ValueError("Requested S092 window exceeds the record")
     ref = prepared["reference_seconds"][start:start+length].copy()
     stages = prepared["stage_epochs_four"][start//750:(start+length)//750].copy()
+    if require_all_stages and set(stages.tolist()) != {0, 1, 2, 3}:
+        raise ValueError("Selected segment must contain W, Light, REM and Deep")
     conditions = prepared["conditions"][start:start+length].copy()
     mask = np.isfinite(ref) & (ref > 0)
     if not np.isfinite(ref).all() or (ref < 0).any() or (mask.reshape(-1, 750).sum(1) < 2).any():
@@ -214,14 +219,16 @@ def worker_preflight(context, npz_path, metadata_path, start_second, output_dir)
     with (output / "inputs.npz").open("xb") as stream:
         np.savez_compressed(stream, reference_ibi_seconds=ref, conditions=conditions,
             scoring_mask=mask, sleep_stages=stages, start_second=np.array(start_second),
-            sample_rate_hz=np.array(fs))
+            sample_rate_hz=np.array(fs), window_size=np.array(args.window_size))
     report = dict(status="checked", arm=context["arm"], epoch=context["epoch"],
         checkpoint_sha256=context["checkpoint_sha256"], best_manifest_sha256=context["best_manifest_sha256"],
         source_checks=context["source_checks"], **provenance, subject="S092", source_npz=str(npz_path),
         source_npz_sha256=S092_SHA256, metadata_sha256=sha256(metadata_path),
         subject_provenance=prepared["provenance"], scaler=identity["scaler"],
         signal_center_seconds=center, signal_scale_seconds=scale,
-        start_second=start_second, window_seconds=length/fs, window_size=length,
+        start_second=start_second, window_seconds=args.window_size/fs, window_size=args.window_size,
+        windows=windows, duration_seconds=length/fs, total_samples=length,
+        all_four_stages_present=set(stages.tolist()) == {0, 1, 2, 3},
         stages=stages.tolist(), observed_samples=int(mask.sum()), raw_zero_samples=int((ref == 0).sum()),
         inputs_sha256=sha256(output / "inputs.npz"), model_args=vars(args),
         diffusion_identity=context["manifest"]["diffusion_identity"],
@@ -237,6 +244,20 @@ def require_sampling_device(runtime):
     if device.type != "cuda":
         raise RuntimeError("CUDA is required; CPU fallback is disabled")
     return device
+
+
+def sampling_arrays(arrays, window_size):
+    """Split only at model-window boundaries; do not interpolate or overlap."""
+    import numpy as np
+    ref = np.asarray(arrays["reference_ibi_seconds"])
+    cond = np.asarray(arrays["conditions"])
+    mask = np.asarray(arrays["scoring_mask"])
+    if (ref.ndim != 1 or ref.size == 0 or ref.size % window_size
+            or cond.shape != (ref.size, 9) or mask.shape != ref.shape
+            or mask.dtype != np.bool_):
+        raise ValueError("Segment arrays must contain complete matching model windows")
+    return (ref.reshape(-1, window_size), cond.reshape(-1, window_size, 9),
+            mask.reshape(-1, window_size))
 
 
 def worker_sample(context, output_dir, seed, threads):
@@ -265,10 +286,14 @@ def worker_sample(context, output_dir, seed, threads):
     schedule = {k: v.to(device) if torch.is_tensor(v) else v for k, v in
                 modules["diffusion_schedule"].build_diffusion_config(args).items()}
     with np.load(output / "inputs.npz", allow_pickle=False) as arrays:
-        reference = torch.as_tensor(arrays["reference_ibi_seconds"][None], dtype=torch.float64, device=device)
-        mask = torch.as_tensor(arrays["scoring_mask"][None], dtype=torch.bool, device=device)
-        conditions = torch.as_tensor(arrays["conditions"][None], dtype=torch.float32, device=device)
-    inputs = torch.cat([torch.zeros((1, args.window_size, 1), device=device), conditions], dim=2)
+        ref_array, cond_array, mask_array = sampling_arrays(arrays, args.window_size)
+        reference = torch.as_tensor(ref_array, dtype=torch.float64, device=device)
+        mask = torch.as_tensor(mask_array, dtype=torch.bool, device=device)
+        conditions = torch.as_tensor(cond_array, dtype=torch.float32, device=device)
+    windows = len(reference)
+    if windows != preflight["windows"]:
+        raise ValueError("Sampling window count changed after preflight")
+    inputs = torch.cat([torch.zeros((windows, args.window_size, 1), device=device), conditions], dim=2)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -280,16 +305,23 @@ def worker_sample(context, output_dir, seed, threads):
         model, inputs, schedule, args, device)
     rng_after = hashlib.sha256(torch.cuda.get_rng_state(device).cpu().numpy().tobytes()).hexdigest()
     generated = normalized.to(torch.float64) * preflight["signal_scale_seconds"] + preflight["signal_center_seconds"]
-    metrics = modules["validation_metrics"].window_statistics(generated, reference, observed_mask=mask)
-    metrics = {k: v.item() for k, v in metrics.items()}
+    statistics = modules["validation_metrics"].window_statistics(generated, reference, observed_mask=mask)
+    metrics = {key: statistics[key].mean().item() for key in
+               ("gaussian_kl_real_to_generated", "mean_absolute_error_ms", "variance_absolute_error_ms2")}
+    per_window_metrics = [dict(window_index=i,
+        start_second=preflight["start_second"] + i * preflight["window_seconds"],
+        **{k: v[i].item() for k, v in statistics.items()}) for i in range(windows)]
     nonpositive = int((generated <= 0).sum().item())
     with (output / "waveforms.npz").open("xb") as stream:
-        np.savez_compressed(stream, generated_ibi_seconds=generated[0].detach().cpu().numpy(),
-                            generated_normalized=normalized[0].detach().cpu().numpy(), seed=np.array(seed))
+        np.savez_compressed(stream, generated_ibi_seconds=generated.flatten().detach().cpu().numpy(),
+                            generated_normalized=normalized.flatten().detach().cpu().numpy(), seed=np.array(seed),
+                            window_size=np.array(args.window_size))
     report = dict(status="completed", epoch=context["epoch"], checkpoint_kind="best_kl",
         checkpoint_sha256=context["checkpoint_sha256"], best_manifest_sha256=context["best_manifest_sha256"],
-        checkpoint_load=loaded, seed=seed, batch_size=1, sampling=sampling, metrics=metrics,
-        generated_nonpositive_samples=nonpositive, generated_nonpositive_fraction=nonpositive/args.window_size,
+        checkpoint_load=loaded, seed=seed, batch_size=windows, windows=windows,
+        sampling=sampling, metrics=metrics, metric_aggregation="equal-weight mean over model windows",
+        per_window_metrics=per_window_metrics,
+        generated_nonpositive_samples=nonpositive, generated_nonpositive_fraction=nonpositive/generated.numel(),
         cuda_environment=modules["cuda_runtime"].cuda_environment(device),
         cuda_rng_before=rng_before, cuda_rng_after=rng_after, elapsed_seconds=time.perf_counter()-started,
         waveform_sha256=sha256(output / "waveforms.npz"), scaler=preflight["scaler"],
@@ -317,7 +349,10 @@ def matching_inputs(output):
 def launch_worker(cli, context, phase, destination):
     command = [sys.executable, "-B", "-u", str(Path(__file__).resolve()), "--worker", phase,
         "--arm", context["arm"], "--run-root", context["root"], "--output-dir", str(destination),
-        "--start-second", str(cli.start_second), "--seed", str(cli.seed), "--threads", str(cli.threads)]
+        "--start-second", str(cli.start_second), "--windows", str(cli.windows),
+        "--seed", str(cli.seed), "--threads", str(cli.threads)]
+    if cli.require_all_stages:
+        command.append("--require-all-stages")
     if phase == "preflight":
         identity = context["identity"]
         command += ["--npz", str(cli.npz or Path(identity["data_directory"]) / "S092.npz"),
@@ -337,6 +372,9 @@ def main(argv=None):
     parser.add_argument("--metadata", type=Path, help="Defaults to frozen participant_info.csv")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--start-second", type=int, default=840)
+    parser.add_argument("--windows", type=int, default=1,
+                        help="Consecutive nonoverlapping model windows, generated independently")
+    parser.add_argument("--require-all-stages", action="store_true")
     parser.add_argument("--seed", type=int, default=20261103)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--check-only", action="store_true")
@@ -344,12 +382,13 @@ def main(argv=None):
     parser.add_argument("--arm", choices=ARMS, help=argparse.SUPPRESS)
     parser.add_argument("--run-root", type=Path, help=argparse.SUPPRESS)
     cli = parser.parse_args(argv)
-    if cli.threads < 1 or cli.start_second < 0 or cli.start_second % 30 or not 0 <= cli.seed < 2**32:
+    if cli.threads < 1 or cli.windows < 1 or cli.start_second < 0 or cli.start_second % 30 or not 0 <= cli.seed < 2**32:
         parser.error("Require positive threads, unsigned seed and nonnegative 30s-aligned start")
     if cli.worker:
         context = load_arm(cli.run_root, cli.arm)
         if cli.worker == "preflight":
-            worker_preflight(context, cli.npz, cli.metadata, cli.start_second, cli.output_dir)
+            worker_preflight(context, cli.npz, cli.metadata, cli.start_second, cli.output_dir,
+                             cli.windows, cli.require_all_stages)
         else:
             worker_sample(context, cli.output_dir, cli.seed, cli.threads)
         return
@@ -362,7 +401,8 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=False)
     status = dict(status="checking", output_directory=str(output), arms={}, sampling_performed=False,
         training_executed=False, independent_windows=True, real_ibi_used_as_input=False,
-        overlap_samples=0, seed=cli.seed, start_second=cli.start_second,
+        overlap_samples=0, seed=cli.seed, start_second=cli.start_second, windows=cli.windows,
+        require_all_stages=cli.require_all_stages,
         script_sha256=sha256(__file__), check_only=cli.check_only)
     try:
         save_json(output / "summary.json", status)

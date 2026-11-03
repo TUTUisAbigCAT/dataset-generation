@@ -200,7 +200,8 @@ class CompareBestMinmaxTests(unittest.TestCase):
             with self.subTest(mutation=mutate), self.assertRaises(ValueError):
                 driver.compare_arms(bad)
 
-    def run_preflight(self, arm, *, start=0, expected_sha=None, output=None):
+    def run_preflight(self, arm, *, start=0, expected_sha=None, output=None,
+                      windows=1, require_all_stages=False):
         output = output or self.base / ("preflight_" + arm)
         output.mkdir()
         # The production driver deliberately pins the audited real S092 hash.
@@ -209,12 +210,13 @@ class CompareBestMinmaxTests(unittest.TestCase):
 from scripts import compare_s092_best_minmax as d
 d.S092_SHA256=sys.argv[1]
 c=d.load_arm(pathlib.Path(sys.argv[2]),sys.argv[3])
-d.worker_preflight(c,pathlib.Path(sys.argv[4]),pathlib.Path(sys.argv[5]),int(sys.argv[6]),pathlib.Path(sys.argv[7]))
+d.worker_preflight(c,pathlib.Path(sys.argv[4]),pathlib.Path(sys.argv[5]),int(sys.argv[6]),pathlib.Path(sys.argv[7]),int(sys.argv[8]),bool(int(sys.argv[9])))
 """
         environment = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", OMP_NUM_THREADS="2", MKL_NUM_THREADS="2")
         result = subprocess.run([sys.executable, "-B", "-c", code,
             expected_sha or driver.sha256(self.data / "S092.npz"), str(self.roots[arm]), arm,
-            str(self.data / "S092.npz"), str(self.metadata), str(start), str(output)],
+            str(self.data / "S092.npz"), str(self.metadata), str(start), str(output),
+            str(windows), str(int(require_all_stages))],
             cwd=ROOT, env=environment, capture_output=True, text=True)
         return result, output
 
@@ -241,6 +243,44 @@ d.worker_preflight(c,pathlib.Path(sys.argv[4]),pathlib.Path(sys.argv[5]),int(sys
                 self.assertEqual(values["conditions"].shape, (3000, 9))
         self.assertTrue(all(driver.matching_inputs(outputs).values()))
         self.assertTrue(all(driver.sha256(path) == digest for path, digest in before.items()))
+
+    def test_three_windows_keep_model_length_and_require_all_stages(self):
+        path = self.data / "S092.npz"
+        with np.load(path, allow_pickle=False) as source:
+            arrays = {k: source[k].copy() for k in source.files}
+        arrays['data'] = np.tile(arrays['data'], (3, 1))
+        arrays['stages'] = np.tile(arrays['stages'], 3)
+        np.savez(path, **arrays)
+        result, output = self.run_preflight("minmax", windows=3, require_all_stages=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = driver.read_json(output / 'preflight.json')
+        self.assertEqual(report['window_size'], 3000)
+        self.assertEqual(report['model_args']['window_size'], 3000)
+        self.assertEqual(report['total_samples'], 9000)
+        self.assertEqual(report['duration_seconds'], 360)
+        self.assertEqual(report['windows'], 3)
+        self.assertTrue(report['all_four_stages_present'])
+        with np.load(output / 'inputs.npz', allow_pickle=False) as inputs:
+            ref, cond, mask = driver.sampling_arrays(inputs, 3000)
+            np.testing.assert_array_equal(ref.reshape(-1), inputs['reference_ibi_seconds'])
+            np.testing.assert_array_equal(cond.reshape(-1, 9), inputs['conditions'])
+            np.testing.assert_array_equal(mask.reshape(-1), inputs['scoring_mask'])
+            self.assertEqual(ref.shape, (3, 3000))
+        arrays['stages'][arrays['stages'] == 3] = 1
+        np.savez(path, **arrays)
+        failed, _ = self.run_preflight("minmax", windows=3, require_all_stages=True,
+                                      output=self.base / 'missing_deep')
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn('must contain W, Light, REM and Deep', failed.stderr)
+
+    def test_partial_or_mismatched_sampling_arrays_rejected(self):
+        valid = dict(reference_ibi_seconds=np.zeros(9000), conditions=np.zeros((9000, 9)),
+                     scoring_mask=np.ones(9000, dtype=bool))
+        for key, wrong in [('reference_ibi_seconds', np.zeros(8999)),
+                           ('conditions', np.zeros((9000, 10))),
+                           ('scoring_mask', np.ones(9000))]:
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'complete matching model windows'):
+                driver.sampling_arrays(dict(valid, **{key: wrong}), 3000)
 
     def test_worker_rejects_changed_npz_metadata_and_invalid_window(self):
         result, _ = self.run_preflight("minmax", expected_sha="0" * 64, output=self.base / "bad_npz")

@@ -1,7 +1,8 @@
 """Plot completed S092 best-checkpoint comparisons; never run a model.
 
-The full 120-second plot and a deterministic 30-second detail preserve every
-generated value. Stored reference zeros are displayed as missing markers.
+The full segment and deterministic 30-second details preserve every generated
+value. Stored reference zeros are displayed as missing markers. Independently
+generated model windows are separated explicitly, never visually stitched.
 """
 from __future__ import annotations
 
@@ -56,20 +57,27 @@ def load_result(result_dir):
     start = _scalar(reference, 'start_second')
     if fs != 25 or start < 0:
         raise ValueError('Expected a nonnegative NPZ start time and 25 Hz sampling')
-    if real.shape != (3000,) or real.dtype.kind != 'f' or not np.isfinite(real).all() or np.any(real < 0):
-        raise ValueError('Reference must be finite, nonnegative floating seconds with shape [3000]')
+    window_value = _scalar(reference, 'window_size') if 'window_size' in reference else 3000
+    if window_value != int(window_value):
+        raise ValueError('Model window_size must be an integer')
+    window_size = int(window_value)
+    if window_size < 750 or window_size % 750:
+        raise ValueError('Model window_size must contain complete 750-sample epochs')
+    if (real.ndim != 1 or real.size < window_size or real.size % window_size
+            or real.dtype.kind != 'f' or not np.isfinite(real).all() or np.any(real < 0)):
+        raise ValueError('Reference must contain finite nonnegative complete model windows')
     if mask.dtype != np.bool_ or mask.shape != real.shape or not np.array_equal(mask, real > 0):
         raise ValueError('scoring_mask must identify exactly the original positive reference positions')
-    if stages.shape != (4,) or stages.dtype.kind not in 'iu' or np.any((stages < 0) | (stages > 3)):
-        raise ValueError('sleep_stages must contain four integer labels: W=0, Light=1, REM=2, Deep=3')
-    if (mask.reshape(4, 750).sum(axis=1) < 2).any():
+    if stages.shape != (real.size // 750,) or stages.dtype.kind not in 'iu' or np.any((stages < 0) | (stages > 3)):
+        raise ValueError('sleep_stages must have one label per 750 samples: W=0, Light=1, REM=2, Deep=3')
+    if (mask.reshape(-1, 750).sum(axis=1) < 2).any():
         raise ValueError('Each reference epoch must have at least two positive observations')
     generated, summaries = {}, {}
     for arm in ARMS:
         waveform = _npz(root/arm/'waveforms.npz')
         values = waveform['generated_ibi_seconds']
         if values.shape != real.shape or values.dtype.kind != 'f' or not np.isfinite(values).all():
-            raise ValueError(f'{arm} must contain finite floating generated seconds with shape [3000]')
+            raise ValueError(f'{arm} must contain finite floating seconds matching the reference')
         # Negative generated values are valid diagnostic evidence and remain visible.
         generated[arm] = values.astype(np.float64, copy=False)
         summary = json.loads((root/arm/'summary.json').read_text(encoding='utf-8-sig'))
@@ -96,7 +104,8 @@ def load_result(result_dir):
         raise RuntimeError('Input artifacts changed while being read')
     return dict(root=root, reference=real.astype(np.float64, copy=False), mask=mask,
                 stages=stages, fs=fs, start=start, generated=generated,
-                summaries=summaries, source_sha256=source_hashes)
+                summaries=summaries, source_sha256=source_hashes, window_size=window_size,
+                windows=real.size // window_size, duration_seconds=real.size / fs)
 
 
 def _zoom_bounds(stages):
@@ -104,12 +113,12 @@ def _zoom_bounds(stages):
     transitions = np.flatnonzero(stages[1:] != stages[:-1]) + 1
     if len(transitions):
         center = float(transitions[0] * 30)
-        start = max(0., min(90., center - 15.))
+        start = max(0., min(len(stages)*30. - 30., center - 15.))
         return start, start + 30., '30 seconds centered on the first input-stage transition'
     return 0., 30., 'first 30 seconds; no input-stage transition in the window'
 
 
-def _draw(data, interval, *, detail, synthetic_fixture):
+def _draw(data, interval, *, detail, synthetic_fixture, stage_name=None):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -117,7 +126,7 @@ def _draw(data, interval, *, detail, synthetic_fixture):
 
     begin, end = interval
     fs, start = data['fs'], data['start']
-    relative = np.arange(3000, dtype=np.float64) / fs
+    relative = np.arange(len(data['reference']), dtype=np.float64) / fs
     selected = (relative >= begin) & (relative < end)
     time = start + relative[selected]
     mask = data['mask'][selected]
@@ -125,11 +134,11 @@ def _draw(data, interval, *, detail, synthetic_fixture):
     observed = np.where(mask, reference_ms, np.nan)
     fig, (axis, stage_axis) = plt.subplots(2, 1, figsize=(14.2, 7.3), sharex=True,
         gridspec_kw=dict(height_ratios=[4.2, 1.15], hspace=.12))
-    fig.subplots_adjust(left=.075, right=.985, bottom=.17, top=.80)
+    fig.subplots_adjust(left=.075, right=.965, bottom=.17, top=.80)
     prefix = 'SYNTHETIC FIXTURE — ' if synthetic_fixture else ''
     title = 'S092 | Best-model IBI comparison'
     if detail:
-        title += ' | 30 s detail'
+        title += ' | ' + (stage_name + ' | ' if stage_name else '') + '30 s detail'
     fig.suptitle(prefix + title, x=.075, ha='left', y=.97, fontsize=17, fontweight='bold')
     summaries = data['summaries']
     subtitle = (f"NPZ time {start+begin:.0f}–{start+end:.0f} s  |  same sampling seed {summaries['minmax']['seed']}  |  "
@@ -139,11 +148,15 @@ def _draw(data, interval, *, detail, synthetic_fixture):
               label='Real IBI (positive observations)', zorder=3)
     for arm, color, label in (('minmax', '#1672B8', 'Generated: minmax [-1, 1]'),
                               ('minmax01', '#D8691A', 'Generated: minmax [0, 1]')):
-        axis.plot(time, data['generated'][arm][selected] * 1000., color=color,
-                  linewidth=1.05, alpha=.88, label=label, zorder=2)
+        blocks = (np.flatnonzero(selected) // data['window_size'])
+        for number, block in enumerate(np.unique(blocks)):
+            local = blocks == block
+            axis.plot(time[local], data['generated'][arm][selected][local] * 1000., color=color,
+                      linewidth=1.05, alpha=.88, label=label if number == 0 else None, zorder=2)
     axis.scatter(time[~mask], np.zeros(int((~mask).sum())), s=15, marker='x',
                  color='#777777', linewidths=.9, label='Stored zero: missing marker', zorder=5)
-    axis.axhline(0, color='#999999', linewidth=.7, linestyle=':', zorder=1)
+    if not mask.all() or any(np.any(values[selected] <= 0) for values in data['generated'].values()):
+        axis.axhline(0, color='#999999', linewidth=.7, linestyle=':', zorder=1)
     axis.set_ylabel('IBI (ms)', fontsize=11)
     axis.grid(axis='both', color='#DEDEDE', linewidth=.55, alpha=.7)
     axis.margins(y=.10)
@@ -151,7 +164,7 @@ def _draw(data, interval, *, detail, synthetic_fixture):
                 fontsize=10, frameon=False, borderaxespad=0., columnspacing=2.5)
     # Clinical display order differs from the encoded class IDs; labels are explicit.
     display_y = np.array([3, 1, 2, 0])[data['stages']]
-    boundaries = start + np.arange(5, dtype=np.float64) * 30.
+    boundaries = start + np.arange(len(data['stages'])+1, dtype=np.float64) * 30.
     stage_axis.step(boundaries, np.r_[display_y, display_y[-1]], where='post',
                     linewidth=2.0, color='#5B4A8A')
     shades = ('#F2F5F9', '#E9F2FA', '#F1EAF7', '#E3EBF5')
@@ -159,19 +172,23 @@ def _draw(data, interval, *, detail, synthetic_fixture):
         stage_axis.axvspan(boundaries[index], boundaries[index+1], color=shades[int(stage)], zorder=0)
         if begin < index*30 < end:
             axis.axvline(boundaries[index], color='#BBBBBB', linewidth=.7, linestyle='--', zorder=0)
+    for boundary in np.arange(1, data['windows']) * data['window_size'] / fs:
+        if begin < boundary < end:
+            for ax in (axis, stage_axis):
+                ax.axvline(start+boundary, color='#8946A8', linewidth=1.4, linestyle=':', zorder=4)
     stage_axis.set_yticks([0, 1, 2, 3], ['Deep', 'Light', 'REM', 'W'])
     stage_axis.set_ylim(-.35, 3.35)
     stage_axis.set_ylabel('Input stage', fontsize=11)
     stage_axis.set_xlabel('Time from start of the stored NPZ record (mm:ss)', fontsize=11)
     stage_axis.set_xlim(start+begin, start+end)
-    stage_axis.xaxis.set_major_locator(MultipleLocator(5 if detail else 15))
+    stage_axis.xaxis.set_major_locator(MultipleLocator(5 if detail else (30 if end-begin > 120 else 15)))
     stage_axis.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f'{int(round(value))//60:02d}:{int(round(value))%60:02d}'))
     stage_axis.grid(axis='x', color='#CCCCCC', linewidth=.55, alpha=.65)
     for ax in (axis, stage_axis):
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.tick_params(labelsize=10)
-    fig.text(.075, .078, 'Independent conditional generation; pointwise reconstruction is not expected. '
+    fig.text(.075, .078, f"{data['windows']} independent {data['window_size']/fs:g} s window(s); purple lines mark window boundaries. "
              'Sleep stages are input conditions, not predictions.', fontsize=10, color='#333333')
     fig.text(.075, .044, 'All samples retained; no clipping or smoothing. Reference zeros mark missing observations; '
              'generated negative values remain visible.', fontsize=10, color='#555555')
@@ -193,10 +210,18 @@ def main(argv=None):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     products = []
-    for stem, interval, detail in (
-            ('S092_best_minmax_comparison', (0., 120.), False),
-            ('S092_best_minmax_zoom30s', (zoom_start, zoom_end), True)):
-        fig = _draw(data, interval, detail=detail, synthetic_fixture=cli.synthetic_fixture)
+    views = [('S092_best_minmax_comparison', (0., data['duration_seconds']), False, None),
+             ('S092_best_minmax_zoom30s', (zoom_start, zoom_end), True, None)]
+    stage_details = {}
+    for stage, name in enumerate(STAGES):
+        matches = np.flatnonzero(data['stages'] == stage)
+        if len(matches):
+            begin = float(matches[0] * 30)
+            views.append((f'S092_best_minmax_stage_{name.lower()}', (begin, begin+30), True, name))
+            stage_details[name] = dict(relative_start_seconds=begin, relative_end_seconds=begin+30,
+                                      selection_rule='first original epoch of this stage in the selected segment')
+    for stem, interval, detail, stage_name in views:
+        fig = _draw(data, interval, detail=detail, synthetic_fixture=cli.synthetic_fixture, stage_name=stage_name)
         try:
             for extension in ('png', 'pdf'):
                 path = plot_dir/(stem+'.'+extension)
@@ -207,10 +232,12 @@ def main(argv=None):
             plt.close(fig)
     manifest = dict(status='completed', synthetic_fixture=cli.synthetic_fixture,
         model_executed_by_plotter=False, source_sha256=data['source_sha256'],
-        source_window=dict(start_second=data['start'], duration_seconds=120., sample_rate_hz=data['fs'],
-                           samples=3000, sleep_stages=data['stages'].tolist(), stage_names=list(STAGES)),
+        source_window=dict(start_second=data['start'], duration_seconds=data['duration_seconds'], sample_rate_hz=data['fs'],
+                           samples=len(data['reference']), model_window_size=data['window_size'], windows=data['windows'],
+                           sleep_stages=data['stages'].tolist(), stage_names=list(STAGES)),
         checkpoints={arm:{key:data['summaries'][arm][key] for key in ('epoch','checkpoint_sha256','seed')} for arm in ARMS},
         zoom=dict(relative_start_seconds=zoom_start, relative_end_seconds=zoom_end, selection_rule=zoom_rule),
+        stage_details=stage_details,
         reference_missing_samples=int((~data['mask']).sum()),
         generated_nonpositive_samples={arm:int((value<=0).sum()) for arm,value in data['generated'].items()},
         plotting=dict(clipped=False, smoothed=False, decimated=False, reference_zeros_shown_as_missing_markers=True,
