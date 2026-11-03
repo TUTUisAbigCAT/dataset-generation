@@ -27,7 +27,7 @@ from window_config import EPOCH_SAMPLES, FS
 
 def source_hashes():
     names = ["training_wavestitch.py", "data_utils.py", "training_utils.py",
-             "watchsleep_loader.py", "window_config.py", "diffusion_schedule.py",
+             "watchsleep_loader.py", "window_config.py", "diffusion_schedule.py", "signal_normalization.py",
              "cuda_runtime.py", "dataset_config.json", "epoch_validation.py",
              "validation_metrics.py", "validation_sampling.py", "night_checkpoint.py",
              "night_data.py", "night_sampling.py", "diagnostic_identity.py",

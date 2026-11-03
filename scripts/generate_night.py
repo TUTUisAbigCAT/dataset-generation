@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.evaluate_denoising import save_json, sha256
 from window_config import EPOCH_SAMPLES, FS
+from signal_normalization import signal_affine_parameters
 from night_checkpoint import load_inference_config, load_checkpoint_state
 
 
@@ -67,8 +68,8 @@ def _sample(model_args, checkpoint, conditions, scaler, device, *,
     elapsed = time.perf_counter() - started
     if standardized.device != device or standardized.shape != (len(conditions),):
         raise RuntimeError("Night sampler returned an unexpected shape or device")
-    generated_seconds = (standardized.detach().to(torch.float64) * scaler["signal_std_seconds"]
-                         + scaler["signal_mean_seconds"])
+    signal_center, signal_scale = signal_affine_parameters(scaler)
+    generated_seconds = standardized.detach().to(torch.float64) * signal_scale + signal_center
     execution = dict(**cuda_environment(device), python=sys.version, executable=sys.executable,
         initialization_seed=42, initialization_threads=threads,
         sampling_seed=seed, sampling_threads=threads, sampling_seconds=elapsed,
@@ -175,7 +176,7 @@ def main(argv=None):
             window_samples=args.window_size, stride_samples=stride,
             windows_per_group=cli.windows_per_group, groups=len(plan), generation_plan=plan,
             source_sha256={name: sha256(ROOT / name) for name in (
-                "scripts/generate_night.py", "night_checkpoint.py", "night_data.py", "night_sampling.py", "data_utils.py",
+                "scripts/generate_night.py", "night_checkpoint.py", "night_data.py", "night_sampling.py", "data_utils.py", "signal_normalization.py",
                 "watchsleep_loader.py", "window_config.py", "diffusion_schedule.py", "TSImputers/S4Model.py",
                 "scripts/evaluate_denoising.py", "scripts/evaluate_original_sampler.py")})
         if cli.check_only:

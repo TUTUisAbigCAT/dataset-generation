@@ -15,6 +15,7 @@ import torch
 from torch.utils.data import Dataset
 from watchsleep_loader import SSDataset
 from window_config import FS, EPOCH_SAMPLES, window_settings
+from signal_normalization import normalization_spec, signal_affine_parameters, validate_signal_bounds
 
 ROOT = Path(__file__).resolve().parent
 datasets = {"DREAMT_SIM": None, "DREAMT": None}
@@ -23,6 +24,7 @@ CONTINUOUS = ("AHI", "BMI", "AGE")
 COLUMNS = ("IBI",) + tuple("stage_" + name for name in STAGE_NAMES) + CONTINUOUS + ("gender_F", "gender_M")
 ZERO_VALUE_POLICY = "preserve stored zero missing-value markers in scaler and unmodified MSE; no imputation"
 MASKED_ZERO_VALUE_POLICY = "raw IBI > 0 is observed; training signal scaler uses observed points only; missing signal inputs are standardized zero; observed mask is separate from the ten model channels"
+ZERO_FILL_ONE_VALUE_POLICY = "replace raw IBI == 0 with 1.0 second before training-only signal scaling and window standardization; ordinary MSE includes all filled points; original records and observed masks remain unchanged"
 
 
 class CyclicEncoder:
@@ -126,10 +128,12 @@ class Preprocessor:
 
         self.dataset = dataset
         policy = config.get("missing_value_policy", "preserve") if missing_value_policy is None else missing_value_policy
-        if not isinstance(policy, str) or policy not in ("preserve", "masked"):
-            raise ValueError("missing_value_policy must be 'preserve' or 'masked'")
+        if not isinstance(policy, str) or policy not in ("preserve", "masked", "zero_fill_one"):
+            raise ValueError("missing_value_policy must be 'preserve', 'masked', or 'zero_fill_one'")
         self.missing_value_policy = policy
-        self.zero_value_policy = MASKED_ZERO_VALUE_POLICY if policy == "masked" else ZERO_VALUE_POLICY
+        self.zero_value_policy = {"preserve": ZERO_VALUE_POLICY, "masked": MASKED_ZERO_VALUE_POLICY,
+                                 "zero_fill_one": ZERO_FILL_ONE_VALUE_POLICY}[policy]
+        self.signal_normalization = normalization_spec(config)
         dimensions = window_settings(config if window_epochs is None else {"window_epochs": window_epochs})
         self.window_epochs = dimensions["window_epochs"]
         self.window_size = dimensions["window_size"]
@@ -237,6 +241,9 @@ class Preprocessor:
             # missing-value policy changes only the signal fit and supervision.
             values.append(record["continuous"])
             self.scaler_subjects.append(record["subject_id"])
+            if self.missing_value_policy == "zero_fill_one":
+                signal[signal == 0] = 1.0
+            validate_signal_bounds(signal, self.signal_normalization, context=f"Training {filename}")
             if self.missing_value_policy == "masked":
                 signal = signal[signal > 0]
                 if not signal.size:
@@ -269,6 +276,13 @@ class Preprocessor:
             signal_fit_policy="structurally valid training epochs, including stored zero missing-value markers; no interpolation or clipping")
         if self.missing_value_policy == "masked":
             self.scaler["signal_fit_policy"] = "positive observed IBI points in structurally valid training epochs only; no interpolation or clipping"
+        elif self.missing_value_policy == "zero_fill_one":
+            self.scaler["signal_fit_policy"] = "all points in structurally valid training epochs after raw IBI == 0 is replaced by 1.0 second; each source point once; no interpolation or clipping of positive values"
+        if self.signal_normalization is not None:
+            scale = (self.signal_normalization["max_seconds"] - self.signal_normalization["min_seconds"]) / 2.
+            self.scaler.update(signal_normalization=dict(self.signal_normalization),
+                signal_center_seconds=self.signal_normalization["min_seconds"] + scale,
+                signal_scale_seconds=scale)
         self._meta_mean, self._meta_std = meta_mean, meta_std
 
     def record(self, filename):
@@ -315,8 +329,8 @@ class Preprocessor:
     def window_observed_mask(self, filename, start, length):
         """Return original-scale IBI > 0, never inferred from standardized zeros.
 
-        Preserve mode exposes the same observed mask for optional masked
-        evaluation, while retaining its original tensor-only training output.
+        Preserve and zero_fill_one expose the same original observed mask for
+        optional masked evaluation, while retaining tensor-only training output.
         The returned array is independent of the stored record.
         """
         record = self._window_record(filename, start, length)
@@ -326,7 +340,12 @@ class Preprocessor:
         record = self._window_record(filename, start, length)
         end = start + length
         array = np.empty((length, len(COLUMNS)), dtype=np.float32)
-        array[:, 0] = (record["ibi"][start:end].astype(np.float64) - self.scaler["signal_mean_seconds"]) / self.scaler["signal_std_seconds"]
+        signal = record["ibi"][start:end].astype(np.float64)
+        if self.missing_value_policy == "zero_fill_one":
+            signal[signal == 0] = 1.0
+        validate_signal_bounds(signal, self.signal_normalization, context=f"Window {filename}:{start}")
+        center, scale = signal_affine_parameters(self.scaler)
+        array[:, 0] = (signal - center) / scale
         if self.missing_value_policy == "masked":
             array[record["ibi"][start:end] == 0, 0] = 0.
         array[:, 1:5] = np.eye(4, dtype=np.float32)[record["stages"][start:end]]
@@ -380,7 +399,8 @@ class Preprocessor:
         return selected
 
     def inverse_signal(self, standardized):
-        return np.asarray(standardized) * self.scaler["signal_std_seconds"] + self.scaler["signal_mean_seconds"]
+        center, scale = signal_affine_parameters(self.scaler)
+        return np.asarray(standardized) * scale + center
 
     def data_identity(self):
         """Frozen training inputs; opening validation records cannot change it."""
@@ -399,10 +419,12 @@ class Preprocessor:
             scaler=self.scaler, scaler_subjects=self.scaler_subjects,
             train_npz_sha256=train_hashes, training_npz_sha256=train_hashes)
         # Historical preserve identities remain byte-for-byte structurally
-        # compatible; the new mode is explicit and cannot be silently restored
+        # compatible; other modes are explicit and cannot be silently restored
         # using preserve scaling or the current machine's configuration.
-        if self.missing_value_policy == "masked":
+        if self.missing_value_policy != "preserve":
             identity["missing_value_policy"] = self.missing_value_policy
+        if self.signal_normalization is not None:
+            identity["signal_normalization"] = dict(self.signal_normalization)
         return _json_copy(identity)
 
     @classmethod
@@ -433,7 +455,9 @@ class Preprocessor:
             metadata_path=identity["metadata_path"], split_path=identity["split_path"],
             multiplier=identity["multiplier"], downsample_rate=identity["downsample_rate"],
             max_epochs=identity["max_epochs"], split_seed=identity["split_seed"],
-            generate_splits=generated, config_override={}, window_epochs=identity.get("window_epochs", 4),
+            generate_splits=generated,
+            config_override={"signal_normalization": identity.get("signal_normalization", {"method": "zscore"})},
+            window_epochs=identity.get("window_epochs", 4),
             missing_value_policy=identity.get("missing_value_policy", "preserve"))
         actual = processor.data_identity()
         expected = dict(identity)
@@ -446,7 +470,7 @@ class Preprocessor:
     def provenance(self):
         flags = [self._records[name].get("synthetic") for name in self.splits["train"]]
         synthetic = True if all(flag is True for flag in flags) else (False if all(flag is False for flag in flags) else None)
-        return dict(dataset=self.dataset, data_directory=str(self.data_dir.resolve()),
+        provenance = dict(dataset=self.dataset, data_directory=str(self.data_dir.resolve()),
             data_synthetic=synthetic,
             columns=list(COLUMNS), non_hierarchical_columns=["IBI"],
             hierarchical_columns=self.hierarchical_features_cyclic,
@@ -474,3 +498,6 @@ class Preprocessor:
             test_npz_opened=False, global_rng_used=False,
             loader_source_sha256=file_sha256(ROOT / "watchsleep_loader.py"),
             upstream_loader_sha256=file_sha256(ROOT / "third_party/WatchSleepNet/data_setup.py"))
+        if self.signal_normalization is not None:
+            provenance["signal_normalization"] = dict(self.signal_normalization)
+        return provenance

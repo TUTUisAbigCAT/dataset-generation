@@ -17,6 +17,7 @@ import torch
 from cuda_runtime import assert_cuda_model, require_cuda
 from validation_metrics import DistributionAccumulator, preserve_random_state
 from validation_sampling import sample_validation_windows
+from signal_normalization import signal_affine_parameters
 from window_config import EPOCH_SAMPLES, window_settings
 
 DEFAULT_VALIDATION = {"max_windows": None, "batch_size": 8, "seed": 20261020,
@@ -149,7 +150,7 @@ def validation_options(config):
 
 
 def _uses_reference_mask(preprocessor, options):
-    return (getattr(preprocessor, "missing_value_policy", "preserve") == "masked"
+    return (getattr(preprocessor, "missing_value_policy", "preserve") in ("masked", "zero_fill_one")
             or options.get("reference_mask_policy", "training") == "observed_only")
 
 
@@ -252,8 +253,8 @@ class EpochValidator:
         self.window_size = self.window["window_size"]
         self.window_epochs = self.window["window_epochs"]
         self.missing_value_policy = getattr(preprocessor, "missing_value_policy", "preserve")
-        if self.missing_value_policy not in ("preserve", "masked"):
-            raise ValueError("Validation missing_value_policy must be preserve or masked")
+        if self.missing_value_policy not in ("preserve", "masked", "zero_fill_one"):
+            raise ValueError("Validation missing_value_policy must be preserve, masked or zero_fill_one")
         self.reference_mask = None
         self.reference_mask_policy = self.options.get("reference_mask_policy", "training")
         use_reference_mask = _uses_reference_mask(preprocessor, self.options)
@@ -292,8 +293,7 @@ class EpochValidator:
                         raise ValueError("Every masked validation window needs at least two observed samples")
                     masks.append(torch.from_numpy(observed.copy()))
                 self.reference_mask = torch.stack(masks)
-            self.scale = float(preprocessor.scaler["signal_std_seconds"])
-            self.center = float(preprocessor.scaler["signal_mean_seconds"])
+            self.center, self.scale = signal_affine_parameters(preprocessor.scaler)
             if not math.isfinite(self.scale) or self.scale <= 0 or not math.isfinite(self.center):
                 raise ValueError("Invalid training-only IBI scaler")
             self.windows_metadata = [

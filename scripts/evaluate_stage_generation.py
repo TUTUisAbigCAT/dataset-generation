@@ -26,6 +26,7 @@ import torch
 
 from cuda_runtime import require_cuda, assert_cuda_model, cuda_environment
 from data_utils import Preprocessor
+from signal_normalization import signal_affine_parameters
 from diffusion_schedule import build_diffusion_config
 from night_data import prepare_night, _resolve_subject
 from scripts.evaluate_denoising import bind_training_data
@@ -116,6 +117,7 @@ def sample_arm(context, data, device, *, seeds, batch_size, output_dir, progress
     # Build the input without copying reference IBI, including at missing points.
     inputs = torch.cat((torch.zeros((*conditions.shape[:2], 1), device=device), conditions), dim=2)
     scaler = context["identity"]["scaler"]
+    signal_center, signal_scale = signal_affine_parameters(scaler)
     reports, paths = [], []
     with preserve_random_state(device):
         np.random.seed(42)
@@ -140,8 +142,7 @@ def sample_arm(context, data, device, *, seeds, batch_size, output_dir, progress
             for start in range(0, len(inputs), batch_size):
                 standardized, info = sample_validation_windows(
                     model, inputs[start:start+batch_size], schedule, args, device)
-                generated_batches.append(standardized.to(torch.float64) * scaler["signal_std_seconds"]
-                                         + scaler["signal_mean_seconds"])
+                generated_batches.append(standardized.to(torch.float64) * signal_scale + signal_center)
                 sampling.append(info)
             generated = torch.cat(generated_batches, dim=0)
             report = score_stage_draw(generated, reference, labels,
@@ -243,7 +244,7 @@ def main(argv=None):
                 runtime_source_checks=contexts[arm]["source_checks"]) for arm in ARMS},
             analysis_source_sha256={name:sha256(ROOT/name) for name in
                 ("scripts/evaluate_stage_generation.py", "stage_evaluation.py", "night_data.py",
-                 "validation_metrics.py", "scripts/plot_stage_evaluation.py")},
+                 "validation_metrics.py", "signal_normalization.py", "scripts/plot_stage_evaluation.py")},
             limitations=["One held-out subject; sampling standard deviations are not confidence intervals.",
                 "Thirty-second Gaussian moment KL is not numerically interchangeable with 120-second training-validation KL.",
                 "Moment agreement does not establish temporal, physiological or clinical realism.",

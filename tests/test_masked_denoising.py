@@ -109,6 +109,7 @@ class MaskedDenoisingTests(unittest.TestCase):
         context.update(batch=torch.tensor([[[1.], [2.], [1000.]], [[3.], [1000.], [1000.]]]),
             estimate=torch.tensor([[[2., 3., -1000.]], [[4., -1000., -1000.]]]),
             preprocessor=SimpleNamespace(scaler={"signal_std_seconds": .1, "signal_mean_seconds": .7}),
+            signal_center=.7, signal_scale=.1,
             rows=[], identities=[{"subject_id":"one"}, {"subject_id":"two"}], offset=0,
             timesteps=torch.tensor([0, 1]), alpha_bars=torch.tensor([.9, .8]),
             state_name="trained", scenario="test", _teacher_forced_window_metrics=audit._teacher_forced_window_metrics)

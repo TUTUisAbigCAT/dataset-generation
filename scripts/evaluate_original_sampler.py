@@ -27,6 +27,7 @@ SOURCE = UPSTREAM / 'synthesis_wavestitch_pipeline_strided_preconditioning.py'
 sys.path.insert(0, str(ROOT))
 
 from window_config import EPOCH_SAMPLES, FS
+from signal_normalization import signal_affine_parameters
 from diffusion_schedule import build_diffusion_config, diffusion_identity
 from scripts.verify_upstream_boundary import CORE_FILES, expected_core_source
 
@@ -199,13 +200,19 @@ def select_sampling_window(preprocessor, subject=None, start_sample=None, window
     if filename not in preprocessor.splits['train'] + preprocessor.splits['val']:
         raise ValueError('Selected subject must belong to the recorded train or validation split')
     length = window_size + stride * (windows - 1)
+    def validate_span(start):
+        preprocessor.window_array(filename, start, length)
+        if getattr(preprocessor, 'missing_value_policy', 'preserve') in ('masked', 'zero_fill_one'):
+            observed = preprocessor.window_observed_mask(filename, start, length)
+            if int(observed.sum()) < 2:
+                raise ValueError('Observed-only generation evaluation requires at least two raw positive IBI samples')
     if start_sample is not None:
-        preprocessor.window_array(filename, start_sample, length)
+        validate_span(start_sample)
         return filename, start_sample
     record = preprocessor.record(filename)
     for start in range(0, len(record['ibi']) - length + 1, EPOCH_SAMPLES):
         try:
-            preprocessor.window_array(filename, start, length)
+            validate_span(start)
         except ValueError:
             continue
         return filename, start
@@ -290,7 +297,7 @@ def main():
         report['training_data_identity_checks'] = identity_checks
         report['artificial_data'] = preprocessor.provenance().get('data_synthetic')
         report['source_sha256'] = {name: digest((ROOT / name).read_bytes()) for name in
-             ('data_utils.py', 'watchsleep_loader.py', 'window_config.py', 'diffusion_schedule.py', 'scripts/evaluate_denoising.py',
+             ('data_utils.py', 'watchsleep_loader.py', 'window_config.py', 'diffusion_schedule.py', 'signal_normalization.py', 'scripts/evaluate_denoising.py',
              'scripts/evaluate_original_sampler.py')}
         columns = preprocessor.columns
         input_features = len(columns)
@@ -354,15 +361,14 @@ def main():
         generated = scope['synth_tensor'].detach()
         if generated.device != device:
             raise RuntimeError('Original sampler returned a tensor on the wrong device')
-        generated_seconds = (generated[:, 0] * preprocessor.scaler['signal_std_seconds']
-                             + preprocessor.scaler['signal_mean_seconds'])
-        reference_seconds = (reference_tensor[:, 0] * preprocessor.scaler['signal_std_seconds']
-                             + preprocessor.scaler['signal_mean_seconds'])
+        signal_center, signal_scale = signal_affine_parameters(preprocessor.scaler)
+        generated_seconds = generated[:, 0] * signal_scale + signal_center
+        reference_seconds = reference_tensor[:, 0] * signal_scale + signal_center
         observed_mask = torch.as_tensor(preprocessor.window_observed_mask(filename, start_sample, total_length),
                                         dtype=torch.bool, device=device)
-        masked_reference = preprocessor.missing_value_policy == 'masked'
+        masked_reference = preprocessor.missing_value_policy in ('masked', 'zero_fill_one')
         if masked_reference:
-            # The standardized placeholder is not a measured IBI target.
+            # Neither a standardized placeholder nor a one-second fill is a measured IBI target.
             reference_seconds = torch.as_tensor(preprocessor.record(filename)['ibi'][start_sample:start_sample+total_length].copy(),
                                                 dtype=torch.float64, device=device)
         evaluation_mask = observed_mask if masked_reference else torch.ones_like(observed_mask)

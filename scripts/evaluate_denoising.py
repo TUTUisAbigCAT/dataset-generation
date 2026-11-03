@@ -4,6 +4,7 @@ This is an external observation: no sampling, training, output clipping, or
 state-dict loading repair. It uses the official conditional forward-noising
 expression. Preserve-mode metrics retain ordinary MSELoss; masked runs score
 only the original observed IBI positions, never finite missing placeholders.
+The zero_fill_one policy scores every point of its one-second-filled target.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ from window_config import DEFAULT_WINDOW_EPOCHS, EPOCH_SAMPLES, FS, window_setti
 from diffusion_schedule import (build_diffusion_config, diffusion_settings,
                                 diffusion_identity, verify_diffusion_identity)
 from missing_data import masked_noise_mse
+from signal_normalization import signal_affine_parameters
 
 DEFAULT_TRAINING_ARGS = dict(dataset="DREAMT_SIM", backbone="S4", beta_0=.0001, beta_T=.02,
     timesteps=200, hdim=64, lr=.0001, batch_size=1024, epochs=1000, layers=4,
@@ -111,11 +113,32 @@ def load_training_run(manifest_path):
         raise ValueError("S4 implementation differs from the checkpoint's recorded training source. "
                          "Use its original frozen workspace to reproduce historical results; "
                          "do not silently load old fallback weights into the corrected kernel")
+    # A minmax run must identify the affine implementation as well as its
+    # recorded bounds. Historical z-score runs predate this helper; their
+    # absence is compatible only when no nonlegacy transform is recorded.
+    identity = _manifest_data_identity(manifest)
+    scaler = identity.get("scaler", {}) if isinstance(identity, dict) else {}
+    normalization_recorded = ("signal_normalization" in identity
+                              or isinstance(scaler, dict) and "signal_normalization" in scaler)
+    normalization_source = "signal_normalization.py"
+    normalization_hashes = [value for key, value in recorded_sources.items()
+                            if isinstance(key, str) and key.replace("\\", "/") == normalization_source]
+    if len(normalization_hashes) > 1 and any(value != normalization_hashes[0] for value in normalization_hashes[1:]):
+        raise ValueError("Conflicting recorded signal normalization source hashes")
+    normalization_identity = dict(required=normalization_recorded, recorded=False)
+    if normalization_recorded or normalization_hashes:
+        expected_normalization_hash = normalization_hashes[0] if normalization_hashes else None
+        actual_normalization_hash = sha256(ROOT / normalization_source)
+        if expected_normalization_hash != actual_normalization_hash:
+            raise ValueError("Signal normalization source identity is missing or differs from the recorded training source; "
+                             "use the original frozen workspace, never silently infer a minmax transform")
+        normalization_identity.update(recorded=True, path=normalization_source,
+            recorded_sha256=expected_normalization_hash, runtime_sha256=actual_normalization_hash, matched=True)
     info = dict(source="explicit run_manifest.training_args and data",
         manifest=str(manifest_path.resolve()), manifest_sha256=sha256(manifest_path),
         supplied_training_args=config, frozen_window=settings, diffusion_schedule=schedule_check,
         s4_source_identity=dict(path=s4_source, recorded_sha256=recorded_hash, runtime_sha256=actual_hash, matched=True),
-        actual_training_duration_verified=False)
+        signal_normalization_source_identity=normalization_identity, actual_training_duration_verified=False)
     return model_args, manifest, info
 
 
@@ -152,6 +175,8 @@ def bind_training_data(model_args, manifest, manifest_path, preprocessor_class):
         multiplier=expected.get("multiplier", 1.0), downsample_rate=expected.get("downsample_rate", 1),
         max_epochs=expected.get("max_epochs"), window_epochs=settings["window_epochs"],
         missing_value_policy=expected.get("missing_value_policy", "preserve"))
+    if "signal_normalization" in expected:
+        config["signal_normalization"] = expected["signal_normalization"]
     if "schema" in expected:
         if expected["schema"] != "dreamt_data_identity_v1":
             raise ValueError("Unsupported training data identity schema")
@@ -166,7 +191,7 @@ def bind_training_data(model_args, manifest, manifest_path, preprocessor_class):
                 "split_file_sha256", "split_fingerprint", "metadata_file_sha256", "splits", "scaler",
                 "scaler_subjects", "multiplier", "downsample_rate", "max_epochs", "sample_rate_hz",
                 "epoch_samples", "window_epochs", "columns", "stage_names", "raw_stage_mapping",
-                "zero_value_policy"):
+                "zero_value_policy", "signal_normalization"):
         if key in expected:
             reference = expected[key]
             if key in ("data_directory", "metadata_path", "split_path") and reference is not None:
@@ -187,9 +212,9 @@ def bind_training_data(model_args, manifest, manifest_path, preprocessor_class):
 
 
 def _validation_observed_masks(preprocessor, selected_windows, window_size):
-    """Copy original-scale masks; preserve mode never requests or applies one."""
+    """Match training loss: only masked mode excludes original missing positions."""
     policy = getattr(preprocessor, "missing_value_policy", "preserve")
-    if policy == "preserve":
+    if policy in ("preserve", "zero_fill_one"):
         return None
     if policy != "masked":
         raise ValueError("Unknown frozen missing_value_policy")
@@ -294,6 +319,7 @@ def main():
     np.random.seed(42)
     torch.manual_seed(42)
     preprocessor, data_identity_checks = bind_training_data(model_args, manifest, args.run_manifest, Preprocessor)
+    signal_center, signal_scale = signal_affine_parameters(preprocessor.scaler)
     columns = preprocessor.columns
     input_features = len(columns)
     expected_columns = ("IBI", "stage_W", "stage_Light", "stage_REM", "stage_Deep",
@@ -395,10 +421,8 @@ def main():
                 if state_name == "initial_zero_head" and bool((predicted != 0).any()):
                     raise AssertionError("The original initialized zero output head did not predict exactly zero")
                 for i in range(len(batch)):
-                    truth_seconds = (batch[i, :, 0].double() * preprocessor.scaler["signal_std_seconds"]
-                                     + preprocessor.scaler["signal_mean_seconds"])
-                    estimate_seconds = (estimate[i, 0].double() * preprocessor.scaler["signal_std_seconds"]
-                                        + preprocessor.scaler["signal_mean_seconds"])
+                    truth_seconds = batch[i, :, 0].double() * signal_scale + signal_center
+                    estimate_seconds = estimate[i, 0].double() * signal_scale + signal_center
                     rows.append(dict(model_state=state_name, scenario=scenario, **identities[offset + i],
                         timestep=int(timesteps[i]), alpha_bar=float(alpha_bars[timesteps[i]]),
                         **_teacher_forced_window_metrics(predicted[i], target[i], truth_seconds, estimate_seconds,
@@ -447,7 +471,7 @@ def main():
             for key, value in row.items():
                 if torch.is_tensor(value):
                     row[key] = float(value)
-    sources = {name: sha256(ROOT / name) for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "window_config.py", "diffusion_schedule.py",
+    sources = {name: sha256(ROOT / name) for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "window_config.py", "diffusion_schedule.py", "signal_normalization.py",
         "TSImputers/SSSDS4Imputer.py", "TSImputers/S4Model.py", "utils/util.py", "scripts/evaluate_denoising.py")}
     if observed_masks is not None:
         sources["missing_data.py"] = sha256(ROOT / "missing_data.py")
@@ -486,6 +510,14 @@ def main():
             missing_placeholder_scored_as_truth=False, raw_observed_mask_exported=True,
             summary_weighting="Per-window observed-position metrics; windows averaged within subject, then subjects equally weighted")
         report["runtime"]["host_boundaries"].append("Masked-loss finite checks and observed-count scalar synchronization; no CPU tensor computation")
+    if preprocessor.missing_value_policy == "zero_fill_one":
+        report["protocol"].update(missing_value_policy="zero_fill_one",
+            loss="Original all-point nn.MSELoss over predicted IBI epsilon, including positions filled with one second",
+            metric_positions="All time positions of the frozen training target; stored zeros are replaced by one second before normalization",
+            reference_target="One-second-filled training target, not the original raw IBI observations",
+            missing_placeholder_scored_as_truth=False, filled_training_target_scored=True,
+            raw_observed_mask_exported=False,
+            generation_validation_policy="Separate generation validation excludes original missing positions; its raw-reference metrics are not these teacher-forced training-target metrics")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     table_files(args.output_dir, "per_window", rows)
     table_files(args.output_dir, "per_subject", subjects)
@@ -505,6 +537,10 @@ def main():
     if observed_masks is not None:
         lines += ["", "本次使用训练时冻结的 masked 缺失值策略：epsilon MSE、epsilon均值、真实与重建IBI均值均只统计原始有效mask的相同位置。"
             "这不是全采样点MSE；标准化均值占位不作为真实IBI评分。raw_predictions.npz中的observed_mask保存该布尔mask。"]
+    if preprocessor.missing_value_policy == "zero_fill_one":
+        lines += ["", "The frozen zero_fill_one policy replaces stored zero IBI with 1 second before normalization. "
+            "These teacher-forced epsilon and reconstruction metrics use every position of that filled training target. "
+            "Filled positions are not claimed to be observed physiological truth; generation validation separately scores raw positive observations."]
     lines += ["", "先平均每人的已选窗口，再对实际参与验证的主体等权平均。x0 均值误差是辅助观测，不是新增训练损失；"
         "整体 epsilon MSE 与均值误差可以朝不同方向变化。零输出头重建使用带有真实目标信息的 x_t，不能将其均值表现解读为零模型能自由生成。", "",
         "模型由 np/torch seed42 和原 fetchModel 构造；加载前逐项验证固定 buffers 与保存值一致，"

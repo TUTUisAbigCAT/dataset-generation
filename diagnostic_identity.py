@@ -12,6 +12,7 @@ from pathlib import PurePosixPath
 import re
 
 from diffusion_schedule import diffusion_identity
+from signal_normalization import signal_affine_parameters
 
 
 MODEL_FIELDS = (
@@ -22,7 +23,7 @@ MODEL_FIELDS = (
 REQUIRED_CORE_SOURCES = (
     "training_utils.py", "TSImputers/SSSDS4Imputer.py", "TSImputers/S4Model.py", "utils/util.py",
 )
-DATA_SOURCES = ("data_utils.py", "watchsleep_loader.py", "window_config.py", "diffusion_schedule.py")
+DATA_SOURCES = ("data_utils.py", "watchsleep_loader.py", "window_config.py", "diffusion_schedule.py", "signal_normalization.py")
 DATA_FIELDS = (
     "sample_rate_hz", "epoch_samples", "window_epochs", "multiplier", "downsample_rate",
     "max_epochs", "columns", "stage_names", "raw_stage_mapping", "zero_value_policy",
@@ -213,6 +214,10 @@ def audit_training_identity(training_manifest, inference_args, current_data_iden
                     and scaler["continuous_columns"] == ["AHI", "BMI", "AGE"]
                     and isinstance(means, list) and len(means) == 3 and all(finite_number(x) for x in means)
                     and isinstance(stds, list) and len(stds) == 3 and all(finite_number(x) and x > 0 for x in stds))
+                try:
+                    signal_affine_parameters(scaler)
+                except (TypeError, ValueError):
+                    valid = False
                 if not valid:
                     add(prefix + "." + side + ".scaler_values", "incomplete", "Malformed/nonfinite affine scaling evidence")
             if _digest(identity.get("metadata_file_sha256")) is None:
@@ -261,6 +266,9 @@ def audit_training_identity(training_manifest, inference_args, current_data_iden
         if aliases:
             add(prefix + ".aliases", "mismatch", "Conflicting hashes identify the same normalized source path", paths=aliases)
         required = {_source_key(name) for name in REQUIRED_CORE_SOURCES}
+        if ("signal_normalization" in current_data
+                or "signal_normalization" in _mapping(current_data.get("scaler"))):
+            required.add("signal_normalization.py")
         supplemental = {key for key in historical if key.startswith(("tsimputers/", "utils/")) or key in DATA_SOURCES}
         for key in sorted(required | supplemental):
             if historical.get(key) is None or current_sources.get(key) is None:

@@ -17,6 +17,7 @@ from night_sampling import generate_night, _generate_night
 from validation_metrics import summarize_distribution
 from validation_sampling import sample_validation_windows, _sample_windows_from_original
 from window_config import FS, EPOCH_SAMPLES
+from signal_normalization import signal_affine_parameters
 
 STAGES = ("W", "Light", "REM", "Deep")
 CONTINUOUS = ("AHI", "BMI", "AGE")
@@ -177,6 +178,7 @@ def _check_inputs(model, conditions, reference, scaler, args, device, starts, re
             raise ValueError("Invalid signal scaler")
     if scaler["signal_std_seconds"] <= 0:
         raise ValueError("Signal standard deviation must be positive")
+    signal_affine_parameters(scaler)
     for key in ("continuous_mean", "continuous_std"):
         if len(scaler[key]) != 3 or not all(math.isfinite(float(v)) for v in scaler[key]):
             raise ValueError("AHI/BMI/AGE training scaler is required")
@@ -191,6 +193,7 @@ def _run_sampling_diagnostics(model, conditions, reference_seconds, scaler, args
     device = torch.device(device)
     _check_inputs(model, conditions, reference_seconds, scaler, args, device, starts, repeats,
                   comparison_repeats, seed, stride, windows_per_group, kl_variance_floor_ms2)
+    signal_center, signal_scale = signal_affine_parameters(scaler)
     length, total = args.window_size, len(conditions)
     reference = reference_seconds.detach().to(torch.float64)
     independent_sampler = sample_validation_windows if device.type == "cuda" else _sample_windows_from_original
@@ -238,7 +241,7 @@ def _run_sampling_diagnostics(model, conditions, reference_seconds, scaler, args
         clean = torch.zeros(1, length, 10, dtype=torch.float32, device=device)
         clean[0, :, 1:] = condition
         standardized, _ = independent_sampler(model, clean, schedule, args, device)
-        return standardized[0].double()*scaler["signal_std_seconds"]+scaler["signal_mean_seconds"]
+        return standardized[0].double()*signal_scale+signal_center
 
     def seeded_independent(condition, draw_seed):
         with _seeded(draw_seed, device):
@@ -334,7 +337,7 @@ def _run_sampling_diagnostics(model, conditions, reference_seconds, scaler, args
             standardized, _ = night_sampler(model, conditions, schedule, args, device, stride=stride,
                 windows_per_group=windows_per_group,
                 progress=lambda event: emit("diagnostic_progress", stage="independent_vs_continued", method="continued", repeat=repeat, sampler_progress=event))
-            continued_signal = standardized.double()*scaler["signal_std_seconds"]+scaler["signal_mean_seconds"]
+            continued_signal = standardized.double()*signal_scale+signal_center
         for method, signal in (("independent", independent_signal), ("continued", continued_signal)):
             kl_values = []
             for start in evaluation_starts:

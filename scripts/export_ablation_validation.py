@@ -138,7 +138,10 @@ def load_reference_pair(reference_run):
                 or _options(config.get("validation", {})) != _options(protocol["options"])):
             raise ValueError(f"{arm}: frozen validation configuration differs from original protocol")
         source_checks = {}
-        for name in RUNTIME_SOURCES:
+        source_names = list(RUNTIME_SOURCES)
+        if "signal_normalization.py" in recorded or "signal_normalization" in identity.get("scaler", {}):
+            source_names.append("signal_normalization.py")
+        for name in source_names:
             actual = sha256(ROOT/name)
             source_checks[name] = dict(recorded=recorded.get(name), runtime=actual,
                                       matched=actual == recorded.get(name))

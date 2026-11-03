@@ -96,7 +96,7 @@ def main():
                     ROOT / 'watchsleep_loader.py', ROOT / 'dataset_config.json', ROOT / 'cuda_runtime.py',
                     ROOT / 'third_party/WatchSleepNet/data_setup.py', ROOT / 'epoch_validation.py',
                     ROOT / 'validation_metrics.py', ROOT / 'validation_sampling.py', ROOT / 'validation_artifacts.py', ROOT / 'window_config.py',
-                    ROOT / 'scripts/evaluate_original_sampler.py', ROOT / 'diffusion_schedule.py', ROOT / 'missing_data.py']
+                    ROOT / 'scripts/evaluate_original_sampler.py', ROOT / 'diffusion_schedule.py', ROOT / 'missing_data.py', ROOT / 'signal_normalization.py']
     hashes = {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
     command = [filename, '-d', args.dataset, '-window_size', str(dimensions['window_size']), '-s4_lmax', str(dimensions['window_size']),
                '-stride', str(EPOCH_SAMPLES), '-batch_size', str(args.batch_size), '-epochs', str(args.epochs),

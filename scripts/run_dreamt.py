@@ -51,7 +51,7 @@ def resolve_output_directory(config_path, explicit_output=None):
 def snapshot_source(destination):
     destination.mkdir()
     for name in ("training_wavestitch.py", "training_utils.py", "data_utils.py", "watchsleep_loader.py", "cuda_runtime.py",
-                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "validation_artifacts.py", "window_config.py", "diffusion_schedule.py", "missing_data.py"):
+                 "epoch_validation.py", "validation_metrics.py", "validation_sampling.py", "validation_artifacts.py", "window_config.py", "diffusion_schedule.py", "missing_data.py", "signal_normalization.py"):
         shutil.copy2(ROOT / name, destination / name)
     for name in ("TSImputers", "utils", "third_party"):
         shutil.copytree(ROOT / name, destination / name,
@@ -67,8 +67,8 @@ def main():
     parser.add_argument("--data-dir", type=Path, help="Override only the NPZ folder; otherwise read dataset_config.json")
     parser.add_argument("--config", type=Path, default=ROOT / "dataset_config.json")
     parser.add_argument("--check-only", action="store_true", help="Validate the complete data interface without training")
-    parser.add_argument("--missing-value-policy", choices=("preserve", "masked"),
-                        help="Override JSON policy: preserve legacy stored zeros, or supervise observed positive IBI only")
+    parser.add_argument("--missing-value-policy", choices=("preserve", "masked", "zero_fill_one"),
+                        help="Override JSON policy: preserve zeros, supervise observed positive IBI only, or fill stored zeros with one second before training")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--threads", type=int, default=2)
@@ -137,6 +137,8 @@ def main():
         frozen_config = {key: identity.get(key) for key in
             ("metadata_path", "split_path", "split_seed", "multiplier", "downsample_rate", "max_epochs", "window_epochs")}
         frozen_config["missing_value_policy"] = preprocessor.missing_value_policy
+        if preprocessor.signal_normalization is not None:
+            frozen_config["signal_normalization"] = preprocessor.signal_normalization
         frozen_config["validation"] = validation_config
         frozen_config["early_stopping"] = stopping_config
         frozen_config.update(schedule_config)
