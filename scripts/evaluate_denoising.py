@@ -24,6 +24,7 @@ from diffusion_schedule import (build_diffusion_config, diffusion_settings,
                                 diffusion_identity, verify_diffusion_identity)
 from missing_data import masked_noise_mse
 from signal_normalization import signal_affine_parameters
+from s4_dropout_config import s4_dropout_options
 
 DEFAULT_TRAINING_ARGS = dict(dataset="DREAMT_SIM", backbone="S4", beta_0=.0001, beta_T=.02,
     timesteps=200, hdim=64, lr=.0001, batch_size=1024, epochs=1000, layers=4,
@@ -85,9 +86,10 @@ def load_training_run(manifest_path):
         raise ValueError("Expected dataset DREAMT or DREAMT_SIM")
     for key in ("backbone", "beta_0", "beta_T", "timesteps", "num_res_layers",
                 "res_channels", "skip_channels", "diff_step_embed_in", "diff_step_embed_mid", "diff_step_embed_out",
-                "s4_dstate", "s4_dropout", "s4_bidirectional", "s4_layernorm", "propCycEnc"):
+                "s4_dstate", "s4_bidirectional", "s4_layernorm", "propCycEnc"):
         if config[key] != DEFAULT_TRAINING_ARGS[key]:
             raise ValueError(f"This audit expects the planned strict model; {key} differs: {config[key]!r}")
+    config = dict(config, s4_dropout=s4_dropout_options(config))
     # Historical manifests have no selector: explicitly restore linear, never
     # the default of the current dataset JSON or a new training launcher.
     config = dict(config, **diffusion_settings(config, default_schedule="linear"))
@@ -113,6 +115,16 @@ def load_training_run(manifest_path):
         raise ValueError("S4 implementation differs from the checkpoint's recorded training source. "
                          "Use its original frozen workspace to reproduce historical results; "
                          "do not silently load old fallback weights into the corrected kernel")
+    dropout_hashes = [v for k, v in recorded_sources.items()
+                      if k.replace("\\", "/") == "s4_dropout_config.py"]
+    dropout_identity = dict(probability=model_args.s4_dropout, recorded=False)
+    if model_args.s4_dropout > 0 or dropout_hashes:
+        actual_dropout_hash = sha256(ROOT / "s4_dropout_config.py")
+        if not dropout_hashes or any(value != actual_dropout_hash for value in dropout_hashes):
+            raise ValueError("S4 dropout configuration source is missing or differs from the frozen run")
+        if "s4_dropout" in manifest and s4_dropout_options(manifest) != model_args.s4_dropout:
+            raise ValueError("Manifest S4 dropout differs from recorded training arguments")
+        dropout_identity.update(recorded=True, matched=True, source_sha256=actual_dropout_hash)
     # A minmax run must identify the affine implementation as well as its
     # recorded bounds. Historical z-score runs predate this helper; their
     # absence is compatible only when no nonlegacy transform is recorded.
@@ -139,6 +151,7 @@ def load_training_run(manifest_path):
         supplied_training_args=config, frozen_window=settings, diffusion_schedule=schedule_check,
         s4_source_identity=dict(path=s4_source, recorded_sha256=recorded_hash, runtime_sha256=actual_hash, matched=True),
         signal_normalization_source_identity=normalization_identity, actual_training_duration_verified=False)
+    info["s4_dropout_identity"] = dropout_identity
     return model_args, manifest, info
 
 

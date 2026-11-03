@@ -16,6 +16,8 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def save_json(path, value):
@@ -88,6 +90,8 @@ def expected_training_args(preflight, epochs, batch_size):
     result.update(dataset="DREAMT", window_size=preflight["window_size"],
                   s4_lmax=preflight["window_size"], stride=750, batch_size=batch_size,
                   epochs=epochs, **preflight["diffusion_settings"])
+    from s4_dropout_config import s4_dropout_options
+    result["s4_dropout"] = s4_dropout_options(preflight)
     result.pop("validation_output", None)
     return result
 
@@ -167,6 +171,10 @@ def compare_reference_preflights(reference, current):
     data, split, file hashes and scaler after the loader resolves paths.
     """
     checks = {}
+    from s4_dropout_config import s4_dropout_options
+    from training_input_dropout import input_dropout_options
+    checks["s4_dropout"] = s4_dropout_options(reference) == s4_dropout_options(current)
+    checks["training_input_dropout"] = input_dropout_options(reference) == input_dropout_options(current)
     for key in ("data_identity", "training_windows", "training_input_shape", "window_epochs", "window_size",
                 "validation_windows", "validation_selection", "diffusion_identity", "diffusion_settings"):
         checks[key] = key in reference and key in current and reference[key] == current[key]

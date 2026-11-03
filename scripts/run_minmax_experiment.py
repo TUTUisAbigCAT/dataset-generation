@@ -44,13 +44,15 @@ def experiment_config(base, config_path, experiment):
     return config
 
 
-def compare_minmax_preflight(reference, current, experiment):
+def compare_minmax_preflight(reference, current, experiment, *, expected_input_dropout=None):
     if experiment not in EXPERIMENTS:
         raise ValueError("Unknown minmax experiment: " + experiment)
     old, new = copy.deepcopy(reference["data_identity"]), copy.deepcopy(current["data_identity"])
     old_scaler, new_scaler = old.pop("scaler"), new.pop("scaler")
     expected_spec = MINMAX01 if experiment == "minmax01" else MINMAX
     expected_dropout = dict(probability=.1 if experiment == "minmax_dropout" else 0.0, seed=42)
+    if expected_input_dropout is not None:
+        expected_dropout = input_dropout_options({"training_input_dropout": expected_input_dropout})
     checks = dict(status=reference.get("status") == current.get("status") == "passed",
         baseline_normalization=normalization_spec(old) == normalization_spec(old_scaler) == MINMAX,
         normalization=normalization_spec(new) == normalization_spec(new_scaler) == expected_spec,

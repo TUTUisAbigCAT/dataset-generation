@@ -374,6 +374,10 @@ sbatch submit_inference.sh
 
 两组各自从头训练 30 轮，与已完成的 `minmax_20261103T003905Z_1223635` 使用相同训练预算和验证窗口。配置、计数、输出和提交方式见 [min-max 后续实验说明](docs/minmax_followup_experiments.md)。
 
+## 16 组 dropout 与归一化对照
+
+`submit_dropout_sweep.sh` 提交 16 个独立 CUDA 训练任务：`[-1,1]`、`[0,1]` 两种范围，各自分别测试输入 dropout 和原生 `s4_dropout` 的 `0.01 / 0.03 / 0.05 / 0.1`。每组只开启一种 dropout，另一种为 0。各组从头训练 30 轮、batch size 8，使用相同数据和固定验证窗口，最多同时运行 4 组。配置表为 `configs/dropout_sweep.json`；提交命令、机制和输出见 [16 组实验说明](docs/dropout_sweep.md)。
+
 ## S092 四阶段评估：两组最终第 30 轮权重
 
 `submit_stage_evaluation.sh` 使用这次缺失值对照的两组 **final epoch-30** 权重，在相同 S092 原始阶段与人员条件下各生成 8 次。按原始 30 秒标签分别统计 W、Light、REM、Deep 的均值误差、方差误差、高斯 KL 和非正值比例；真实 IBI 不输入模型，混合阶段窗口不改成纯阶段条件。结果保留每次波形和分阶段图。执行前 `git pull`，创建日志目录，再 `sbatch submit_stage_evaluation.sh`。路径、身份核对、评分口径与输出说明见 [四阶段评估说明](docs/stage_evaluation.md)。

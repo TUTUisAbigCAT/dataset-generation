@@ -25,6 +25,7 @@ from cuda_runtime import require_cuda, cuda_environment
 from epoch_validation import weighted_loss
 from window_config import EPOCH_SAMPLES, window_settings
 from diffusion_schedule import diffusion_settings, diffusion_identity
+from s4_dropout_config import s4_dropout_options, s4_dropout_report
 
 
 def save_json(path, value):
@@ -79,6 +80,7 @@ def main():
     schedule_settings = diffusion_settings(config, default_schedule="linear_power")
     from training_input_dropout import input_dropout_options
     dropout_options = input_dropout_options(config)
+    s4_probability = s4_dropout_options(config)
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
     checkpoint_path = ROOT / 'saved_models' / args.dataset / 'model.pth'
@@ -98,12 +100,13 @@ def main():
                     ROOT / 'watchsleep_loader.py', ROOT / 'dataset_config.json', ROOT / 'cuda_runtime.py',
                     ROOT / 'third_party/WatchSleepNet/data_setup.py', ROOT / 'epoch_validation.py',
                     ROOT / 'validation_metrics.py', ROOT / 'validation_sampling.py', ROOT / 'validation_artifacts.py', ROOT / 'window_config.py',
-                    ROOT / 'scripts/evaluate_original_sampler.py', ROOT / 'diffusion_schedule.py', ROOT / 'missing_data.py', ROOT / 'signal_normalization.py', ROOT / 'training_input_dropout.py']
+                    ROOT / 'scripts/evaluate_original_sampler.py', ROOT / 'diffusion_schedule.py', ROOT / 'missing_data.py', ROOT / 'signal_normalization.py', ROOT / 'training_input_dropout.py', ROOT / 's4_dropout_config.py']
     hashes = {str(p.relative_to(ROOT)): sha(p) for p in source_paths}
     command = [filename, '-d', args.dataset, '-window_size', str(dimensions['window_size']), '-s4_lmax', str(dimensions['window_size']),
                '-stride', str(EPOCH_SAMPLES), '-batch_size', str(args.batch_size), '-epochs', str(args.epochs),
                '-diffusion_schedule', schedule_settings['diffusion_schedule'],
                '-terminal_alpha_bar', str(schedule_settings['terminal_alpha_bar']),
+               '-s4_dropout', str(s4_probability),
                '-validation_output', str(output / 'validation')]
     manifest = dict(status='starting', python=sys.executable, python_version=sys.version,
                     torch=torch.__version__, numpy=np.__version__, cuda=torch.cuda.is_available(),
@@ -111,6 +114,7 @@ def main():
                     process_id=os.getpid(), command=command, source_sha256=hashes,
                     device=str(device), cuda_environment=cuda_environment(device), window_settings=dimensions,
                     diffusion_settings=schedule_settings, training_input_dropout=dict(options=dropout_options),
+                    s4_dropout=s4_probability,
                     observer='sys.settrace reads current loss and completed updates only; no training hooks or replacements',
                     observer_sha256=sha(Path(__file__)), training_args=None,
                     checkpoint=str(checkpoint_path), data_synthetic=None)
@@ -143,6 +147,10 @@ def main():
                         print(json.dumps(progress), flush=True)
                 if frame.f_lineno == loop_line and not configured:
                     state = frame.f_locals
+                    if state['args'].s4_dropout != s4_probability or not state['model'].training:
+                        raise ValueError('S4 dropout launch configuration/mode did not reach training')
+                    manifest['s4_dropout_runtime'] = s4_dropout_report(
+                        state['model'], s4_probability, expected_layers=2 * state['args'].num_res_layers)
                     manifest.update(status='training', training_args=vars(state['args']).copy(),
                                     parameter_count=sum(p.numel() for p in state['model'].parameters()),
                                     train_windows=len(state['training_dataset']),
@@ -204,6 +212,7 @@ def main():
                   mean_loss=weighted_loss(rows), loss_aggregation=('observed_point_weighted_mean'
                       if manifest['missing_value_policy'] == 'masked' else 'sample_weighted_mean'),
                   missing_value_policy=manifest['missing_value_policy'], training_input_dropout=dropout_report,
+                  s4_dropout=s4_probability, s4_dropout_runtime=manifest['s4_dropout_runtime'],
                   validation=validation, all_losses_finite=True, checkpoint_all_finite=True,
                   checkpoint=str(checkpoint_path), checkpoint_sha256=sha(checkpoint_path),
                   source_unchanged=True, mkldnn_enabled=torch.backends.mkldnn.enabled,
