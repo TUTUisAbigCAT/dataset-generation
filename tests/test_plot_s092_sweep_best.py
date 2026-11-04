@@ -16,11 +16,13 @@ def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2), encoding='utf-8')
 
 
-def synthetic_result(root):
-    """Twelve labeled fake generation outputs, with all four original stages."""
+def synthetic_result(root, config_ids=None):
+    """Labeled fake generation outputs, with all four original stages."""
     root = Path(root)
     root.mkdir(parents=True)
     configs = json.loads((ROOT/'configs/all88_s092_sweep.json').read_text())['configurations']
+    if config_ids is not None:
+        configs = [configs[index] for index in config_ids]
     stages = np.array([0, 1, 1, 1, 2, 1, 1, 1, 3, 1, 1, 3], dtype=np.int64)
     time = np.arange(9000)/25
     real = (1.1+.18*np.sin(time*.5)+.08*np.cos(time*.09)).astype(np.float64)
@@ -52,8 +54,13 @@ def synthetic_result(root):
             waveform_sha256=plotter.sha256(path/'waveforms.npz'), metrics=aggregate,
             sampling=dict(independent_windows=True, signal_all_unknown=True,
                           condition_columns_bitwise_preserved=True, clipping_applied=False)))
-    write_json(root/'summary.json', dict(status='completed', configurations=configs, seed=20261103,
-        reference_sha256=plotter.sha256(root/'reference.npz'), implementation_test_only=True))
+    summary = dict(status='completed', configurations=configs, seed=20261103,
+        reference_sha256=plotter.sha256(root/'reference.npz'), implementation_test_only=True)
+    if config_ids is not None:
+        summary.update(selected_configuration_ids=list(config_ids),
+                       excluded_configuration_ids=sorted(set(range(12))-set(config_ids)),
+                       completed_configurations=list(config_ids))
+    write_json(root/'summary.json', summary)
     return root
 
 
@@ -93,14 +100,17 @@ class SweepPlotTests(unittest.TestCase):
         equal = plotter.paired_statistics(real, real, real > 0)
         self.assertEqual(equal['gaussian_kl_real_to_generated'], 0.)
 
-    def test_reject_incomplete_grid_wrong_seed_and_unsaved_reference(self):
+    def test_reject_invalid_grid_wrong_seed_and_unsaved_reference(self):
         path = self.result/'summary.json'
         base = plotter.read_json(path)
-        variants = [dict(base, configurations=base['configurations'][:-1]),
+        variants = [dict(base, configurations=[]),
                     dict(base, seed=123), dict(base, reference_sha256='0'*64), dict(base, status='sampling')]
         duplicate = deepcopy(base)
         duplicate['configurations'][11]['id'] = 10
         variants.append(duplicate)
+        unknown = deepcopy(base)
+        unknown['configurations'][11]['id'] = 12
+        variants.append(unknown)
         for variant in variants:
             with self.subTest(variant=variant.keys()):
                 write_json(path, variant)
@@ -108,6 +118,57 @@ class SweepPlotTests(unittest.TestCase):
                     plotter.render_comparison(self.result)
                 self.assertFalse((self.result/'plots').exists())
         write_json(path, base)
+
+    def test_selected_ids_and_completion_records_must_match_declared_subset(self):
+        result = synthetic_result(self.base/'nine', range(9))
+        path = result/'summary.json'
+        base = plotter.read_json(path)
+        variants = [dict(base, selected_configuration_ids=list(range(8))),
+                    dict(base, selected_configuration_ids=[0]*9),
+                    dict(base, selected_configuration_ids=[True]+list(range(1, 9))),
+                    dict(base, excluded_configuration_ids=[]),
+                    dict(base, excluded_configuration_ids=[9, 10, 10]),
+                    dict(base, completed_configurations=list(range(8)))]
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises(ValueError):
+                write_json(path, variant)
+                plotter.render_comparison(result)
+            self.assertFalse((result/'plots').exists())
+
+    def test_missing_selected_output_is_not_silently_skipped(self):
+        result = synthetic_result(self.base/'nine', range(9))
+        (result/'config_8/waveforms.npz').unlink()
+        with self.assertRaises(FileNotFoundError):
+            plotter.render_comparison(result)
+        self.assertFalse((result/'plots').exists())
+
+    def test_nonconsecutive_selection_preserves_ids_and_sorts_for_plotting(self):
+        result = synthetic_result(self.base/'selected', [8, 0, 6])
+        data = plotter.load_result(result)
+        self.assertEqual([row['id'] for row in data['configs']], [0, 6, 8])
+        self.assertEqual([row['configuration_id'] for row in data['rows']], [0, 6, 8])
+        self.assertEqual(set(data['generated']), {0, 6, 8})
+
+    def test_render_nine_configs_without_any_excluded_directories(self):
+        result = synthetic_result(self.base/'nine', range(9))
+        self.assertTrue(all(not (result/f'config_{index}').exists() for index in (9, 10, 11)))
+        report = plotter.render_comparison(result, synthetic_fixture=True)
+        self.assertEqual(report['configuration_count'], 9)
+        self.assertEqual(report['selected_configuration_ids'], list(range(9)))
+        self.assertEqual(report['excluded_configuration_ids'], [9, 10, 11])
+        self.assertEqual(set(report['checkpoint_epochs']), {str(index) for index in range(9)})
+        self.assertEqual(len(report['artifacts']), 29)
+        self.assertTrue(all((result/'plots'/item['file']).is_file() for item in report['artifacts']))
+        ranking = json.loads((result/'plots/configuration_ranking.json').read_text())
+        self.assertEqual(len(ranking), 9)
+        self.assertEqual({row['configuration_id'] for row in ranking}, set(range(9)))
+        for stem, count in (('stage_excerpt_metrics', 36), ('per_window_metrics', 27)):
+            self.assertEqual(len(json.loads((result/'plots'/(stem+'.json')).read_text())), count)
+        chart = (result/'plots/S092_sweep_metric_comparison.svg').read_text()
+        self.assertIn('config_8', chart)
+        self.assertNotIn('config_9', chart)
+        self.assertNotIn('config_10', chart)
+        self.assertNotIn('config_11', chart)
 
     def test_final_config_bad_hash_or_metrics_rejected_before_any_output(self):
         path = self.result/'config_11/summary.json'

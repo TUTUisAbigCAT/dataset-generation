@@ -1,4 +1,4 @@
-"""Freeze the current best of all 12 runs and compare the same S092 conditions.
+"""Freeze selected sweep runs' current best and compare the same S092 conditions.
 
 Training may still be running. A live validation summary and matching weight
 bytes identify the selected epoch; a final best manifest is not required.
@@ -182,10 +182,27 @@ def freeze_configuration(sweep_root, configuration, output_dir, attempts=3, retr
     return context
 
 
-def compare_contexts(contexts):
+def select_configurations(grid, configuration_ids=None):
+    """Select explicit IDs before accessing run files; never skip failures silently."""
+    ids = [row['id'] for row in grid] if configuration_ids is None else configuration_ids
+    if (not isinstance(ids, list) or not ids
+            or any(type(value) is not int or not 0 <= value < 12 for value in ids)
+            or len(set(ids)) != len(ids)):
+        raise ValueError('Configuration IDs must be a nonempty list of unique integers from 0 to 11')
+    rows = sorted((row for row in grid if row['id'] in ids), key=lambda row: row['id'])
+    if len(rows) != len(ids) or {row['id'] for row in rows} != set(ids):
+        raise ValueError('Every selected configuration must exist exactly once in the grid')
+    return rows
+
+
+def compare_contexts(contexts, *, expected_ids=None):
     """Allow the requested dropout/range differences; keep data and math paired."""
-    if len(contexts) != 12 or {c['configuration']['id'] for c in contexts} != set(range(12)):
-        raise ValueError('Require exactly the 12 sweep configurations')
+    rows = [context['configuration'] for context in contexts]
+    select_configurations(rows)
+    if expected_ids is not None:
+        select_configurations(rows, expected_ids)
+        if {row['id'] for row in rows} != set(expected_ids):
+            raise ValueError('Captured configurations differ from the requested IDs')
     checks = {}
     base = contexts[0]
     def data_key(context):
@@ -270,6 +287,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--sweep-root', type=Path)
     parser.add_argument('--grid', type=Path, default=ROOT/'configs/all88_s092_sweep.json')
+    parser.add_argument('--config-ids', type=int, nargs='+',
+                        help='Configuration IDs to compare (default: all 12); excluded runs are not read')
     parser.add_argument('--npz', type=Path)
     parser.add_argument('--metadata', type=Path)
     parser.add_argument('--output-dir', type=Path, required=True)
@@ -304,14 +323,20 @@ def main(argv=None):
     sweep = cli.sweep_root.expanduser().resolve()
     if output == sweep or output.is_relative_to(sweep):
         parser.error('Use a new output directory outside the training sweep')
+    from scripts.run_all88_s092_sweep import load_grid
+    try:
+        configurations = select_configurations(load_grid(cli.grid), cli.config_ids)
+    except ValueError as error:
+        parser.error(str(error))
+    selected_ids = [row['id'] for row in configurations]
+    excluded_ids = sorted(set(range(12))-set(selected_ids))
     if not cli.check_only:
         from cuda_runtime import require_cuda
         require_cuda()
-    from scripts.run_all88_s092_sweep import load_grid
-    configurations = load_grid(cli.grid)
     output.mkdir(parents=True, exist_ok=False)
     status = dict(status='checking', sweep_root=str(sweep), output_directory=str(output),
         configurations=configurations, seed=cli.seed, start_second=cli.start_second,
+        selected_configuration_ids=selected_ids, excluded_configuration_ids=excluded_ids,
         windows=cli.windows, window_seconds=120, duration_seconds=cli.windows*120,
         training_executed=False, sampling_performed=False, independent_windows=True,
         real_ibi_used_as_input=False, overlap_samples=0, evaluation_is_held_out=False,
@@ -319,6 +344,8 @@ def main(argv=None):
         script_sha256=sha256(__file__))
     try:
         save_json(output/'summary.json', status)
+        print(json.dumps(dict(event='sweep_configuration_selection',
+                              selected=selected_ids, excluded=excluded_ids)), flush=True)
         contexts = []
         for row in configurations:
             destination = output/f'config_{row["id"]}'
@@ -326,7 +353,7 @@ def main(argv=None):
             contexts.append(context)
             status['snapshots'][str(row['id'])] = dict(epoch=context['epoch'],
                 checkpoint_sha256=context['checkpoint_sha256'], snapshot=context['manifest']['snapshot'])
-        status['shared_training_checks'] = compare_contexts(contexts)
+        status['shared_training_checks'] = compare_contexts(contexts, expected_ids=selected_ids)
         save_json(output/'summary.json', status)
         for context in contexts:
             destination = output/f'config_{context["configuration"]["id"]}'
@@ -357,7 +384,8 @@ def main(argv=None):
             subprocess.run([sys.executable, '-B', str(ROOT/'scripts/plot_s092_sweep_best.py'),
                             '--result-dir', str(output)], check=True, cwd=ROOT)
         save_json(output/'summary.json', status)
-        print(json.dumps(dict(event='s092_sweep_finished', status=status['status'], output_directory=str(output))), flush=True)
+        print(json.dumps(dict(event='s092_sweep_finished', status=status['status'],
+                              configuration_ids=selected_ids, output_directory=str(output))), flush=True)
     except BaseException as error:
         status.update(status='failed', error_type=type(error).__name__, error=str(error))
         save_json(output/'summary.json', status)

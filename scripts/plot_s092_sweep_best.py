@@ -1,4 +1,4 @@
-"""Plot twelve completed, paired S092 best-checkpoint outputs without a model.
+"""Plot selected completed, paired S092 best-checkpoint outputs without a model.
 
 Four-stage details select the first original 30-second epoch of each stage.
 Full-window views retain every generated value and separate independent draws.
@@ -46,13 +46,14 @@ def scalar(arrays, key):
 
 
 def configuration_rows(rows):
-    """Validate the fixed twelve-job protocol, including duplicate p=0 labels."""
-    if not isinstance(rows, list) or len(rows) != 12:
-        raise ValueError('Require all twelve configurations')
+    """Validate a nonempty subset of the fixed twelve-job protocol."""
+    if not isinstance(rows, list) or not rows:
+        raise ValueError('Require at least one selected configuration')
     if any(not isinstance(row, dict) or type(row.get('id')) is not int for row in rows):
         raise ValueError('Configuration IDs must be integers')
-    if sorted(row['id'] for row in rows) != list(range(12)):
-        raise ValueError('Require unique configuration IDs 0 through 11')
+    ids = [row['id'] for row in rows]
+    if len(set(ids)) != len(ids) or not set(ids).issubset(range(12)):
+        raise ValueError('Require unique configuration IDs within 0 through 11')
     rows = sorted(rows, key=lambda row: row['id'])
     for row in rows:
         index = row['id']
@@ -100,6 +101,15 @@ def load_result(result_dir):
     if summary.get('status') != 'completed':
         raise ValueError('Only completed generation comparisons can be plotted')
     configs = configuration_rows(summary.get('configurations'))
+    selected_ids = {row['id'] for row in configs}
+    for key, expected in (('selected_configuration_ids', selected_ids),
+                          ('excluded_configuration_ids', set(range(12))-selected_ids),
+                          ('completed_configurations', selected_ids)):
+        if key in summary:
+            ids = summary[key]
+            if (not isinstance(ids, list) or any(type(index) is not int for index in ids)
+                    or len(ids) != len(set(ids)) or set(ids) != expected):
+                raise ValueError(key + ' differs from the selected completed configurations')
     seed = summary.get('seed')
     if type(seed) is not int or not 0 <= seed < 2**32:
         raise ValueError('Require a shared unsigned integer sampling seed')
@@ -304,8 +314,9 @@ def render_comparison(result_dir, output_dir=None, synthetic_fixture=False):
                 finally:
                     plt.close(fig)
         fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
-        positions = np.arange(12)
-        colors = ['#2b6fbd']*6+['#e47632']*6
+        positions = np.arange(len(data['configs']))
+        colors = ['#2b6fbd' if row['normalization_range'][0] == -1 else '#e47632'
+                  for row in data['configs']]
         for axis, key, label in zip(axes, ('gaussian_kl_real_to_generated', 'mean_absolute_error_ms'),
                                    ('Mean window Gaussian KL', 'Window mean absolute error (ms)')):
             values = [row[key] for row in data['rows']]
@@ -331,7 +342,9 @@ def render_comparison(result_dir, output_dir=None, synthetic_fixture=False):
     _save_table(output, 'stage_excerpt_metrics', data['stage_rows'])
     _save_table(output, 'per_window_metrics', data['window_rows'])
     manifest = dict(status='completed', synthetic_fixture=synthetic_fixture, model_executed=False,
-        source_sha256=data['source_sha256'], seed=data['seed'], configuration_count=12,
+        source_sha256=data['source_sha256'], seed=data['seed'], configuration_count=len(data['configs']),
+        selected_configuration_ids=[row['id'] for row in data['configs']],
+        excluded_configuration_ids=sorted(set(range(12))-{row['id'] for row in data['configs']}),
         source_segment=dict(start_second=data['start'], samples=len(data['real']), sample_rate_hz=data['fs'],
                             duration_seconds=len(data['real'])/data['fs'], window_size=data['window_size']),
         stage_selection={name: dict(relative_start_second=offset/data['fs'], duration_seconds=30.)

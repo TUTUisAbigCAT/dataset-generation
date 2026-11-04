@@ -1,11 +1,13 @@
-# S092 current-best comparison for all 12 configurations
+# S092 current-best comparison for selected sweep configurations
 
-This compares `config_0` through `config_11` from the all88/S092 sweep using
+The submission script compares `config_0` through `config_8` from the all88/S092 sweep using
 their current `run/training/best_kl_model.pth`. Training need not have finished:
 `run_manifest.json` supplies the frozen model/data settings and
 `validation/summary.json` supplies the best epoch, raw KL and weight SHA256.
 The final `best_kl_manifest.json` is not required. No final-epoch fallback is
-allowed. Every configuration must already have a valid best checkpoint.
+allowed. Every selected configuration must already have a valid best checkpoint.
+The failed `config_9`, `config_10` and `config_11` runs are explicitly excluded;
+their files are not read and they do not appear in figures or rankings.
 
 ## Submit on the cluster
 
@@ -21,10 +23,15 @@ The script already targets
 `/home/yxtao/links/scratch/dataset-generation/runs/all88_s092_sweep_1228119`,
 as shown in the supplied directory tree. Change only `SWEEP_ROOT` if the run
 directory differs. Data and metadata paths are also directly in that script.
-It allocates one GPU and four CPU threads for up to one hour. The 12 inference
+It allocates one GPU and four CPU threads for up to one hour. The nine inference
 workers run sequentially on that GPU in fresh processes; this does not submit
 or modify the 12 training jobs. The BLIS startup policy is applied before
 NumPy/PyTorch imports. Model inference requires CUDA, with no CPU fallback.
+
+`CONFIG_IDS=(0 1 2 3 4 5 6 7 8)` in the submission script controls selection.
+The Python entry point accepts `--config-ids 0 1 2 3 4 5 6 7 8`; omitting that
+option retains the original all-12 behavior. Missing or invalid selected runs
+still stop the job: exclusion is explicit, never an automatic skip on failure.
 
 Best means the best available when the inference job starts on a compute node,
 not the time `sbatch` was called. Each run is captured separately, and each
@@ -40,7 +47,7 @@ that all models received identical numbers of updates.
   `W Light Light Light | REM Light Light Light | Deep Light Light Deep`.
 - Use S092's recorded AHI/BMI/AGE/GENDER and each run's frozen metadata scaler.
 - Use sampling seed **20261103** and check identical CUDA RNG states before and
-  after sampling across all 12 workers.
+  after sampling across all selected workers.
 - Real IBI is used only for evaluation and plotting, not fed as a prefix or
   known signal. There is no overlap, inpainting or continuation in this test.
 - Restore each model's own S4 dropout setting when constructing it, then call
@@ -67,8 +74,8 @@ metadata, changed source/data hashes or unexpected settings stop the job.
 The Slurm log prints a new output directory under
 `runs/S092_sweep_best_<UTC timestamp>_<job ID>/`:
 
-- `summary.json`: all 12 configurations, captured epochs/hashes, paired checks,
-  progress and completion status.
+- `summary.json`: selected configurations, explicit selected/excluded IDs,
+  captured epochs/hashes, paired checks, progress and completion status.
 - `reference.npz`: the common real IBI, observed mask and original conditions.
 - `config_N/checkpoint_snapshot/`: the copied best weights and
   `best_snapshot_manifest.json` identifying their epoch and provenance.
@@ -91,6 +98,7 @@ For data/configuration checks without model execution, use a fresh directory:
 ```bash
 python -B scripts/compare_s092_sweep_best.py \
   --sweep-root /home/yxtao/links/scratch/dataset-generation/runs/all88_s092_sweep_1228119 \
+  --config-ids 0 1 2 3 4 5 6 7 8 \
   --output-dir /home/yxtao/links/scratch/dataset-generation/runs/S092_sweep_best_check \
   --start-second 18900 --windows 3 --check-only
 ```

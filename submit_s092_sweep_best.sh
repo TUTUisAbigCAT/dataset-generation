@@ -24,13 +24,15 @@ SWEEP_ROOT=/home/yxtao/links/scratch/dataset-generation/runs/all88_s092_sweep_12
 S092_NPZ=/home/yxtao/links/scratch/WatchSleepProcessedDataset/DREAMT_PIBI_SE/S092.npz
 METADATA=/home/yxtao/links/scratch/WatchSleepProcessedDataset/DREAMT_PIBI_SE/participant_info.csv
 OUTPUT_ROOT="/home/yxtao/links/scratch/dataset-generation/runs/S092_sweep_best_$(date -u +%Y%m%dT%H%M%SZ)_${SLURM_JOB_ID}"
+CONFIG_IDS=(0 1 2 3 4 5 6 7 8)
 
-# Capture all 12 current best weights, including runs still training.
+# Capture nine current best weights; config_9, config_10 and config_11 failed.
 # The same 18900--19260s S092 conditions cover W, Light, REM and Deep.
-# One GPU runs the 12 small inference jobs sequentially in isolated processes.
+# One GPU runs the selected inference jobs sequentially in isolated processes.
 srun python -B -u scripts/compare_s092_sweep_best.py \
   --sweep-root "$SWEEP_ROOT" --npz "$S092_NPZ" --metadata "$METADATA" \
+  --config-ids "${CONFIG_IDS[@]}" \
   --start-second 18900 --windows 3 --seed 20261103 \
   --threads "${SLURM_CPUS_PER_TASK:-4}" --output-dir "$OUTPUT_ROOT"
 
-printf 'Completed all 12 best-checkpoint comparisons. Results: %s\n' "$OUTPUT_ROOT"
+printf 'Completed %s best-checkpoint comparisons. Results: %s\n' "${#CONFIG_IDS[@]}" "$OUTPUT_ROOT"
