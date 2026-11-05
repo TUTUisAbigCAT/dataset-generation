@@ -6,8 +6,7 @@ their current `run/training/best_kl_model.pth`. Training need not have finished:
 `validation/summary.json` supplies the best epoch, raw KL and weight SHA256.
 The final `best_kl_manifest.json` is not required. No final-epoch fallback is
 allowed. Every selected configuration must already have a valid best checkpoint.
-The failed `config_9`, `config_10` and `config_11` runs are explicitly excluded;
-their files are not read and they do not appear in figures or rankings.
+The default submission uses the nine completed configurations.
 
 ## Submit on the cluster
 
@@ -21,14 +20,14 @@ sbatch submit_s092_sweep_best.sh
 
 The script already targets
 `/home/yxtao/links/scratch/dataset-generation/runs/all88_s092_sweep_1228119`,
-as shown in the supplied directory tree. Change only `SWEEP_ROOT` if the run
-directory differs. Data and metadata paths are also directly in that script.
-It allocates one GPU and four CPU threads for up to one hour. The nine inference
+and allocates one GPU and four CPU threads for up to four hours. The nine inference
 workers run sequentially on that GPU in fresh processes; this does not submit
 or modify the 12 training jobs. The BLIS startup policy is applied before
 NumPy/PyTorch imports. Model inference requires CUDA, with no CPU fallback.
 
-`CONFIG_IDS=(0 1 2 3 4 5 6 7 8)` in the submission script controls selection.
+To evaluate only config 1, run `sbatch submit_s092_sweep_best.sh 1`.
+To evaluate the three retrained models, use
+`sbatch submit_s092_sweep_best.sh --sweep-root /path/to/the/retry_sweep 9 10 11`.
 The Python entry point accepts `--config-ids 0 1 2 3 4 5 6 7 8`; omitting that
 option retains the original all-12 behavior. Missing or invalid selected runs
 still stop the job: exclusion is explicit, never an automatic skip on failure.
@@ -41,10 +40,12 @@ that all models received identical numbers of updates.
 
 ## Exact comparison
 
-- Use the same S092 NPZ segment: **18900--19260 seconds** (6 minutes).
-- Generate three independent **120-second / 3000-point** windows at 25 Hz.
-- Preserve the original stage sequence:
-  `W Light Light Light | REM Light Light Light | Deep Light Light Deep`.
+- The Slurm entry point passes `--all-windows`. Each model generates a fresh
+  independent IBI sequence for every complete window in the frozen S092
+  validation protocol, in batches of eight. Stored source starts, stage labels
+  and positive-reference scoring masks are checked against the S092 NPZ.
+- The audited record contains 222 nonoverlapping windows of 120 seconds at
+  25 Hz, followed by 60 seconds outside the final complete window.
 - Use S092's recorded AHI/BMI/AGE/GENDER and each run's frozen metadata scaler.
 - Use sampling seed **20261103** and check identical CUDA RNG states before and
   after sampling across all selected workers.
@@ -75,7 +76,18 @@ metadata, changed source/data hashes or unexpected settings stop the job.
 ## Results
 
 The Slurm log prints a new output directory under
-`runs/S092_sweep_best_<UTC timestamp>_<job ID>/`:
+`runs/S092_all_windows_<UTC timestamp>_<job ID>/`:
+
+- `per_window_metrics.csv` contains a row per model and source window, with
+  the source start time, observed sample count, paired real/generated means
+  (ms) and population variances (ms²), and their signed and absolute differences.
+  Signed differences use generated minus reference. The same positive-reference
+  positions are scored on both sides.
+- `all_window_summary.csv` contains one row per model. Each `avg_*` field is
+  the arithmetic mean of its per-window column. In particular,
+  `avg_generated_variance_ms2` averages the within-window population variances.
+  `avg_mean_absolute_error_ms` and `avg_variance_absolute_error_ms2` preserve
+  the size of errors when different windows have opposite signs.
 
 - `summary.json`: selected configurations, explicit selected/excluded IDs,
   captured epochs/hashes, paired checks, progress and completion status.
@@ -83,18 +95,12 @@ The Slurm log prints a new output directory under
 - `config_N/checkpoint_snapshot/`: the copied best weights and
   `best_snapshot_manifest.json` identifying their epoch and provenance.
 - `config_N/preflight.json`, `sample.log`, `summary.json`: source checks,
-  runtime details and three-window Gaussian KL/mean/variance statistics.
+  runtime details and Gaussian KL/mean/variance statistics.
 - `config_N/waveforms.npz`: generated normalized IBI and IBI in seconds.
-- `plots/`: a four-stage figure and full six-minute figure for each configuration,
-  plus comparison statistics. The four-stage panels show the first 30-second
-  occurrence of W, Light, REM and Deep in this segment. They are selected using
-  recorded labels, never by generated quality.
 
-Reference zeros remain visible as missing-value markers and generated negative
-values remain visible. Stages on the lower axes are the shared input labels,
-not predicted stages. Main ranking uses the mean of the three paired 120-second
-Gaussian KL values at the same positive-reference positions; 30-second stage
-details are separately labeled.
+For the earlier six-minute comparison and its four-stage plots, invoke the
+Python entry point with `--start-second 18900 --windows 3` instead of
+`--all-windows`. Full-window statistics go directly into the output root.
 
 For data/configuration checks without model execution, use a fresh directory:
 
@@ -103,7 +109,7 @@ python -B scripts/compare_s092_sweep_best.py \
   --sweep-root /home/yxtao/links/scratch/dataset-generation/runs/all88_s092_sweep_1228119 \
   --config-ids 0 1 2 3 4 5 6 7 8 \
   --output-dir /home/yxtao/links/scratch/dataset-generation/runs/S092_sweep_best_check \
-  --start-second 18900 --windows 3 --check-only
+  --all-windows --check-only
 ```
 
 This also captures best snapshots; it does not perform inference or generate

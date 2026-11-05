@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import csv
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -267,11 +268,47 @@ def matching_inputs(output, configurations):
     return checks
 
 
+def write_window_tables(output, reports):
+    """Use the recorded source indices and weight every complete window equally."""
+    import numpy as np
+    with np.load(output/'reference.npz', allow_pickle=False) as reference:
+        starts = reference['start_samples'].tolist()
+        window_size = int(reference['window_size'])
+        sample_rate = int(reference['sample_rate_hz'])
+        counts = reference['scoring_mask'].reshape(len(starts), window_size).sum(axis=1).tolist()
+    moments = ('reference_mean_ms', 'generated_mean_ms', 'mean_error_ms', 'mean_absolute_error_ms',
+               'reference_variance_ms2', 'generated_variance_ms2', 'variance_error_ms2',
+               'variance_absolute_error_ms2', 'gaussian_kl_real_to_generated')
+    detail, summary = [], []
+    for report in reports:
+        identity = dict(configuration_id=report['configuration']['id'], checkpoint_epoch=report['epoch'],
+                        seed=report['seed'])
+        windows = report['per_window_metrics']
+        if ([row['start_sample'] for row in windows] != starts
+                or [row['observed_counts'] for row in windows] != counts):
+            raise ValueError('Window starts or scoring counts differ from the common S092 reference')
+        for index, row in enumerate(windows):
+            detail.append(dict(**identity, window_index=index, start_sample=starts[index],
+                               start_second=starts[index]/sample_rate, observed_samples=counts[index],
+                               **{key: row[key] for key in moments}))
+        # The worker reduced one GPU scalar per window across all batches.
+        summary.append(dict(**identity, windows=len(starts),
+                            **{'avg_'+key: report['metrics'][key] for key in moments}))
+    for filename, records in [('per_window_metrics.csv', detail), ('all_window_summary.csv', summary)]:
+        with (output/filename).open('x', newline='', encoding='utf-8') as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(records[0]))
+            writer.writeheader()
+            writer.writerows(records)
+
+
 def launch_worker(cli, context, phase, destination):
     command = [sys.executable, '-B', '-u', str(Path(__file__).resolve()), '--worker', phase,
         '--context', str(destination/'context.json'), '--output-dir', str(destination),
-        '--start-second', str(cli.start_second), '--windows', str(cli.windows),
         '--seed', str(cli.seed), '--threads', str(cli.threads)]
+    if cli.all_windows:
+        command += ['--all-windows', '--sampling-batch-size', str(cli.sampling_batch_size)]
+    else:
+        command += ['--start-second', str(cli.start_second), '--windows', str(cli.windows)]
     identity = context['identity']
     if phase == 'preflight':
         command += ['--npz', str(cli.npz or Path(identity['data_directory'])/'S092.npz'),
@@ -292,14 +329,27 @@ def main(argv=None):
     parser.add_argument('--npz', type=Path)
     parser.add_argument('--metadata', type=Path)
     parser.add_argument('--output-dir', type=Path, required=True)
-    parser.add_argument('--start-second', type=int, default=18900)
-    parser.add_argument('--windows', type=int, default=3)
+    parser.add_argument('--all-windows', action='store_true',
+                        help='Sample every complete S092 nonoverlapping validation window')
+    parser.add_argument('--start-second', type=int)
+    parser.add_argument('--windows', type=int)
+    parser.add_argument('--sampling-batch-size', type=int,
+                        help='Number of windows per GPU batch in --all-windows mode (default: 8)')
     parser.add_argument('--seed', type=int, default=20261103)
     parser.add_argument('--threads', type=int, default=4)
     parser.add_argument('--check-only', action='store_true')
     parser.add_argument('--worker', choices=('preflight', 'sample'), help=argparse.SUPPRESS)
     parser.add_argument('--context', type=Path, help=argparse.SUPPRESS)
     cli = parser.parse_args(argv)
+    if cli.all_windows and (cli.windows is not None or cli.start_second is not None):
+        parser.error('--all-windows selects its starts from the validation protocol')
+    if cli.sampling_batch_size is not None and (not cli.all_windows or cli.sampling_batch_size < 1):
+        parser.error('--sampling-batch-size requires --all-windows and a positive size')
+    cli.sampling_batch_size = cli.sampling_batch_size or 8
+    if cli.start_second is None:
+        cli.start_second = 0 if cli.all_windows else 18900
+    if cli.windows is None:
+        cli.windows = 3
     if cli.threads < 1 or cli.windows < 1 or cli.start_second < 0 or cli.start_second % 30 or not 0 <= cli.seed < 2**32:
         parser.error('Require positive threads/windows, unsigned seed, and a nonnegative 30-second-aligned start')
     policy = configure_host_threads(cli.threads)
@@ -309,9 +359,10 @@ def main(argv=None):
         context = load_snapshot_context(cli.context)
         if cli.worker == 'preflight':
             shared.worker_preflight(context, cli.npz, cli.metadata, cli.start_second, cli.output_dir,
-                windows=cli.windows, require_all_stages=True)
+                windows=cli.windows, require_all_stages=True, all_windows=cli.all_windows)
         else:
-            report = shared.worker_sample(context, cli.output_dir, cli.seed, cli.threads)
+            report = shared.worker_sample(context, cli.output_dir, cli.seed, cli.threads,
+                batch_size=cli.sampling_batch_size if cli.all_windows else None)
             report.update(configuration=context['configuration'], host_thread_runtime=policy,
                 inference_dropout=dict(training_input_dropout_applied=False, s4_mode='eval'),
                 reference_sha256=sha256(cli.output_dir/'inputs.npz'), evaluation_is_held_out=False)
@@ -342,6 +393,9 @@ def main(argv=None):
         real_ibi_used_as_input=False, overlap_samples=0, evaluation_is_held_out=False,
         host_thread_runtime=policy, snapshots={}, check_only=cli.check_only,
         script_sha256=sha256(__file__))
+    if cli.all_windows:
+        status.update(window_selection='all_nonoverlapping_validation_windows', start_second=None, windows=None,
+                      duration_seconds=None, sampling_batch_size=cli.sampling_batch_size)
     try:
         save_json(output/'summary.json', status)
         print(json.dumps(dict(event='sweep_configuration_selection',
@@ -361,6 +415,13 @@ def main(argv=None):
             launch_worker(cli, context, 'preflight', destination)
         status['shared_input_checks'] = matching_inputs(output, configurations)
         status['reference_sha256'] = sha256(output/'reference.npz')
+        if cli.all_windows:
+            first = read_json(output/f'config_{selected_ids[0]}'/'preflight.json')
+            for key in ('windows', 'start_second', 'duration_seconds', 'source_samples', 'trailing_samples',
+                        'uncovered_samples'):
+                status[key] = first[key]
+            print(json.dumps(dict(event='s092_all_windows_checked', windows=status['windows'],
+                                  trailing_samples=status['trailing_samples'])), flush=True)
         if cli.check_only:
             status['status'] = 'checked'
         else:
@@ -378,11 +439,17 @@ def main(argv=None):
                 all(r[k] == reports[0][k] for k in ('cuda_rng_before', 'cuda_rng_after')) for r in reports)
             if not status['paired_cuda_rng_states_match']:
                 raise RuntimeError('Paired CUDA noise streams differ across configurations')
+            if cli.all_windows:
+                write_window_tables(output, reports)
+                status.update(per_window_metrics=str(output/'per_window_metrics.csv'),
+                              all_window_summary=str(output/'all_window_summary.csv'),
+                              window_weighting='equal per window; generated minus reference; population variance')
+            else:
+                status.update(status='completed', plots_directory=str(output/'plots'))
+                save_json(output/'summary.json', status)
+                subprocess.run([sys.executable, '-B', str(ROOT/'scripts/plot_s092_sweep_best.py'),
+                                '--result-dir', str(output)], check=True, cwd=ROOT)
             status['status'] = 'completed'
-            status['plots_directory'] = str(output/'plots')
-            save_json(output/'summary.json', status)
-            subprocess.run([sys.executable, '-B', str(ROOT/'scripts/plot_s092_sweep_best.py'),
-                            '--result-dir', str(output)], check=True, cwd=ROOT)
         save_json(output/'summary.json', status)
         print(json.dumps(dict(event='s092_sweep_finished', status=status['status'],
                               configuration_ids=selected_ids, output_directory=str(output))), flush=True)

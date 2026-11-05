@@ -2,7 +2,7 @@
 #SBATCH --account=def-plago
 #SBATCH --cpus-per-task=4
 #SBATCH --gpus-per-node=1
-#SBATCH --time=01:00:00
+#SBATCH --time=04:00:00
 #SBATCH --job-name=s092-sweep-best
 #SBATCH --output=/home/yxtao/links/scratch/dataset-generation/logs/s092_sweep_best_%j.txt
 
@@ -21,18 +21,22 @@ export BLIS_JC_NT=1 BLIS_PC_NT=1 BLIS_IC_NT=1 BLIS_JR_NT=1 BLIS_IR_NT=1
 export PYTHONFAULTHANDLER=1
 
 SWEEP_ROOT=/home/yxtao/links/scratch/dataset-generation/runs/all88_s092_sweep_1228119
+if [[ ${1:-} == --sweep-root ]]; then
+  if (( $# < 3 )); then echo "Expected --sweep-root PATH followed by config IDs" >&2; exit 2; fi
+  SWEEP_ROOT=$2
+  shift 2
+fi
 S092_NPZ=/home/yxtao/links/scratch/WatchSleepProcessedDataset/DREAMT_PIBI_SE/S092.npz
 METADATA=/home/yxtao/links/scratch/WatchSleepProcessedDataset/DREAMT_PIBI_SE/participant_info.csv
-OUTPUT_ROOT="/home/yxtao/links/scratch/dataset-generation/runs/S092_sweep_best_$(date -u +%Y%m%dT%H%M%SZ)_${SLURM_JOB_ID}"
+OUTPUT_ROOT="/home/yxtao/links/scratch/dataset-generation/runs/S092_all_windows_$(date -u +%Y%m%dT%H%M%SZ)_${SLURM_JOB_ID}"
 CONFIG_IDS=(0 1 2 3 4 5 6 7 8)
+if (( $# )); then CONFIG_IDS=("$@"); fi
 
-# Capture nine current best weights; config_9, config_10 and config_11 failed.
-# The same 18900--19260s S092 conditions cover W, Light, REM and Deep.
-# One GPU runs the selected inference jobs sequentially in isolated processes.
+# Each model samples the same full set of S092 windows in chronological order.
 srun python -B -u scripts/compare_s092_sweep_best.py \
   --sweep-root "$SWEEP_ROOT" --npz "$S092_NPZ" --metadata "$METADATA" \
   --config-ids "${CONFIG_IDS[@]}" \
-  --start-second 18900 --windows 3 --seed 20261103 \
+  --all-windows --sampling-batch-size 8 --seed 20261103 \
   --threads "${SLURM_CPUS_PER_TASK:-4}" --output-dir "$OUTPUT_ROOT"
 
-printf 'Completed %s best-checkpoint comparisons. Results: %s\n' "${#CONFIG_IDS[@]}" "$OUTPUT_ROOT"
+printf 'Window-level statistics: %s/per_window_metrics.csv\nWindow averages: %s/all_window_summary.csv\n' "$OUTPUT_ROOT" "$OUTPUT_ROOT"

@@ -173,8 +173,67 @@ def frozen_imports(context):
                               checkpoint_identity=checkpoint)
 
 
+def _full_validation_starts(prepared, context, window_size, fs):
+    """Verify the frozen evaluation order against every eligible S092 window."""
+    import numpy as np
+    from data_utils import _window_valid
+
+    protocol_path = Path(context["workspace"]).parent / "training/validation/protocol.json"
+    contents = protocol_path.read_bytes()
+    protocol = json.loads(contents.decode("utf-8-sig"))
+    options, selection, dimensions = (protocol[key] for key in ("options", "selection", "window"))
+    epoch_size = dimensions["epoch_samples"]
+    identity = context["identity"]
+    if (protocol.get("evaluation_filenames") != ["S092.npz"]
+            or protocol.get("evaluation_protocol") != identity["evaluation_protocol"]
+            or identity["train_npz_sha256"].get("S092.npz") != prepared["record"]["file_sha256"]
+            or epoch_size != 750 or dimensions["sample_rate_hz"] != fs or dimensions["window_size"] != window_size
+            or window_size % epoch_size or dimensions["window_epochs"] != window_size // epoch_size
+            or selection["candidate_stride_samples"] != epoch_size or selection["window_size_samples"] != window_size
+            or selection["available_subjects"] != 1 or selection["selected_subjects"] != 1
+            or options["max_windows"] is not None or options["reference_mask_policy"] != "observed_only"
+            or protocol["reference_mask_policy"] != "observed_only"):
+        raise ValueError("Require the full, observed-only S092 validation protocol with matching window dimensions")
+    record = prepared["record"]
+    reference = prepared["reference_seconds"]
+    observed = np.isfinite(reference) & (reference > 0)
+    expected = []
+    next_free = 0
+    for start in range(0, len(reference) - window_size + 1, epoch_size):
+        if start < next_free or not _window_valid(record, start // epoch_size, window_size // epoch_size):
+            continue
+        if np.count_nonzero(observed[start:start + window_size]) >= 2:
+            expected.append(start)
+            next_free = start + window_size
+    rows = protocol["windows"]
+    if (not expected or not isinstance(rows, list) or len(rows) != len(expected)
+            or selection["available_nonoverlapping_windows"] != len(expected)
+            or selection["selected_windows"] != len(expected)):
+        raise ValueError("Validation protocol does not cover every eligible nonoverlapping S092 window")
+    for index, (row, start) in enumerate(zip(rows, expected)):
+        epoch = start // epoch_size
+        stages = prepared["stage_epochs_four"][epoch:epoch + window_size // epoch_size].tolist()
+        mask = observed[start:start + window_size]
+        mask_meta = row["reference_mask"]
+        if (type(row["start_sample"]) is not int or row["start_sample"] != start
+                or row["validation_index"] != index or row["start_second"] != start / fs
+                or row["subject_id"] != "S092" or row["filename"] != "S092.npz"
+                or row["file_sha256"] != record["file_sha256"] or row["sleep_stages"] != stages
+                or mask_meta["observed_samples"] != int(mask.sum())
+                or mask_meta["missing_samples"] != int((~mask).sum())
+                or mask_meta["sha256"] != hashlib.sha256(mask.tobytes()).hexdigest()):
+            raise ValueError(f"Frozen validation window {index} differs from S092 source coordinates, stages or mask")
+    source_samples = len(reference) + record["discarded_tail_samples"]
+    coverage = dict(all_windows=True, source_samples=source_samples,
+                    trailing_samples=source_samples - (expected[-1] + window_size),
+                    uncovered_samples=source_samples - len(expected) * window_size,
+                    validation_protocol_path=str(protocol_path.resolve()),
+                    validation_protocol_sha256=hashlib.sha256(contents).hexdigest())
+    return np.asarray(expected, dtype=np.int64), coverage
+
+
 def worker_preflight(context, npz_path, metadata_path, start_second, output_dir,
-                     windows=1, require_all_stages=False):
+                     windows=1, require_all_stages=False, *, all_windows=False):
     import numpy as np
     import pandas as pd
     if start_second < 0 or start_second % 30:
@@ -201,16 +260,26 @@ def worker_preflight(context, npz_path, metadata_path, start_second, output_dir,
         downsample_rate=identity["downsample_rate"], max_epochs=identity["max_epochs"])
     prepared = modules["night_data"].prepare_night(view, "S092")
     fs = int(identity["sample_rate_hz"])
-    start, length = start_second * fs, args.window_size * windows
-    if start + length > len(prepared["reference_seconds"]):
-        raise ValueError("Requested S092 window exceeds the record")
-    ref = prepared["reference_seconds"][start:start+length].copy()
-    stages = prepared["stage_epochs_four"][start//750:(start+length)//750].copy()
+    coverage, coordinates = {}, {}
+    if all_windows:
+        starts, coverage = _full_validation_starts(prepared, context, args.window_size, fs)
+        coordinates["start_samples"] = starts
+        start_second, windows = int(starts[0]) // fs, len(starts)
+        slices = [slice(start, start + args.window_size) for start in starts]
+    else:
+        start = start_second * fs
+        stop = start + args.window_size * windows
+        if stop > len(prepared["reference_seconds"]):
+            raise ValueError("Requested S092 window exceeds the record")
+        slices = [slice(start, stop)]
+    ref = np.concatenate([prepared["reference_seconds"][span] for span in slices])
+    stages = np.concatenate([prepared["stage_epochs_four"][span.start//750:span.stop//750] for span in slices])
     if require_all_stages and set(stages.tolist()) != {0, 1, 2, 3}:
         raise ValueError("Selected segment must contain W, Light, REM and Deep")
-    conditions = prepared["conditions"][start:start+length].copy()
+    conditions = np.concatenate([prepared["conditions"][span] for span in slices])
     mask = np.isfinite(ref) & (ref > 0)
-    if not np.isfinite(ref).all() or (ref < 0).any() or (mask.reshape(-1, 750).sum(1) < 2).any():
+    minimum_block = args.window_size if all_windows else 750
+    if not np.isfinite(ref).all() or (ref < 0).any() or (mask.reshape(-1, minimum_block).sum(1) < 2).any():
         raise ValueError("Reference window has invalid IBI or insufficient observed points")
     center, scale = modules["signal_normalization"].signal_affine_parameters(identity["scaler"])
     expected_affine = (1.0, 1.0) if context["arm"] == "minmax" else (0.0, 2.0)
@@ -220,7 +289,7 @@ def worker_preflight(context, npz_path, metadata_path, start_second, output_dir,
     with (output / "inputs.npz").open("xb") as stream:
         np.savez_compressed(stream, reference_ibi_seconds=ref, conditions=conditions,
             scoring_mask=mask, sleep_stages=stages, start_second=np.array(start_second),
-            sample_rate_hz=np.array(fs), window_size=np.array(args.window_size))
+            sample_rate_hz=np.array(fs), window_size=np.array(args.window_size), **coordinates)
     report = dict(status="checked", arm=context["arm"], epoch=context["epoch"],
         checkpoint_sha256=context["checkpoint_sha256"], best_manifest_sha256=context["best_manifest_sha256"],
         source_checks=context["source_checks"], **provenance, subject="S092", source_npz=str(npz_path),
@@ -228,7 +297,7 @@ def worker_preflight(context, npz_path, metadata_path, start_second, output_dir,
         subject_provenance=prepared["provenance"], scaler=identity["scaler"],
         signal_center_seconds=center, signal_scale_seconds=scale,
         start_second=start_second, window_seconds=args.window_size/fs, window_size=args.window_size,
-        windows=windows, duration_seconds=length/fs, total_samples=length,
+        windows=windows, duration_seconds=len(ref)/fs, total_samples=len(ref), **coverage,
         all_four_stages_present=set(stages.tolist()) == {0, 1, 2, 3},
         stages=stages.tolist(), observed_samples=int(mask.sum()), raw_zero_samples=int((ref == 0).sum()),
         inputs_sha256=sha256(output / "inputs.npz"), model_args=vars(args),
@@ -261,9 +330,11 @@ def sampling_arrays(arrays, window_size):
             mask.reshape(-1, window_size))
 
 
-def worker_sample(context, output_dir, seed, threads):
+def worker_sample(context, output_dir, seed, threads, *, batch_size=None):
     import numpy as np
     import torch
+    if batch_size is not None and (type(batch_size) is not int or batch_size < 1):
+        raise ValueError("Sampling batch size must be a positive integer")
     modules, args, provenance = frozen_imports(context)
     device = require_sampling_device(modules["cuda_runtime"])
     output = Path(output_dir)
@@ -290,13 +361,20 @@ def worker_sample(context, output_dir, seed, threads):
                 modules["diffusion_schedule"].build_diffusion_config(args).items()}
     with np.load(output / "inputs.npz", allow_pickle=False) as arrays:
         ref_array, cond_array, mask_array = sampling_arrays(arrays, args.window_size)
-        reference = torch.as_tensor(ref_array, dtype=torch.float64, device=device)
-        mask = torch.as_tensor(mask_array, dtype=torch.bool, device=device)
-        conditions = torch.as_tensor(cond_array, dtype=torch.float32, device=device)
-    windows = len(reference)
+        sample_rate = float(arrays["sample_rate_hz"].item())
+        if not np.isfinite(sample_rate) or sample_rate <= 0:
+            raise ValueError("Invalid sampling rate in paired inputs")
+        if "start_samples" in arrays:
+            starts = arrays["start_samples"]
+            if (starts.shape != (len(ref_array),) or starts.dtype.kind not in "iu"
+                    or (starts < 0).any() or (starts[1:] <= starts[:-1]).any()):
+                raise ValueError("Window starts must be strictly increasing nonnegative sample indices")
+        else:
+            starts = int(preflight["start_second"] * sample_rate) + np.arange(len(ref_array)) * args.window_size
+    windows = len(ref_array)
     if windows != preflight["windows"]:
         raise ValueError("Sampling window count changed after preflight")
-    inputs = torch.cat([torch.zeros((windows, args.window_size, 1), device=device), conditions], dim=2)
+    batch_size = min(batch_size or windows, windows)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -304,27 +382,60 @@ def worker_sample(context, output_dir, seed, threads):
     # Same fresh-process seed and same tensor shapes ensure paired random draws.
     rng_before = hashlib.sha256(torch.cuda.get_rng_state(device).cpu().numpy().tobytes()).hexdigest()
     started = time.perf_counter()
-    normalized, sampling = modules["validation_sampling"].sample_validation_windows(
-        model, inputs, schedule, args, device)
+    seconds_parts, normalized_parts, statistics_parts, batch_counts = [], [], [], []
+    sampling = None
+    denoiser_calls = 0
+    nonpositive = 0
+    for first in range(0, windows, batch_size):
+        sl = slice(first, min(first + batch_size, windows))
+        conditions = torch.as_tensor(cond_array[sl], dtype=torch.float32, device=device)
+        inputs = torch.cat([torch.zeros_like(conditions[:, :, :1]), conditions], dim=2)
+        normalized, batch_report = modules["validation_sampling"].sample_validation_windows(
+            model, inputs, schedule, args, device)
+        count = len(conditions)
+        if (batch_report["windows"] != count or batch_report["mask_shape"] != [count, args.window_size]
+                or normalized.shape != (count, args.window_size)):
+            raise ValueError("Sampler returned a different batch shape from the paired inputs")
+        common = {key: value for key, value in batch_report.items()
+                  if key not in ("windows", "mask_shape", "denoiser_calls")}
+        if sampling is None:
+            sampling = common
+        elif common != sampling:
+            raise ValueError("Sampler settings or condition checks changed between batches")
+        denoiser_calls += batch_report["denoiser_calls"]
+        batch_counts.append(count)
+        generated = normalized.to(torch.float64) * preflight["signal_scale_seconds"] + preflight["signal_center_seconds"]
+        reference = torch.as_tensor(ref_array[sl], dtype=torch.float64, device=device)
+        mask = torch.as_tensor(mask_array[sl], dtype=torch.bool, device=device)
+        statistics_parts.append(modules["validation_metrics"].window_statistics(
+            generated, reference, observed_mask=mask))
+        nonpositive += int((generated <= 0).sum().item())
+        seconds_parts.append(generated.detach().cpu().numpy())
+        normalized_parts.append(normalized.detach().cpu().numpy())
     rng_after = hashlib.sha256(torch.cuda.get_rng_state(device).cpu().numpy().tobytes()).hexdigest()
-    generated = normalized.to(torch.float64) * preflight["signal_scale_seconds"] + preflight["signal_center_seconds"]
-    statistics = modules["validation_metrics"].window_statistics(generated, reference, observed_mask=mask)
+    sampling.update(windows=windows, mask_shape=[windows, args.window_size], denoiser_calls=denoiser_calls,
+                    batch_window_counts=batch_counts)
+    # Concatenate the one-scalar-per-window results before reducing. This
+    # weights the last (possibly shorter) batch by its actual window count.
+    statistics = {key: torch.cat([batch[key] for batch in statistics_parts])
+                  for key in statistics_parts[0]}
     metrics = {key: statistics[key].mean().item() for key in
-               ("gaussian_kl_real_to_generated", "mean_absolute_error_ms", "variance_absolute_error_ms2")}
-    per_window_metrics = [dict(window_index=i,
-        start_second=preflight["start_second"] + i * preflight["window_seconds"],
-        **{k: v[i].item() for k, v in statistics.items()}) for i in range(windows)]
-    nonpositive = int((generated <= 0).sum().item())
+               ("reference_mean_ms", "generated_mean_ms", "reference_variance_ms2", "generated_variance_ms2",
+                "mean_error_ms", "mean_absolute_error_ms", "variance_error_ms2", "variance_absolute_error_ms2",
+                "gaussian_kl_real_to_generated")}
+    columns = {key: values.tolist() for key, values in statistics.items()}
+    per_window_metrics = [dict(window_index=i, start_sample=int(start), start_second=int(start) / sample_rate,
+        **{key: values[i] for key, values in columns.items()}) for i, start in enumerate(starts)]
     with (output / "waveforms.npz").open("xb") as stream:
-        np.savez_compressed(stream, generated_ibi_seconds=generated.flatten().detach().cpu().numpy(),
-                            generated_normalized=normalized.flatten().detach().cpu().numpy(), seed=np.array(seed),
-                            window_size=np.array(args.window_size))
+        np.savez_compressed(stream, generated_ibi_seconds=np.concatenate(seconds_parts).reshape(-1),
+                            generated_normalized=np.concatenate(normalized_parts).reshape(-1), seed=np.array(seed),
+                            window_size=np.array(args.window_size), start_samples=starts)
     report = dict(status="completed", epoch=context["epoch"], checkpoint_kind="best_kl",
         checkpoint_sha256=context["checkpoint_sha256"], best_manifest_sha256=context["best_manifest_sha256"],
-        checkpoint_load=loaded, seed=seed, batch_size=windows, windows=windows,
+        checkpoint_load=loaded, seed=seed, batch_size=batch_size, windows=windows,
         sampling=sampling, metrics=metrics, metric_aggregation="equal-weight mean over model windows",
         per_window_metrics=per_window_metrics,
-        generated_nonpositive_samples=nonpositive, generated_nonpositive_fraction=nonpositive/generated.numel(),
+        generated_nonpositive_samples=nonpositive, generated_nonpositive_fraction=nonpositive/ref_array.size,
         cuda_environment=modules["cuda_runtime"].cuda_environment(device),
         cuda_rng_before=rng_before, cuda_rng_after=rng_after, elapsed_seconds=time.perf_counter()-started,
         waveform_sha256=sha256(output / "waveforms.npz"), scaler=preflight["scaler"],

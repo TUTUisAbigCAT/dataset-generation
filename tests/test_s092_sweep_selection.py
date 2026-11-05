@@ -6,9 +6,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 import contextlib
+import csv
 import io
 import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -17,6 +19,36 @@ from tests import test_compare_s092_sweep_best as fixtures
 
 
 class SweepSelectionTests(unittest.TestCase):
+    def test_exported_window_rows_and_equal_weight_means_with_missing_samples(self):
+        import numpy as np
+        starts = [0, 3750]
+        mask = np.ones((2, 3000), dtype=bool)
+        mask[0, 2:] = False
+        windows = [
+            dict(start_sample=start, observed_counts=count,
+                 reference_mean_ms=1000., generated_mean_ms=1000.+error, mean_error_ms=error,
+                 mean_absolute_error_ms=abs(error), reference_variance_ms2=100.,
+                 generated_variance_ms2=100.+v_error, variance_error_ms2=v_error,
+                 variance_absolute_error_ms2=abs(v_error), gaussian_kl_real_to_generated=1.)
+            for start, count, error, v_error in [(0, 2, 40., -80.), (3750, 3000, -60., 20.)]]
+        metrics = {key: (windows[0][key]+windows[1][key])/2 for key in windows[0]}
+        report = dict(configuration=dict(id=1), epoch=25, seed=42, per_window_metrics=windows, metrics=metrics)
+        with tempfile.TemporaryDirectory(dir=driver.ROOT) as tmp:
+            output = Path(tmp)
+            np.savez(output/'reference.npz', start_samples=starts, window_size=3000,
+                     sample_rate_hz=25, scoring_mask=mask.ravel())
+            driver.write_window_tables(output, [report])
+            with (output/'per_window_metrics.csv').open() as src:
+                detail = list(csv.DictReader(src))
+            self.assertEqual([row['start_second'] for row in detail], ['0.0', '150.0'])
+            self.assertEqual([row['observed_samples'] for row in detail], ['2', '3000'])
+            with (output/'all_window_summary.csv').open() as src:
+                summary, = csv.DictReader(src)
+            for key, expected in dict(avg_generated_mean_ms=990., avg_mean_error_ms=-10.,
+                    avg_mean_absolute_error_ms=50., avg_generated_variance_ms2=70.,
+                    avg_variance_error_ms2=-30., avg_variance_absolute_error_ms2=50.).items():
+                self.assertEqual(float(summary[key]), expected)
+
     def test_default_keeps_all_twelve_and_explicit_selection_is_sorted(self):
         original = deepcopy(fixtures.GRID)
         self.assertEqual(driver.select_configurations(fixtures.GRID), fixtures.GRID)
