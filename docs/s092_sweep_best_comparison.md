@@ -56,16 +56,19 @@ that all models received identical numbers of updates.
   schedule. Do not fit any scaler or modify the saved waveforms.
 
 All 88 records, including S092, trained these models. This measures fitting on
-S092, not held-out generalization. The old two-arm S092 script remains unchanged
-and is for the earlier 66/11/11 runs only.
+S092, not held-out generalization. The two-arm S092 script targets the earlier
+66/11/11 runs and shares the checkpoint-loading and sampling worker.
 
 ## Live-checkpoint consistency
 
 The launcher reads the validation summary and weight bytes, verifies the weight
 SHA256, and rereads the metadata to reject a concurrent update. It retries a
 bounded number of times. It copies matching weights to a new inference output
-directory and writes an inference snapshot manifest. Workers load only that
-copy, so subsequent best updates cannot alter this comparison. Training files
+directory and writes an inference snapshot manifest. Workers restore every
+parameter and persistent buffer from that copy, including the saved S4
+`B/P/w/Q` eigenbasis tensors. Each worker checks every restored tensor against
+the checkpoint before sampling and records the result under `checkpoint_load`
+in its `config_N/summary.json`. Training files
 and source snapshots are never edited. Missing best weights, inconsistent
 metadata, changed source/data hashes or unexpected settings stop the job.
 

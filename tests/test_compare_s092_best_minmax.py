@@ -1,7 +1,7 @@
 """Artificial identity fixtures and read-only frozen-worker integration.
 
-Fake checkpoint bytes are never deserialized. No model is constructed, trained,
-or sampled; CPU use here is preprocessing and CUDA-contract testing only.
+The checkpoint restoration regression loads a small S4 state without sampling.
+Other tests use artificial metadata and fake checkpoint bytes.
 """
 from __future__ import annotations
 
@@ -235,14 +235,57 @@ d.worker_preflight(c,pathlib.Path(sys.argv[4]),pathlib.Path(sys.argv[5]),int(sys
             self.assertEqual(report["stages"], [0, 1, 2, 3])
             self.assertEqual((report["signal_center_seconds"], report["signal_scale_seconds"]),
                              (1., 1.) if arm == "minmax" else (0., 2.))
-            for name, record in report["imported_sources"].items():
-                if name != "night_data":
+            imports = report["imported_sources"]
+            self.assertIn("night_checkpoint", imports)
+            for name, record in imports.items():
+                if name in ("night_data", "night_checkpoint"):
+                    self.assertEqual(Path(record["path"]), ROOT / (name + ".py"))
+                    self.assertEqual(record["sha256"], driver.sha256(record["path"]))
+                else:
                     self.assertTrue(Path(record["path"]).is_relative_to(self.roots[arm] / "run/workspace"))
             with np.load(output / "inputs.npz", allow_pickle=False) as values:
                 self.assertTrue(np.array_equal(values["scoring_mask"], values["reference_ibi_seconds"] > 0))
                 self.assertEqual(values["conditions"].shape, (3000, 9))
         self.assertTrue(all(driver.matching_inputs(outputs).values()))
         self.assertTrue(all(driver.sha256(path) == digest for path, digest in before.items()))
+
+    def test_worker_restores_saved_s4_kernel_buffers_before_sampling(self):
+        import torch
+        import night_checkpoint
+        from tests.test_night_checkpoint import small_s4, snapshot
+        from scripts import evaluate_original_sampler
+
+        self.addCleanup(np.random.set_state, np.random.get_state())
+        with torch.random.fork_rng(devices=[]):
+            target = small_s4()
+            saved = snapshot(target)
+            kernel_buffers = {name for name, _ in target.named_buffers()
+                              if name.rsplit('.', 1)[-1] in {'B', 'P', 'w', 'Q'}}
+            self.assertEqual({name.rsplit('.', 1)[-1] for name in kernel_buffers}, {'B', 'P', 'w', 'Q'})
+            for name in kernel_buffers:
+                saved[name].add_(1)
+            with self.assertRaisesRegex(RuntimeError, 'Seed-42 reconstructed buffers differ'):
+                evaluate_original_sampler.load_original_parameters(target, saved, torch)
+
+            checkpoint = self.base / 'kernel_state.pth'
+            torch.save(saved, checkpoint)
+            context = dict(checkpoint=str(checkpoint), checkpoint_sha256=driver.sha256(checkpoint),
+                           best_manifest_sha256='a' * 64)
+            inputs = self.base / 'inputs.npz'
+            np.savez(inputs, fixture=np.array(1))
+            driver.save_json(self.base / 'preflight.json', dict(context, inputs_sha256=driver.sha256(inputs)))
+            modules = {'training_utils': SimpleNamespace(fetchModel=lambda *args: target),
+                       'cuda_runtime': SimpleNamespace(assert_cuda_model=lambda model: None),
+                       'scripts.evaluate_original_sampler': evaluate_original_sampler,
+                       'night_checkpoint': night_checkpoint}
+            # Stop at eval(), immediately after state loading, before any model forward.
+            with (mock.patch.object(driver, 'frozen_imports', return_value=(modules, None, {})),
+                  mock.patch.object(driver, 'require_sampling_device', return_value=torch.device('cpu')),
+                  mock.patch.object(target, 'eval', side_effect=StopIteration('restored')),
+                  self.assertRaisesRegex(StopIteration, 'restored')):
+                driver.worker_sample(context, self.base, 20261103, torch.get_num_threads())
+            for name, value in target.state_dict().items():
+                self.assertTrue(torch.equal(value, saved[name]), name)
 
     def test_three_windows_keep_model_length_and_require_all_stages(self):
         path = self.data / "S092.npz"

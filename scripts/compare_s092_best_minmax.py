@@ -156,14 +156,15 @@ def frozen_imports(context):
         if not path.is_relative_to(workspace):
             raise RuntimeError("Imported outside the frozen workspace: " + name)
         imports[name] = dict(path=str(path), sha256=sha256(path))
-    # This inference-only adapter was not part of the training snapshot.
-    # Its loader and normalizers above still resolve to the selected frozen run.
-    night = importlib.import_module("night_data")
-    if Path(night.__file__).resolve() != ROOT / "night_data.py":
-        raise RuntimeError("Unexpected night-data adapter path")
-    modules["night_data"] = night
-    imports["night_data"] = dict(path=str(ROOT / "night_data.py"), sha256=sha256(ROOT / "night_data.py"),
-                                 role="new inference adapter; not a recorded training source")
+    # Import the inference adapters after their training dependencies have
+    # resolved to the selected run. Record their identities for both workers.
+    for name in ("night_data", "night_checkpoint"):
+        module = importlib.import_module(name)
+        path = Path(module.__file__).resolve()
+        if path != ROOT / (name + ".py"):
+            raise RuntimeError("Unexpected inference adapter path: " + str(path))
+        modules[name] = module
+        imports[name] = dict(path=str(path), sha256=sha256(path), role="inference adapter")
     loader = modules["scripts.evaluate_denoising"]
     args, manifest, provenance = loader.load_training_run(Path(context["manifest_path"]))
     _, checkpoint = loader.resolve_checkpoint(Path(context["manifest_path"]), manifest,
@@ -281,7 +282,9 @@ def worker_sample(context, output_dir, seed, threads):
     if hashlib.sha256(checkpoint_bytes).hexdigest() != context["checkpoint_sha256"]:
         raise ValueError("Best checkpoint changed before loading")
     saved = torch.load(io.BytesIO(checkpoint_bytes), map_location=device, weights_only=True)
-    loaded = modules["scripts.evaluate_original_sampler"].load_original_parameters(model, saved, torch)
+    # B/P/w/Q are checkpointed in the eigenbasis used during training.
+    # Restore that basis together with the learned parameters.
+    loaded = modules["night_checkpoint"].load_checkpoint_state(model, saved)
     model.eval()
     schedule = {k: v.to(device) if torch.is_tensor(v) else v for k, v in
                 modules["diffusion_schedule"].build_diffusion_config(args).items()}
