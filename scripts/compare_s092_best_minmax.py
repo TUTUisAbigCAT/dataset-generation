@@ -173,8 +173,8 @@ def frozen_imports(context):
                               checkpoint_identity=checkpoint)
 
 
-def _full_validation_starts(prepared, context, window_size, fs):
-    """Verify the frozen evaluation order against every eligible S092 window."""
+def _full_inference_starts(prepared, context, window_size, fs, window_stride_seconds):
+    """Check the original validation anchors, then choose legal source windows for inference."""
     import numpy as np
     from data_utils import _window_valid
 
@@ -197,20 +197,25 @@ def _full_validation_starts(prepared, context, window_size, fs):
     record = prepared["record"]
     reference = prepared["reference_seconds"]
     observed = np.isfinite(reference) & (reference > 0)
-    expected = []
-    next_free = 0
+    if (type(window_stride_seconds) is not int or window_stride_seconds <= 0
+            or window_stride_seconds * fs % epoch_size or window_stride_seconds * fs > window_size):
+        raise ValueError("Window stride must be a positive whole number of sleep epochs up to the window length")
+    stride = window_stride_seconds * fs
+    eligible = []
+    anchors = []
     for start in range(0, len(reference) - window_size + 1, epoch_size):
-        if start < next_free or not _window_valid(record, start // epoch_size, window_size // epoch_size):
+        if not _window_valid(record, start // epoch_size, window_size // epoch_size):
             continue
         if np.count_nonzero(observed[start:start + window_size]) >= 2:
-            expected.append(start)
-            next_free = start + window_size
+            eligible.append(start)
+            if not anchors or start >= anchors[-1] + window_size:
+                anchors.append(start)
     rows = protocol["windows"]
-    if (not expected or not isinstance(rows, list) or len(rows) != len(expected)
-            or selection["available_nonoverlapping_windows"] != len(expected)
-            or selection["selected_windows"] != len(expected)):
+    if (not anchors or not isinstance(rows, list) or len(rows) != len(anchors)
+            or selection["available_nonoverlapping_windows"] != len(anchors)
+            or selection["selected_windows"] != len(anchors)):
         raise ValueError("Validation protocol does not cover every eligible nonoverlapping S092 window")
-    for index, (row, start) in enumerate(zip(rows, expected)):
+    for index, (row, start) in enumerate(zip(rows, anchors)):
         epoch = start // epoch_size
         stages = prepared["stage_epochs_four"][epoch:epoch + window_size // epoch_size].tolist()
         mask = observed[start:start + window_size]
@@ -223,17 +228,27 @@ def _full_validation_starts(prepared, context, window_size, fs):
                 or mask_meta["missing_samples"] != int((~mask).sum())
                 or mask_meta["sha256"] != hashlib.sha256(mask.tobytes()).hexdigest()):
             raise ValueError(f"Frozen validation window {index} differs from S092 source coordinates, stages or mask")
+    # A full-length stride reproduces the original greedy validation even
+    # when an invalid epoch shifted a later anchor off the initial grid.
+    starts = anchors if stride == window_size else [s for s in eligible if s % stride == 0]
+    if not starts:
+        raise ValueError("No eligible S092 windows for the requested source stride")
     source_samples = len(reference) + record["discarded_tail_samples"]
+    unique_samples = window_size + sum(min(window_size, s - prev) for prev, s in zip(starts, starts[1:]))
+    selected_samples = len(starts) * window_size
     coverage = dict(all_windows=True, source_samples=source_samples,
-                    trailing_samples=source_samples - (expected[-1] + window_size),
-                    uncovered_samples=source_samples - len(expected) * window_size,
+                    window_stride_seconds=window_stride_seconds, window_overlap_seconds=(window_size - stride)/fs,
+                    validation_anchor_windows=len(anchors), selected_sample_count=selected_samples,
+                    unique_covered_samples=unique_samples, sampled_duration_seconds=selected_samples/fs,
+                    trailing_samples=source_samples - (starts[-1] + window_size),
+                    uncovered_samples=source_samples - unique_samples,
                     validation_protocol_path=str(protocol_path.resolve()),
                     validation_protocol_sha256=hashlib.sha256(contents).hexdigest())
-    return np.asarray(expected, dtype=np.int64), coverage
+    return np.asarray(starts, dtype=np.int64), coverage
 
 
 def worker_preflight(context, npz_path, metadata_path, start_second, output_dir,
-                     windows=1, require_all_stages=False, *, all_windows=False):
+                     windows=1, require_all_stages=False, *, all_windows=False, window_stride_seconds=30):
     import numpy as np
     import pandas as pd
     if start_second < 0 or start_second % 30:
@@ -262,8 +277,9 @@ def worker_preflight(context, npz_path, metadata_path, start_second, output_dir,
     fs = int(identity["sample_rate_hz"])
     coverage, coordinates = {}, {}
     if all_windows:
-        starts, coverage = _full_validation_starts(prepared, context, args.window_size, fs)
+        starts, coverage = _full_inference_starts(prepared, context, args.window_size, fs, window_stride_seconds)
         coordinates["start_samples"] = starts
+        coordinates["window_stride_seconds"] = np.array(window_stride_seconds, dtype=np.int64)
         start_second, windows = int(starts[0]) // fs, len(starts)
         slices = [slice(start, start + args.window_size) for start in starts]
     else:
@@ -297,14 +313,18 @@ def worker_preflight(context, npz_path, metadata_path, start_second, output_dir,
         subject_provenance=prepared["provenance"], scaler=identity["scaler"],
         signal_center_seconds=center, signal_scale_seconds=scale,
         start_second=start_second, window_seconds=args.window_size/fs, window_size=args.window_size,
-        windows=windows, duration_seconds=len(ref)/fs, total_samples=len(ref), **coverage,
+        windows=windows, duration_seconds=coverage.get("unique_covered_samples", len(ref))/fs,
+        total_samples=len(ref), **coverage,
         all_four_stages_present=set(stages.tolist()) == {0, 1, 2, 3},
         stages=stages.tolist(), observed_samples=int(mask.sum()), raw_zero_samples=int((ref == 0).sum()),
         inputs_sha256=sha256(output / "inputs.npz"), model_args=vars(args),
         diffusion_identity=context["manifest"]["diffusion_identity"],
         training_npz_reopened=False, scaler_refitted=False, sampling_performed=False,
-        generation=dict(independent_windows=True, overlap_samples=0, real_ibi_prefix_samples=0,
+        generation=dict(independent_windows=True, overlap_samples=(args.window_size-window_stride_seconds*fs
+                            if all_windows else 0), real_ibi_prefix_samples=0,
             reference_ibi_used_as_model_input=False, stage_conditions_overridden=False, clipping_applied=False))
+    if all_windows:
+        report["generation"]["stitching_overlap_samples"] = 0
     save_json(output / "preflight.json", report)
     return report
 
@@ -317,7 +337,7 @@ def require_sampling_device(runtime):
 
 
 def sampling_arrays(arrays, window_size):
-    """Split only at model-window boundaries; do not interpolate or overlap."""
+    """Recover independent model windows from the packed source slices."""
     import numpy as np
     ref = np.asarray(arrays["reference_ibi_seconds"])
     cond = np.asarray(arrays["conditions"])

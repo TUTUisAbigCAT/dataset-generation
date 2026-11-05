@@ -59,15 +59,16 @@ class FullWindowInputTests(unittest.TestCase):
                 reference_mask=dict(observed_samples=int(mask.sum()), missing_samples=int((~mask).sum()),
                                     sha256=hashlib.sha256(mask.tobytes()).hexdigest())))
 
-    def run_preflight(self, protocol):
+    def run_preflight(self, protocol, **options):
         driver.save_json(self.protocol_path, protocol)
         modules = dict(night_data=night_data, signal_normalization=signal_normalization)
         with (mock.patch.object(driver, "S092_SHA256", self.digest),
               mock.patch.object(driver, "frozen_imports", return_value=(modules, SimpleNamespace(window_size=3000), {}))):
-            return driver.worker_preflight(self.context, self.npz, self.meta, 18900, self.root, all_windows=True)
+            return driver.worker_preflight(self.context, self.npz, self.meta, 0, self.root, all_windows=True,
+                                           **options)
 
-    def test_full_preflight_uses_source_starts_and_complete_windows(self):
-        report = self.run_preflight(self.protocol)
+    def test_full_length_stride_reproduces_frozen_nonoverlap_even_after_invalid_epoch(self):
+        report = self.run_preflight(self.protocol, window_stride_seconds=120)
         self.assertEqual(report["source_samples"], len(self.signal))
         self.assertEqual(report["trailing_samples"], 2325)
         self.assertEqual(report["uncovered_samples"], 3075)
@@ -79,6 +80,46 @@ class FullWindowInputTests(unittest.TestCase):
             np.testing.assert_array_equal(arrays["scoring_mask"], expected > 0)
             np.testing.assert_array_equal(arrays["conditions"][:,:4].argmax(1),
                                           np.repeat(arrays["sleep_stages"], 750))
+
+    def test_default_overlapping_windows_cover_source_time_once_and_preserve_each_slice(self):
+        report = self.run_preflight(self.protocol)
+        expected = np.asarray([0, 5, 6, 7, 8, 9, 10, 11, 12])*750
+        self.assertEqual(report["validation_anchor_windows"], 3)
+        self.assertEqual((report["window_stride_seconds"], report["window_overlap_seconds"]), (30, 90))
+        self.assertEqual((report["windows"], report["selected_sample_count"], report["total_samples"]),
+                         (9, 27000, 27000))
+        self.assertEqual((report["unique_covered_samples"], report["duration_seconds"],
+                          report["sampled_duration_seconds"]), (11250, 450, 1080))
+        self.assertEqual((report["trailing_samples"], report["uncovered_samples"]), (75, 825))
+        self.assertTrue(report["generation"]["independent_windows"])
+        self.assertEqual((report["generation"]["overlap_samples"],
+                          report["generation"]["stitching_overlap_samples"]), (2250, 0))
+        with np.load(self.root/"inputs.npz") as arrays:
+            np.testing.assert_array_equal(arrays["start_samples"], expected)
+            self.assertEqual(int(arrays["window_stride_seconds"]), 30)
+            for i, s in enumerate(expected):
+                np.testing.assert_array_equal(arrays["reference_ibi_seconds"][i*3000:(i+1)*3000],
+                                              self.signal[s:s+3000])
+                np.testing.assert_array_equal(arrays["sleep_stages"][i*4:(i+1)*4],
+                                              self.stages[s//750:s//750+4])
+                np.testing.assert_array_equal(arrays["scoring_mask"][i*3000:(i+1)*3000],
+                                              self.signal[s:s+3000] > 0)
+
+    def test_wider_sliding_strides_use_the_original_epoch_grid(self):
+        for stride, offsets in [(60, [0, 6, 8, 10, 12]), (90, [0, 6, 9, 12])]:
+            with self.subTest(stride=stride):
+                report = self.run_preflight(self.protocol, window_stride_seconds=stride)
+                self.assertEqual(report["unique_covered_samples"], 10500)
+                self.assertEqual(report["window_overlap_seconds"], 120-stride)
+                with np.load(self.root/"inputs.npz") as arrays:
+                    np.testing.assert_array_equal(arrays["start_samples"], np.asarray(offsets)*750)
+                (self.root/"inputs.npz").unlink()
+
+    def test_invalid_stride_is_rejected_before_input_files_are_written(self):
+        for stride in (0, -30, 15, 150, True, 30.0):
+            with self.subTest(stride=stride), self.assertRaisesRegex(ValueError, "stride"):
+                self.run_preflight(self.protocol, window_stride_seconds=stride)
+            self.assertFalse((self.root/"inputs.npz").exists())
 
     def test_incomplete_selection_wrong_coordinate_stage_and_mask_are_rejected(self):
         for error in ("missing", "start", "stages", "hash"):

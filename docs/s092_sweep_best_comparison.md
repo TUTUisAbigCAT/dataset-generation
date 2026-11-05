@@ -20,7 +20,7 @@ sbatch submit_s092_sweep_best.sh
 
 The script already targets
 `/home/yxtao/links/scratch/dataset-generation/runs/all88_s092_sweep_1228119`,
-and allocates one GPU and four CPU threads for up to four hours. The nine inference
+and allocates one GPU and four CPU threads for up to 16 hours. The nine inference
 workers run sequentially on that GPU in fresh processes; this does not submit
 or modify the 12 training jobs. The BLIS startup policy is applied before
 NumPy/PyTorch imports. Model inference requires CUDA, with no CPU fallback.
@@ -40,17 +40,21 @@ that all models received identical numbers of updates.
 
 ## Exact comparison
 
-- The Slurm entry point passes `--all-windows`. Each model generates a fresh
-  independent IBI sequence for every complete window in the frozen S092
-  validation protocol, in batches of eight. Stored source starts, stage labels
-  and positive-reference scoring masks are checked against the S092 NPZ.
-- The audited record contains 222 nonoverlapping windows of 120 seconds at
-  25 Hz, followed by 60 seconds outside the final complete window.
+- The Slurm entry point passes `--all-windows --window-stride-seconds 30`.
+  A 120-second window starts at 0, 30, 60 seconds and so on. Adjacent windows
+  share 90 seconds of recorded conditions. Each receives its own diffusion
+  sample. The audited S092 record has 887 eligible windows at 25 Hz. The last
+  starts at 26,580 seconds and reaches the end of the 26,700-second record.
+- Source labels, positive IBI masks and the original validation window list
+  are checked against the S092 NPZ. Checkpoint selection used the original
+  222 nonoverlapping windows. For that inference selection, set
+  `WINDOW_STRIDE_SECONDS=120` in the submission script. Supported steps are
+  30, 60, 90 and 120 seconds.
 - Use S092's recorded AHI/BMI/AGE/GENDER and each run's frozen metadata scaler.
 - Use sampling seed **20261103** and check identical CUDA RNG states before and
   after sampling across all selected workers.
-- Real IBI is used only for evaluation and plotting, not fed as a prefix or
-  known signal. There is no overlap, inpainting or continuation in this test.
+- The sampler receives stage and participant conditions and generates each
+  window's entire IBI channel. Real IBI supplies the paired evaluation target.
 - Restore each model's own S4 dropout setting when constructing it, then call
   `eval()`; training input dropout is not applied during inference.
 - Restore the saved normalization, source implementation and diffusion
@@ -84,7 +88,9 @@ The Slurm log prints a new output directory under
   Signed differences use generated minus reference. The same positive-reference
   positions are scored on both sides.
 - `all_window_summary.csv` contains one row per model. Each `avg_*` field is
-  the arithmetic mean of its per-window column. In particular,
+  the arithmetic mean of its per-window column. Source samples in an overlap
+  contribute to each window that contains them. The report records source
+  coverage separately from the sum of sampled window lengths. In particular,
   `avg_generated_variance_ms2` averages the within-window population variances.
   `avg_mean_absolute_error_ms` and `avg_variance_absolute_error_ms2` preserve
   the size of errors when different windows have opposite signs.

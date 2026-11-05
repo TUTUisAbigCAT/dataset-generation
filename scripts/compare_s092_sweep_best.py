@@ -3,7 +3,7 @@
 Training may still be running. A live validation summary and matching weight
 bytes identify the selected epoch; a final best manifest is not required.
 Each inference worker imports its run's verified source snapshot. No training,
-scaler refitting, real-IBI prefix, overlap or output clipping is performed.
+scaler refitting, real-IBI prefix, stitching or output clipping is performed.
 """
 from __future__ import annotations
 
@@ -275,6 +275,8 @@ def write_window_tables(output, reports):
         starts = reference['start_samples'].tolist()
         window_size = int(reference['window_size'])
         sample_rate = int(reference['sample_rate_hz'])
+        # Older inputs were created by the nonoverlapping full-window protocol.
+        stride_seconds = int(reference['window_stride_seconds']) if 'window_stride_seconds' in reference else window_size // sample_rate
         counts = reference['scoring_mask'].reshape(len(starts), window_size).sum(axis=1).tolist()
     moments = ('reference_mean_ms', 'generated_mean_ms', 'mean_error_ms', 'mean_absolute_error_ms',
                'reference_variance_ms2', 'generated_variance_ms2', 'variance_error_ms2',
@@ -292,7 +294,8 @@ def write_window_tables(output, reports):
                                start_second=starts[index]/sample_rate, observed_samples=counts[index],
                                **{key: row[key] for key in moments}))
         # The worker reduced one GPU scalar per window across all batches.
-        summary.append(dict(**identity, windows=len(starts),
+        summary.append(dict(**identity, windows=len(starts), window_seconds=window_size/sample_rate,
+                            window_stride_seconds=stride_seconds,
                             **{'avg_'+key: report['metrics'][key] for key in moments}))
     for filename, records in [('per_window_metrics.csv', detail), ('all_window_summary.csv', summary)]:
         with (output/filename).open('x', newline='', encoding='utf-8') as stream:
@@ -306,7 +309,8 @@ def launch_worker(cli, context, phase, destination):
         '--context', str(destination/'context.json'), '--output-dir', str(destination),
         '--seed', str(cli.seed), '--threads', str(cli.threads)]
     if cli.all_windows:
-        command += ['--all-windows', '--sampling-batch-size', str(cli.sampling_batch_size)]
+        command += ['--all-windows', '--sampling-batch-size', str(cli.sampling_batch_size),
+                    '--window-stride-seconds', str(cli.window_stride_seconds)]
     else:
         command += ['--start-second', str(cli.start_second), '--windows', str(cli.windows)]
     identity = context['identity']
@@ -330,7 +334,9 @@ def main(argv=None):
     parser.add_argument('--metadata', type=Path)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--all-windows', action='store_true',
-                        help='Sample every complete S092 nonoverlapping validation window')
+                        help='Sample complete eligible S092 windows at the requested stride')
+    parser.add_argument('--window-stride-seconds', type=int, choices=(30, 60, 90, 120),
+                        help='S092 source-window step in --all-windows mode (default: 30 seconds)')
     parser.add_argument('--start-second', type=int)
     parser.add_argument('--windows', type=int)
     parser.add_argument('--sampling-batch-size', type=int,
@@ -342,7 +348,11 @@ def main(argv=None):
     parser.add_argument('--context', type=Path, help=argparse.SUPPRESS)
     cli = parser.parse_args(argv)
     if cli.all_windows and (cli.windows is not None or cli.start_second is not None):
-        parser.error('--all-windows selects its starts from the validation protocol')
+        parser.error('--all-windows selects starts across the full source record')
+    if cli.window_stride_seconds is not None and not cli.all_windows:
+        parser.error('--window-stride-seconds requires --all-windows')
+    if cli.window_stride_seconds is None:
+        cli.window_stride_seconds = 30
     if cli.sampling_batch_size is not None and (not cli.all_windows or cli.sampling_batch_size < 1):
         parser.error('--sampling-batch-size requires --all-windows and a positive size')
     cli.sampling_batch_size = cli.sampling_batch_size or 8
@@ -359,7 +369,8 @@ def main(argv=None):
         context = load_snapshot_context(cli.context)
         if cli.worker == 'preflight':
             shared.worker_preflight(context, cli.npz, cli.metadata, cli.start_second, cli.output_dir,
-                windows=cli.windows, require_all_stages=True, all_windows=cli.all_windows)
+                windows=cli.windows, require_all_stages=True, all_windows=cli.all_windows,
+                window_stride_seconds=cli.window_stride_seconds)
         else:
             report = shared.worker_sample(context, cli.output_dir, cli.seed, cli.threads,
                 batch_size=cli.sampling_batch_size if cli.all_windows else None)
@@ -394,8 +405,11 @@ def main(argv=None):
         host_thread_runtime=policy, snapshots={}, check_only=cli.check_only,
         script_sha256=sha256(__file__))
     if cli.all_windows:
-        status.update(window_selection='all_nonoverlapping_validation_windows', start_second=None, windows=None,
-                      duration_seconds=None, sampling_batch_size=cli.sampling_batch_size)
+        status.update(window_selection=('all_nonoverlapping_validation_windows' if cli.window_stride_seconds == 120
+                                        else 'eligible_source_windows_at_requested_stride'),
+                      start_second=None, windows=None, duration_seconds=None, sampling_batch_size=cli.sampling_batch_size,
+                      window_stride_seconds=cli.window_stride_seconds, overlap_samples=(120-cli.window_stride_seconds)*25,
+                      stitching_overlap_samples=0)
     try:
         save_json(output/'summary.json', status)
         print(json.dumps(dict(event='sweep_configuration_selection',
@@ -418,9 +432,13 @@ def main(argv=None):
         if cli.all_windows:
             first = read_json(output/f'config_{selected_ids[0]}'/'preflight.json')
             for key in ('windows', 'start_second', 'duration_seconds', 'source_samples', 'trailing_samples',
-                        'uncovered_samples'):
+                        'uncovered_samples', 'window_stride_seconds', 'window_overlap_seconds',
+                        'selected_sample_count', 'unique_covered_samples', 'sampled_duration_seconds',
+                        'validation_anchor_windows'):
                 status[key] = first[key]
             print(json.dumps(dict(event='s092_all_windows_checked', windows=status['windows'],
+                                  window_stride_seconds=status['window_stride_seconds'],
+                                  window_overlap_seconds=status['window_overlap_seconds'],
                                   trailing_samples=status['trailing_samples'])), flush=True)
         if cli.check_only:
             status['status'] = 'checked'
@@ -443,7 +461,7 @@ def main(argv=None):
                 write_window_tables(output, reports)
                 status.update(per_window_metrics=str(output/'per_window_metrics.csv'),
                               all_window_summary=str(output/'all_window_summary.csv'),
-                              window_weighting='equal per window; generated minus reference; population variance')
+                              window_weighting='equal per window; shared source positions enter each covering window; generated minus reference; population variance')
             else:
                 status.update(status='completed', plots_directory=str(output/'plots'))
                 save_json(output/'summary.json', status)
